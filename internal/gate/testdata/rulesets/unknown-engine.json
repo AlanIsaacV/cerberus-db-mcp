@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "forbidden_functions": [
+    {"id": "fn-utl-file", "match": "utl_file", "engines": ["oracle"], "reason": "an engine this build has no lexical rules for"}
+  ]
+}

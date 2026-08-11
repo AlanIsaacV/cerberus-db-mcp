@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "notes": ["The operator path for a schema whose legitimate reads outgrow the baseline bound."],
+  "max_statement_bytes": 131072
+}

@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "forbidden_functions": [
+    {"id": "fn-sp-oastop", "match": "sp_oastop", "reason": ""}
+  ]
+}

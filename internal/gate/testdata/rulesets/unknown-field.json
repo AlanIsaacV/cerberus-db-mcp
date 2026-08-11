@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "read_statementz": [
+    {"id": "read-copy", "match": "copy", "reason": "typo in the field name"}
+  ]
+}

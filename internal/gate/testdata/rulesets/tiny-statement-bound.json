@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "notes": ["A bound tightened below the floor, which would refuse every real read."],
+  "max_statement_bytes": 16
+}

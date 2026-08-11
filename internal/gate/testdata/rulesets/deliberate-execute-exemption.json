@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "notes": [
+    "What the escape hatch looks like when it is used deliberately. This overlay DOES make SELECT 1 EXECUTE('...') return allow on every engine, which is a real and severe loosening of a gate whose whole purpose is to refuse dynamic execution.",
+    "It is here so the test suite demonstrates what a declared exemption buys and costs, and so that the shape of a dangerous-but-valid overlay is on file. It is a fixture. It must never be shipped as an operator ruleset."
+  ],
+  "remove_rules": ["stmt-exec", "stmt-execute"],
+  "forbidden_statements": [
+    {"id": "stmt-execute-relaxed", "match": "execute", "safe_as_function": "This claim is false and is written here only to show that nothing in the package checks it: EXECUTE('...') is valid T-SQL, so a reader of this overlay's diff is the only thing standing between this sentence and dynamic execution.", "reason": "EXECUTE runs dynamic SQL"}
+  ],
+  "safe_functions": [{"names": ["execute"], "reason": "the declared exemption"}]
+}

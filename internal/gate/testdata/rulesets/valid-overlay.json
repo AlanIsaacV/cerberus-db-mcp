@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "safe_functions": [
+    {
+      "engines": ["sqlserver"],
+      "names": ["dbo.calcularsaldo"],
+      "reason": "reviewed by the operator and promoted from a grant into the ruleset"
+    }
+  ],
+  "remove_rules": ["read-values"]
+}

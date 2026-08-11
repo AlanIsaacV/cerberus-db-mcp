@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "read_statements": [
+    {"id": "read-delete", "match": "delete", "reason": "DELETE is not a read, and the baseline already forbids it"}
+  ]
+}

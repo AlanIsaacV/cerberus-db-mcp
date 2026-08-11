@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "forbidden_statements": [
+    {"id": "stmt-drop", "match": "drop table", "reason": "an ID the baseline already uses"}
+  ]
+}

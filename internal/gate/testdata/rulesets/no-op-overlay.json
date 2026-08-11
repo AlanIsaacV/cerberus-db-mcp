@@ -1,0 +1,4 @@
+{
+  "version": 1,
+  "notes": ["An overlay that changes nothing, used to show that a reload puts back what a previous overlay had taken away."]
+}

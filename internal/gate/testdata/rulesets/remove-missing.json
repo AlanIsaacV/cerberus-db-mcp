@@ -1,0 +1,4 @@
+{
+  "version": 1,
+  "remove_rules": ["stmt-drop-tables-maybe"]
+}

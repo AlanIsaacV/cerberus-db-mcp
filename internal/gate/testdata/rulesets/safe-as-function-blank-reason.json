@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "notes": ["The same route with the exemption claimed and the argument left blank. Whitespace is not a declaration."],
+  "remove_rules": ["stmt-exec", "stmt-execute"],
+  "forbidden_statements": [
+    {"id": "stmt-execute-relaxed", "match": "execute", "safe_as_function": "   ", "reason": "EXECUTE runs dynamic SQL"}
+  ],
+  "safe_functions": [{"names": ["execute"], "reason": "the loosening validate has to catch"}]
+}

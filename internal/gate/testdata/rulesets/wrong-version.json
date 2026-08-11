@@ -1,0 +1,4 @@
+{
+  "version": 2,
+  "safe_functions": [{"names": ["dbo.calcularsaldo"], "reason": "written against a schema this build does not understand"}]
+}

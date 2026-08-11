@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "notes": ["The exemption is meaningless anywhere but a forbidden statement rule, so claiming it elsewhere is an error rather than a no-op."],
+  "read_statements": [
+    {"id": "read-table", "match": "table", "safe_as_function": "a read rule has no keyword check to exempt", "reason": "TABLE t is a PostgreSQL read"}
+  ]
+}

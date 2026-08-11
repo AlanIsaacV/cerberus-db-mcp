@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race ./...
+
+      # The gate's safety argument is that its verdict depends on nothing but
+      # its input. This is the whole-closure half of that check; the per-file
+      # half is TestPackageImportsNothingItShouldNot.
+      - name: gate dependency closure
+        run: |
+          deps=$(go list -deps ./internal/gate | grep -v '^github.com/AlanIsaacV/cerberus-db-mcp')
+          if echo "$deps" | grep -Eq '(^|/)net($|/)|database/sql|sql/driver|modelcontextprotocol|crypto/tls|os/exec'; then
+            echo "the gate's dependency closure contains a forbidden package:"
+            echo "$deps"
+            exit 1
+          fi
+          if echo "$deps" | grep -qv '^[a-z]'; then
+            echo "the gate's dependency closure contains a non-standard-library package:"
+            echo "$deps" | grep -v '^[a-z]'
+            exit 1
+          fi
+
+      # The corpus is the safety evidence, so the fuzzer runs on every change
+      # rather than only when someone remembers to.
+      - name: go test -fuzz
+        run: go test -run Fuzz -fuzz FuzzGate -fuzztime 60s ./internal/gate
+
+      # A fuzz failure writes the input that caused it under testdata/fuzz.
+      # Uploading it makes the find a file someone can commit as a permanent
+      # seed, rather than a string to retype out of a log.
+      - name: upload the failing fuzz input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failure
+          path: internal/gate/testdata/fuzz
+          if-no-files-found: ignore

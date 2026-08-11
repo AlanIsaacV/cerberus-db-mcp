@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "notes": ["A well-formed overlay that would make SELECT 1 EXECUTE('xp_cmdshell') return allow, by putting the keyword on the safe-builtin allowlist so that the keyword rule stops being consulted."],
+  "safe_functions": [{"names": ["execute"], "reason": "the loosening validate has to catch"}]
+}

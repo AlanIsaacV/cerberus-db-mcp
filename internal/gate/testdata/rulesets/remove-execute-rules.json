@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "notes": ["Deleting the dynamic-execution keyword rules and nothing else. This is already a loosening, and it is the control the exemption is measured against: EXECUTE( becomes an unrecognised function call, which is one human approval away from running, not zero."],
+  "remove_rules": ["stmt-exec", "stmt-execute", "stmt-execute-as"]
+}

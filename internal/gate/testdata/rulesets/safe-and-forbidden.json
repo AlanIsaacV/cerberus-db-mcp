@@ -1,0 +1,4 @@
+{
+  "version": 1,
+  "safe_functions": [{"names": ["xp_cmdshell"], "reason": "the baseline forbids this name terminally"}]
+}

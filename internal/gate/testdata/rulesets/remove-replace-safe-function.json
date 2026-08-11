@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "notes": [
+    "A legitimate tightening: REPLACE() stops being a safe builtin, so SELECT REPLACE(a,1,2) goes from allow to deny/stmt-replace.",
+    "It also leaves the baseline's stmt-replace safe_as_function declaration with nothing to exempt. That dangling declaration changes no verdict, and it is why validate does not reject dangling declarations - doing so would refuse this file. Gate.Exemptions reports it as dangling instead."
+  ],
+  "remove_safe_functions": ["replace"]
+}
