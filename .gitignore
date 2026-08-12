@@ -1,0 +1,6 @@
+# The environment is the only place credentials live, and .env is where they live
+# locally. .env.example carries every variable name and no values, and is the file
+# that is meant to be committed.
+.env
+.env.*
+!.env.example

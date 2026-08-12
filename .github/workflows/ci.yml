@@ -66,3 +66,106 @@ jobs:
           name: fuzz-failure
           path: internal/gate/testdata/fuzz
           if-no-files-found: ignore
+
+  # A second job, not a step in the first one. The container-backed tests need
+  # engines running, and folding them into the unit job would make every check in
+  # it — gofmt, vet, the gate's dependency closure — depend on a database coming
+  # up. `go test ./...` with no build tag must keep passing with nothing running,
+  # and that is what the job above proves.
+  #
+  # There is no SQL Server service. No arm64 image of it exists and the only
+  # arm64-native alternative is a retired 2019-vintage engine, so SQL Server is
+  # verified against a real instance reached over a VPN, which no runner has. Those
+  # tests take their connection from the per-alias environment variables and skip
+  # with a clear message when they are not set — which is what happens here.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: cerberus-test-pg-root
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: cerberus-test-my-root
+          MYSQL_USER: cerberus
+          MYSQL_PASSWORD: cerberus-test-my
+          MYSQL_DATABASE: cerberus
+        ports:
+          - 53306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ucerberus -pcerberus-test-my --silent"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 40
+    env:
+      # Every skip in the integration suite is individually right, and together
+      # they mean a typo in one of the variable names below would give this job
+      # exit 0 with nothing asserted — indistinguishable from the SQL Server tests
+      # skipping, which they legitimately do. Naming the two engines this job has
+      # containers for turns that silence into a failure. SQL Server is
+      # deliberately absent: no instance is reachable from a runner.
+      CERBERUS_TEST_REQUIRE_ENGINES: postgresql,mysql
+      CERBERUS_DB_ALIASES: pgtest,mytest
+      CERBERUS_DB_PGTEST_ENGINE: postgresql
+      CERBERUS_DB_PGTEST_HOST: 127.0.0.1
+      CERBERUS_DB_PGTEST_PORT: '55432'
+      CERBERUS_DB_PGTEST_DATABASE: cerberus
+      CERBERUS_DB_PGTEST_USER: cerberus
+      CERBERUS_DB_PGTEST_PASSWORD: cerberus-test-pg
+      CERBERUS_DB_PGTEST_TLS: disable
+      CERBERUS_DB_MYTEST_ENGINE: mysql
+      CERBERUS_DB_MYTEST_HOST: 127.0.0.1
+      CERBERUS_DB_MYTEST_PORT: '53306'
+      CERBERUS_DB_MYTEST_DATABASE: cerberus
+      CERBERUS_DB_MYTEST_USER: cerberus
+      CERBERUS_DB_MYTEST_PASSWORD: cerberus-test-my
+      CERBERUS_DB_MYTEST_TLS: disable
+      CERBERUS_DB_ROW_CAP: '50'
+      CERBERUS_DB_QUERY_TIMEOUT: 4s
+      CERBERUS_DB_TIMEOUT_GRACE: 4s
+      CERBERUS_DB_LOCK_TIMEOUT: 2s
+      CERBERUS_DB_CONNECT_TIMEOUT: 10s
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      # A service container cannot mount a repository file, so the two pieces of
+      # setup that deploy/compose.test.yaml does declaratively are done here
+      # instead. Both exist for a reason a comment in those files explains:
+      #
+      #   - the test account is created without superuser, because a superuser is
+      #     denied nothing and one of the error classes the sanitisation criterion
+      #     asks for cannot then be provoked at all;
+      #   - the general log is turned on with TABLE output and made readable,
+      #     because it is the server's own record of the statement it received,
+      #     which is the only witness to byte-identity that is not this process
+      #     reporting on itself.
+      - name: prepare the engines
+        env:
+          PGPASSWORD: cerberus-test-pg-root
+        run: |
+          psql -h 127.0.0.1 -p 55432 -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE cerberus LOGIN PASSWORD 'cerberus-test-pg'" \
+            -c "CREATE DATABASE cerberus OWNER cerberus"
+          mysql -h 127.0.0.1 -P 53306 --protocol=TCP -uroot -pcerberus-test-my-root -e "
+            SET GLOBAL log_output = 'TABLE';
+            SET GLOBAL general_log = 1;
+            GRANT SELECT ON mysql.general_log TO 'cerberus'@'%';
+            FLUSH PRIVILEGES;"
+
+      - name: go test -tags integration
+        run: go test -tags integration -race -timeout 20m ./internal/db/...
