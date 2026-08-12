@@ -43,11 +43,29 @@ type AuditEvent struct {
 	// Tool is the tool that was called. Both tools are recorded, because an
 	// enumeration of the configured connections is also something the agent did.
 	Tool string
-	// Identity is who made the call. It is empty for the whole of this objective
-	// — there is no authentication yet — and the field exists now so that the
-	// objective which adds one fills a field rather than changes a schema every
-	// downstream reader has already learned.
+	// Identity and Subject are the caller internal/auth admitted the request as:
+	// Identity is their verified email address, Subject is Google's `sub` claim
+	// for them.
+	//
+	// The comment that stood here promised that the objective which added
+	// authentication would fill a field rather than change a schema. This pair is
+	// what broke that promise, by one field, and it is worth saying why two are
+	// needed. The subject is the stable one: it is opaque, it does not change when
+	// the account behind it changes its address, and it is the only value here
+	// that is guaranteed unique for this OAuth client, so it is what two records
+	// months apart can be joined on. The email is the reconstructable one: it is
+	// what a person reading an incident recognises, and what the allowlist is
+	// written in terms of, so a stream carrying only subjects could not answer
+	// "who did this" without being crossed against a directory that whoever is
+	// reading may no longer have. Identity keeps its name rather than becoming
+	// Email precisely because of the reader that older comment existed to protect:
+	// a rename breaks every query already written against this stream.
+	//
+	// Both are empty when no identity reached the tool, which is a state no
+	// deployed server can be in — see [Server.caller] for why that is recorded as
+	// an absence rather than given a name.
 	Identity string
+	Subject  string
 
 	Alias     string
 	Engine    gate.Engine
@@ -152,6 +170,7 @@ func (a *Auditor) Record(e AuditEvent) {
 		Str("stream", "audit").
 		Str("tool", e.Tool).
 		Str("identity", e.Identity).
+		Str("subject", e.Subject).
 		Str("alias", e.Alias).
 		Str("engine", string(e.Engine)).
 		Str("statement", e.Statement).

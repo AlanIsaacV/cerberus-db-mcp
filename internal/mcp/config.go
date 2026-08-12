@@ -29,11 +29,12 @@ type Config struct {
 	// Address is where the HTTP listener binds.
 	//
 	// The default is loopback, and that is a safety property rather than a
-	// convenience. This objective builds no authentication — [Deps.Middleware] is
-	// a seam with a no-op default — so a process that bound every interface out of
-	// the box would be an unauthenticated database reader reachable from the
-	// network the moment someone ran it. Loopback means exposing it costs a
-	// deliberate edit to this one variable, which is a thing a reviewer can see.
+	// convenience. Authentication is not this package's — [Deps.Middleware] is a
+	// seam whose nil value is a no-op — so a Server built without one and bound to
+	// every interface out of the box would be an unauthenticated database reader
+	// reachable from the network the moment someone ran it. Loopback means exposing
+	// it costs a deliberate edit to this one variable, which is a thing a reviewer
+	// can see.
 	//
 	// This is the only address default in the package; there is no fallback
 	// elsewhere that could quietly answer for an empty value. TestNoOtherListenAddressDefaultExists

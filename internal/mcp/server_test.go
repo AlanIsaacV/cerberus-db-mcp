@@ -482,7 +482,10 @@ func TestAnErrorThatIsNotADatabaseErrorSaysNothing(t *testing.T) {
 
 	leaky := errors.New(`dial tcp 10.0.0.7:5432: connect: postgres://reader:hunter2@db.internal.example/ledger`)
 	in := ExecuteQueryInput{Alias: "warehouse", Statement: "SELECT 1"}
-	agentSide := srv.refuseOrFail(in, time.Millisecond, leaky).Error()
+	// A context with no identity on it, which is what a server built with a nil
+	// Middleware hands every handler: the audit record below names nobody, and this
+	// test is about what the agent is told rather than about who asked.
+	agentSide := srv.refuseOrFail(context.Background(), in, time.Millisecond, leaky).Error()
 
 	if agentSide != internalFailure {
 		t.Errorf("the agent was told %q, want the single internal message %q", agentSide, internalFailure)

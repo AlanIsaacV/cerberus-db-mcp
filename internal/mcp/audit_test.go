@@ -44,6 +44,8 @@ func TestAuditEventCarriesEveryFieldItPromises(t *testing.T) {
 	var buf bytes.Buffer
 	NewAuditor(&buf).Record(AuditEvent{
 		Tool:      ToolExecuteQuery,
+		Identity:  "analyst@example.com",
+		Subject:   "104427392015467281503",
 		Alias:     "warehouse",
 		Engine:    gate.PostgreSQL,
 		Statement: "SELECT * FROM invoices WHERE total > 100 -- and a comment",
@@ -70,7 +72,8 @@ func TestAuditEventCarriesEveryFieldItPromises(t *testing.T) {
 		"level":      "info",
 		"stream":     "audit",
 		"tool":       ToolExecuteQuery,
-		"identity":   "",
+		"identity":   "analyst@example.com",
+		"subject":    "104427392015467281503",
 		"alias":      "warehouse",
 		"engine":     "postgresql",
 		"statement":  "SELECT * FROM invoices WHERE total > 100 -- and a comment",
@@ -92,19 +95,23 @@ func TestAuditEventCarriesEveryFieldItPromises(t *testing.T) {
 	}
 }
 
-// TestTheIdentityFieldIsPresentAndEmpty pins the field the authentication
-// objective will fill. It is here now so that adding an identity is a value
-// change rather than a schema change for everything already reading the stream.
-func TestTheIdentityFieldIsPresentAndEmpty(t *testing.T) {
+// TestTheCallerFieldsArePresentOnAnEventThatNamesNobody is what the field
+// comment on [AuditEvent.Identity] promises a consumer: both caller fields are
+// written on every record, whether or not there was a caller to name, so a
+// reader can tell "this server identified nobody" from "this record predates the
+// field" without knowing which version wrote it.
+func TestTheCallerFieldsArePresentOnAnEventThatNamesNobody(t *testing.T) {
 	var buf bytes.Buffer
 	NewAuditor(&buf).Record(AuditEvent{Tool: ToolListConnections, Outcome: OutcomeAllowed})
 	event := decodeOneEvent(t, buf.String())
-	identity, present := event["identity"]
-	if !present {
-		t.Fatalf("the record has no identity field: %v", event)
-	}
-	if identity != "" {
-		t.Errorf("identity = %v, want it empty until authentication exists", identity)
+	for _, field := range []string{"identity", "subject"} {
+		value, present := event[field]
+		if !present {
+			t.Fatalf("the record has no %s field: %v", field, event)
+		}
+		if value != "" {
+			t.Errorf("%s = %v, want it empty on an event whose caller was not identified", field, value)
+		}
 	}
 }
 

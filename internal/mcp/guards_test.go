@@ -73,8 +73,15 @@ var allowedImports = map[string]bool{
 	"syscall":                     true,
 	"time":                        true,
 	"github.com/caarlos0/env/v11": true,
-	"github.com/modelcontextprotocol/go-sdk/mcp":          true,
-	"github.com/rs/zerolog":                               true,
+	"github.com/modelcontextprotocol/go-sdk/mcp": true,
+	"github.com/rs/zerolog":                      true,
+	// internal/auth is read from, never configured from: this package uses its
+	// Identity and the context accessor that carries one to a tool handler, so that
+	// an audit record can name its caller. Everything about proving who a caller is
+	// — the token, the Tokeninfo request, the allowlist — stays behind the
+	// func(http.Handler) http.Handler seam in [Deps.Middleware], and this package
+	// learning any of it would move a credential into the boundary package.
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth": true,
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db":   true,
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate": true,
 }

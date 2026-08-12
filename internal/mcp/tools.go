@@ -7,6 +7,7 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 )
@@ -125,7 +126,41 @@ func (s *Server) registerTools(srv *sdk.Server) {
 	}, s.executeQuery)
 }
 
-func (s *Server) listConnections(_ context.Context, _ *sdk.CallToolRequest, _ ListConnectionsInput) (*sdk.CallToolResult, *ListConnectionsResult, error) {
+// caller resolves the two identity fields of an audit event from the context the
+// SDK handed this handler.
+//
+// internal/auth puts an [auth.Identity] on the request it admits and this reads
+// it back out, which works only because the identity survives the SDK's
+// dispatch between those two points — a property of Stateless: true rather than
+// a documented contract, pinned by
+// TestAnIdentitySetOnTheRequestContextSurvivesTheSDKsDispatchToTheToolHandler.
+//
+// There is no identity when the server was built with a nil Middleware. Every
+// test in this package does that, and no deployment can: the binary refuses to
+// start without authentication configured. Both fields then stay empty rather
+// than carrying a word such as "unauthenticated", and the two are different
+// claims to whoever reads the stream. A word sits in a field whose every other
+// value is an email address, so it reads as a caller, and it satisfies any
+// downstream check that asks only whether an identity was recorded — including
+// this project's own "every query logged with its calling identity" — which is
+// backwards for the one state where nobody was identified. An absence fails that
+// check, which is the cheapest check anyone will write. What the operator needs
+// instead of a sentinel is to be told, so the telling goes to the application
+// log: a tool that ran for nobody is a defect in this process, and a defect
+// belongs where the person debugging is looking rather than in the vocabulary of
+// a stream whose worth is that its shape can be relied on.
+func (s *Server) caller(ctx context.Context, tool string) (email, subject string) {
+	id, ok := auth.IdentityFrom(ctx)
+	if !ok {
+		s.log.Warn().
+			Str("tool", tool).
+			Msg("a tool call ran with no identity on its context: either no authentication middleware is installed or the identity did not survive the transport, and the audit record for this call names nobody")
+		return "", ""
+	}
+	return id.Email, id.Subject
+}
+
+func (s *Server) listConnections(ctx context.Context, _ *sdk.CallToolRequest, _ ListConnectionsInput) (*sdk.CallToolResult, *ListConnectionsResult, error) {
 	started := time.Now()
 	settings := s.executor.Settings()
 	aliases := s.executor.Aliases()
@@ -146,11 +181,14 @@ func (s *Server) listConnections(_ context.Context, _ *sdk.CallToolRequest, _ Li
 	// Listing is audited like a query is. It carries no statement and no verdict,
 	// and it is recorded anyway: the log's question is what the agent did against
 	// this server, and enumerating the connections is part of the answer.
+	email, subject := s.caller(ctx, ToolListConnections)
 	s.audit.Record(AuditEvent{
-		Tool:    ToolListConnections,
-		Outcome: OutcomeAllowed,
-		Rows:    len(out.Connections),
-		Elapsed: time.Since(started),
+		Tool:     ToolListConnections,
+		Identity: email,
+		Subject:  subject,
+		Outcome:  OutcomeAllowed,
+		Rows:     len(out.Connections),
+		Elapsed:  time.Since(started),
 	})
 	return nil, out, nil
 }
@@ -169,11 +207,14 @@ func (s *Server) executeQuery(ctx context.Context, _ *sdk.CallToolRequest, in Ex
 	elapsed := time.Since(started)
 
 	if err != nil {
-		return nil, nil, s.refuseOrFail(in, elapsed, err)
+		return nil, nil, s.refuseOrFail(ctx, in, elapsed, err)
 	}
 
+	email, subject := s.caller(ctx, ToolExecuteQuery)
 	s.audit.Record(AuditEvent{
 		Tool:      ToolExecuteQuery,
+		Identity:  email,
+		Subject:   subject,
 		Alias:     result.Alias,
 		Engine:    result.Engine,
 		Statement: in.Statement,
@@ -200,9 +241,16 @@ func (s *Server) executeQuery(ctx context.Context, _ *sdk.CallToolRequest, in Ex
 // Both halves happen here and in this order so that neither can be skipped: a
 // call that produced no audit line is a call the log cannot account for, and
 // that includes the calls nobody wanted to happen.
-func (s *Server) refuseOrFail(in ExecuteQueryInput, elapsed time.Duration, err error) error {
+//
+// It takes the handler's ctx for one reason: the caller's identity is on it, and
+// a refusal is the audit line that most needs to say who submitted the
+// statement, since nothing else in this process recorded that it was attempted.
+func (s *Server) refuseOrFail(ctx context.Context, in ExecuteQueryInput, elapsed time.Duration, err error) error {
+	email, subject := s.caller(ctx, ToolExecuteQuery)
 	event := AuditEvent{
 		Tool:      ToolExecuteQuery,
+		Identity:  email,
+		Subject:   subject,
 		Alias:     in.Alias,
 		Statement: in.Statement,
 		Outcome:   OutcomeFailed,

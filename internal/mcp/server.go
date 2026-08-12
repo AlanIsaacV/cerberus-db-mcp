@@ -18,10 +18,10 @@
 //     the calls the gate refused, because a log of only what ran cannot answer
 //     the question that matters against a database this project does not own.
 //
-// Authentication is deliberately absent. [Deps.Middleware] is the seam it will
-// arrive through and its default is a no-op, and because there is nothing
-// guarding the endpoint in this objective the listener binds to loopback unless
-// an operator changes one variable on purpose — see [Config.Address].
+// Authentication is not this package's. [Deps.Middleware] is the seam it arrives
+// through, and a server built without one guards its endpoint with nothing, which
+// is why the listener binds to loopback unless an operator changes one variable on
+// purpose — see [Config.Address].
 package mcp
 
 import (
@@ -80,11 +80,12 @@ type Deps struct {
 	Audit *Auditor
 	// Middleware is the authentication seam.
 	//
-	// It is a plain http.Handler decorator because that is the shape the next
-	// objective's bearer-token validator already has, and because a seam with no
-	// type of its own cannot acquire assumptions about tokens before there is a
-	// validator to have them. Nil means no wrapping, which for this objective is
-	// the only behaviour there is.
+	// It is a plain http.Handler decorator because that is the shape internal/auth's
+	// validator has, and because a seam with no type of its own cannot acquire
+	// assumptions about what a caller presents. Nil means no wrapping — which is
+	// what keeps every test that builds a Server without one working, and is why
+	// refusing to start without authentication is the binary's property rather than
+	// this constructor's.
 	Middleware func(http.Handler) http.Handler
 	// Ready, when non-nil, is called once with the address the listener actually
 	// bound. It exists because "127.0.0.1:0" is the only way to run this server in
@@ -154,6 +155,41 @@ func (s *Server) middlewareOrPassThrough() func(http.Handler) http.Handler {
 	return s.middleware
 }
 
+// warnIfReachableBeyondThisHost says what binding a non-loopback address means
+// for this particular server.
+//
+// It is a warning rather than a refusal because a server that refused to bind
+// anything but loopback would have to be changed to be deployed, and the
+// deployment this repository is for puts a tunnel in front of the listener. What
+// must not happen is that the exposure goes unnoticed.
+//
+// The two texts differ because the danger does. With no middleware there is
+// nothing between the listener and every configured database, and that is the
+// sentence an operator has to read. With one installed, saying the same thing
+// would be false in exactly the situation where an operator most needs the line to
+// be accurate — so it says what this package can actually know: the listener is
+// reachable beyond this host, and requests are answered by whatever authenticates
+// them. Which middleware that is, and what it checks, is not this package's to
+// claim: s.middleware == nil is the whole of what it can see.
+//
+// It is a method of its own so that both texts can be asserted without a test
+// binding a public interface. Run calls it once, immediately after the listener
+// binds and before it reports the address.
+func (s *Server) warnIfReachableBeyondThisHost(addr string) {
+	if s.cfg.IsLoopback() {
+		return
+	}
+	if s.middleware == nil {
+		s.log.Warn().
+			Str("address", addr).
+			Msg("the listener is not on a loopback address; this process performs no authentication of its own, so anything that can reach this address can read every configured database")
+		return
+	}
+	s.log.Warn().
+		Str("address", addr).
+		Msg("the listener is not on a loopback address, so it is reachable beyond this host; every request to it is authenticated by the configured middleware")
+}
+
 func (s *Server) mcpHandler() http.Handler {
 	srv := sdk.NewServer(&sdk.Implementation{Name: serverName, Version: serverVersion}, nil)
 	s.registerTools(srv)
@@ -210,15 +246,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	addr := listener.Addr().String()
-	if !s.cfg.IsLoopback() {
-		// A warning rather than a refusal: the deployment objective puts an
-		// authenticating middleware and a tunnel in front of this process, and a
-		// server that refused to bind anything but loopback would have to be
-		// changed to be deployed. What must not happen is that it goes unnoticed.
-		s.log.Warn().
-			Str("address", addr).
-			Msg("the listener is not on a loopback address; this process performs no authentication of its own, so anything that can reach this address can read every configured database")
-	}
+	s.warnIfReachableBeyondThisHost(addr)
 	s.log.Info().Str("address", addr).Str("path", s.cfg.Path).Msg("serving MCP over streamable HTTP")
 	if s.ready != nil {
 		s.ready(addr)

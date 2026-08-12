@@ -10,9 +10,14 @@
 // wiring is the one thing a main can hold without putting a guarantee somewhere
 // no test can reach.
 //
-// The process has no authentication of its own in this objective. What stands
-// in for it is the loopback default on CERBERUS_MCP_ADDRESS, so nothing in this
-// file may resolve, default or substitute a listen address.
+// Authentication is internal/auth's, and this file is only its wiring: it loads
+// that package's configuration, asks it for the one decorator it hands out, and
+// assigns it into internal/mcp's seam. Nothing here reads anything a client
+// presented — internal/auth's guards_test.go scans this directory to keep that
+// so, and it fails on a variable here merely named after a credential. The
+// loopback default on CERBERUS_MCP_ADDRESS is the outer half of the same
+// boundary, so nothing in this file may resolve, default or substitute a listen
+// address.
 package main
 
 import (
@@ -21,6 +26,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/mcp"
@@ -37,8 +43,8 @@ func main() {
 	if err := run(log); err != nil {
 		// Err(err) and nothing else. The errors that arrive here are built to be
 		// read by an operator without carrying a credential — internal/db's Secret
-		// redacts on every formatting verb, and both configuration loaders name the
-		// variable they rejected instead of quoting its value. Reformatting one
+		// redacts on every formatting verb, and all three configuration loaders name
+		// the variable they rejected instead of quoting its value. Reformatting one
 		// here, with %+v or by assembling a message out of its parts, is the way
 		// that discipline gets defeated from outside the package that keeps it.
 		log.Error().Err(err).Msg("cerberus-db-mcp is exiting on an error")
@@ -55,6 +61,47 @@ func run(log zerolog.Logger) error {
 	if err != nil {
 		return err
 	}
+
+	// Beside the server's own configuration, and before the audit destination is
+	// opened, because the two variables read here are the ones whose absence would
+	// otherwise start a server that works: internal/mcp reads a nil Middleware as
+	// no wrapping — which is what keeps every test that builds a Server without one
+	// working — so this call is the whole of what stands between an unset variable
+	// and a database reader that admits whoever reaches the listener. Refusing here
+	// also means a deployment that was never going to be authenticated leaves no
+	// audit file behind as evidence that it started.
+	//
+	// It is early for the reason db.Open's comment below draws the line on: what the
+	// environment settles is settled before anything binds, and what depends on
+	// somebody else being reachable is not. Nothing here asks Google anything, so
+	// whether Tokeninfo is up has no say in whether this process starts.
+	authCfg, err := auth.LoadConfig()
+	if err != nil {
+		return err
+	}
+
+	middleware, err := auth.NewMiddleware(*authCfg, log)
+	if err != nil {
+		return err
+	}
+
+	// Unredacted, and the argument for it: a client ID is a public identifier, there
+	// is no OAuth secret anywhere in this process because checking somebody else's
+	// credential does not need one, and a client ID differing from the one the agent
+	// was configured with answers 401 to every request and produces no other symptom
+	// — so both values side by side in a deploy log turn an afternoon into a minute.
+	// The allowlist is beside it twice, and the pair is the point. The raw entries are
+	// what reads against the variable an operator set; the normalised ones are what a
+	// request is actually compared with, so the trailing comma that admits nobody and
+	// the stray space that would have been trimmed are visible as a difference between
+	// two lists rather than inferred from a count. An email an identity provider
+	// vouched for is not a credential, which is why internal/auth logs one on every
+	// refusal too.
+	log.Info().
+		Str("google_client_id", authCfg.ClientID).
+		Strs("allowed_identities", authCfg.AllowedEmails).
+		Strs("allowed_identities_normalised", authCfg.Allowlist()).
+		Msg("callers must present a Google credential this client issued, held by an allowlisted identity")
 
 	auditWriter, closeAudit, err := mcp.OpenAuditWriter(cfg.Audit)
 	if err != nil {
@@ -94,8 +141,9 @@ func run(log zerolog.Logger) error {
 		Executor: executor,
 		Log:      log,
 		Audit:    mcp.NewAuditor(auditWriter),
-		// Middleware is left nil, which internal/mcp reads as no wrapping. The
-		// authentication objective fills this field and changes nothing else here.
+		// Wraps the MCP endpoint only, which is internal/mcp's own arrangement and
+		// not something this file chooses.
+		Middleware: middleware,
 	})
 	if err != nil {
 		// The executor is not closed on this path and does not need to be: nothing
