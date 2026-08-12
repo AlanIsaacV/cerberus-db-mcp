@@ -44,7 +44,12 @@ services:
       MYSQL_ROOT_PASSWORD: cerberus-test-my-root
       MYSQL_USER: cerberus
       MYSQL_PASSWORD: cerberus-test-my
-      MYSQL_DATABASE: cerberus
+      # Not the username, and not a string containing it. The sanitisation tests
+      # check the database name and the user name as separate values that must
+      # never reach the agent; spelling them the same way would collapse the two
+      # checks into one and leave the suite unable to say which of them leaked.
+      # postgres-init makes the same choice for the same reason.
+      MYSQL_DATABASE: testbed
     ports:
       - "53306:3306"
     volumes:

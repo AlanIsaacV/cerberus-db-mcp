@@ -51,6 +51,36 @@ jobs:
             exit 1
           fi
 
+      # internal/db gets the same whole-closure treatment for one of the gate's
+      # rules only. It legitimately depends on sockets, TLS and three drivers, so
+      # the enumerated list above is its per-file check in
+      # internal/db/deps_test.go and not this. What must hold here is that no
+      # transport ever reaches it: a db that knew what MCP was could not be run
+      # against a real engine by `go test` alone, and the layer where the gate,
+      # the row cap and the rolled-back transaction are enforced would stop being
+      # testable without the layer that exposes it.
+      - name: db dependency closure
+        run: |
+          deps=$(go list -deps ./internal/db | grep -v '^github.com/AlanIsaacV/cerberus-db-mcp')
+          if echo "$deps" | grep -q 'modelcontextprotocol'; then
+            echo "internal/db's dependency closure contains the MCP SDK:"
+            echo "$deps" | grep 'modelcontextprotocol'
+            exit 1
+          fi
+
+      # The deployment target is a Raspberry Pi 4B, and the binary that reaches it
+      # is a single static file. CGO_ENABLED=0 is the half of that which a
+      # dependency can break silently — one cgo edge anywhere in the closure and
+      # this stops compiling — so it is checked on every change rather than
+      # discovered at release. The whole repository is built, not just cmd/, so a
+      # package that is only reachable from a test is covered too.
+      - name: cross-compile static linux/arm64
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: arm64
+        run: go build ./...
+
       # The corpus is the safety evidence, so the fuzzer runs on every change
       # rather than only when someone remembers to.
       - name: go test -fuzz
@@ -99,7 +129,13 @@ jobs:
           MYSQL_ROOT_PASSWORD: cerberus-test-my-root
           MYSQL_USER: cerberus
           MYSQL_PASSWORD: cerberus-test-my
-          MYSQL_DATABASE: cerberus
+          # Named so that it is not the username and does not contain it. The
+          # sanitisation criterion names the database and the user as separate
+          # things that must not reach the agent, and a fixture that spells them
+          # the same way makes the two checks one check under two labels: a leak
+          # of either fails, and neither the test nor the person reading it can
+          # say which leaked.
+          MYSQL_DATABASE: testbed
         ports:
           - 53306:3306
         options: >-
@@ -119,14 +155,16 @@ jobs:
       CERBERUS_DB_PGTEST_ENGINE: postgresql
       CERBERUS_DB_PGTEST_HOST: 127.0.0.1
       CERBERUS_DB_PGTEST_PORT: '55432'
-      CERBERUS_DB_PGTEST_DATABASE: cerberus
+      # The database name and the user name are deliberately unalike, and neither
+      # is a substring of the other. See MYSQL_DATABASE above for why.
+      CERBERUS_DB_PGTEST_DATABASE: testbed
       CERBERUS_DB_PGTEST_USER: cerberus
       CERBERUS_DB_PGTEST_PASSWORD: cerberus-test-pg
       CERBERUS_DB_PGTEST_TLS: disable
       CERBERUS_DB_MYTEST_ENGINE: mysql
       CERBERUS_DB_MYTEST_HOST: 127.0.0.1
       CERBERUS_DB_MYTEST_PORT: '53306'
-      CERBERUS_DB_MYTEST_DATABASE: cerberus
+      CERBERUS_DB_MYTEST_DATABASE: testbed
       CERBERUS_DB_MYTEST_USER: cerberus
       CERBERUS_DB_MYTEST_PASSWORD: cerberus-test-my
       CERBERUS_DB_MYTEST_TLS: disable
@@ -160,12 +198,37 @@ jobs:
         run: |
           psql -h 127.0.0.1 -p 55432 -U postgres -d postgres -v ON_ERROR_STOP=1 \
             -c "CREATE ROLE cerberus LOGIN PASSWORD 'cerberus-test-pg'" \
-            -c "CREATE DATABASE cerberus OWNER cerberus"
+            -c "CREATE DATABASE testbed OWNER cerberus"
           mysql -h 127.0.0.1 -P 53306 --protocol=TCP -uroot -pcerberus-test-my-root -e "
             SET GLOBAL log_output = 'TABLE';
             SET GLOBAL general_log = 1;
             GRANT SELECT ON mysql.general_log TO 'cerberus'@'%';
             FLUSH PRIVILEGES;"
 
+      # The whole repository, not an enumerated list of the packages that have
+      # container-backed tests today. The list is what went wrong once already:
+      # it read ./internal/db/... and internal/mcp's integration tests — the only
+      # evidence for five of that objective's acceptance criteria — were never
+      # run by anything. A package whose tests need an engine now joins this job
+      # by existing rather than by somebody remembering this line.
+      #
+      # It does not weaken the argument the job comment above makes. That
+      # argument is about the *untagged* job: `go test ./...` with no build tag
+      # must pass with nothing running, and it is the job above, without
+      # services, that proves it. Running the same package set here with the tag
+      # and the engines up adds coverage; it takes none away.
+      #
+      # -p 1 is what the widening cost. `go test` runs one package binary per
+      # available core, and until this line said ./... there was only ever one
+      # binary here. Now there are two, they share one postgres and one mysql
+      # container on a two-core runner, and they want opposite things from it:
+      # internal/mcp provokes its timeout class with reads chosen to be
+      # expensive — a 200000 x 200000 cross join on postgres, a triple self-join
+      # of information_schema.columns on mysql — while internal/db asserts that a
+      # cancelled query stops strictly before QueryTimeout + TimeoutGrace, which
+      # is 8s with the variables above. Run together, internal/mcp's load is
+      # inside internal/db's bound, and the result is a red run that reproduces
+      # nowhere. Deleting -p 1 makes this job faster and makes those assertions
+      # flaky; the two are the same change.
       - name: go test -tags integration
-        run: go test -tags integration -race -timeout 20m ./internal/db/...
+        run: go test -tags integration -race -timeout 20m -p 1 ./...
