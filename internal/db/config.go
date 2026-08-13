@@ -32,8 +32,9 @@ var (
 	// ErrMissingVariable reports a required per-alias variable that is unset or
 	// empty.
 	ErrMissingVariable = errors.New("required variable is not set")
-	// ErrInvalidVariable reports a variable whose value this package cannot use.
-	// The error never quotes the value.
+	// ErrInvalidVariable reports a variable this package cannot use: a value it
+	// cannot parse, or a variable that has been replaced by another one. The error
+	// never quotes the value.
 	ErrInvalidVariable = errors.New("variable value is not usable")
 	// ErrUnsupportedVariable reports a variable that is set, is not this
 	// package's, and would decide something this package insists on deciding
@@ -182,10 +183,16 @@ func (s Settings) statementDeadline(e gate.Engine) time.Duration {
 // method that renders one: a DSN is assembled inside the per-engine file that
 // needs it and is never held, so there is nothing for a stray print to find.
 type AliasSpec struct {
-	Alias    string
-	Engine   gate.Engine
-	Host     string
-	Port     int
+	Alias  string
+	Engine gate.Engine
+	Host   string
+	Port   int
+	// Database is empty when the alias exposes no single database, which is a
+	// configuration an operator may choose on MySQL and SQL Server: the connection
+	// then has no default database and the login reads whatever it can reach
+	// through a qualified name. It is never empty on PostgreSQL, where a
+	// connection is bound to one database by the protocol; [parseDatabases] is
+	// what enforces that.
 	Database string
 	User     string
 	Password Secret
@@ -202,14 +209,35 @@ type Config struct {
 // per-alias variable suffixes. The names are values rather than a struct tag
 // because they are only known once an alias name is.
 const (
-	suffixEngine   = "_ENGINE"
-	suffixHost     = "_HOST"
-	suffixPort     = "_PORT"
-	suffixDatabase = "_DATABASE"
-	suffixUser     = "_USER"
-	suffixPassword = "_PASSWORD"
-	suffixTLS      = "_TLS"
+	suffixEngine    = "_ENGINE"
+	suffixHost      = "_HOST"
+	suffixPort      = "_PORT"
+	suffixDatabases = "_DATABASES"
+	suffixUser      = "_USER"
+	suffixPassword  = "_PASSWORD"
+	suffixTLS       = "_TLS"
 )
+
+// suffixRetiredDatabase is the singular variable [suffixDatabases] replaced. It is
+// named here for one purpose, which is to refuse a configuration that still sets
+// it, and it is deliberately not read as configuration anywhere.
+//
+// Tolerating it would be worse than either alternative. An operator who left
+// _DATABASE on a MySQL alias would get a working connection to no default
+// database and no hint that the name they chose was never read; on PostgreSQL they
+// would be told a variable is missing while looking at one they had set. So the
+// refusal names both variables and is the whole migration instruction.
+const suffixRetiredDatabase = "_DATABASE"
+
+// derivedAliasSeparator joins a parent alias to one of the databases it lists. A
+// dot is the one character that cannot appear in a declared alias — see
+// [variableFamily], which refuses it — and that refusal is what makes a derived
+// name unable to collide with a declared one. It is load-bearing rather than
+// incidental: relax it and two aliases can silently become one.
+//
+// A derived name never becomes part of a variable name, so nothing reads
+// CERBERUS_DB_CRM.SALES_* and none of variableFamily's rules apply to it.
+const derivedAliasSeparator = "."
 
 // aliasPrefix is the fixed part of every per-alias variable name.
 const aliasPrefix = "CERBERUS_DB_"
@@ -273,15 +301,54 @@ func LoadConfigFrom(environ map[string]string) (*Config, error) {
 		families[i] = family
 	}
 
+	// names is every alias name that will exist once derivation has run, seeded
+	// with all the declared ones before any of it does. Seeding first is what makes
+	// the check symmetric: a derived name has to be refused whether the alias it
+	// would shadow appears before its parent in CERBERUS_DB_ALIASES or after it.
+	names := make(map[string]string, len(aliases))
+	for _, alias := range aliases {
+		names[alias] = alias
+	}
+
 	cfg := &Config{Settings: settings}
 	for i, alias := range aliases {
-		spec, err := parseAlias(alias, families[i], environ)
+		specs, err := parseAlias(alias, families[i], environ)
 		if err != nil {
 			return nil, err
 		}
-		cfg.Aliases = append(cfg.Aliases, spec)
+		for _, spec := range specs {
+			// A spec that kept its parent's name was claimed by the seeding above;
+			// only a derived name is a new claim.
+			if spec.Alias != alias {
+				if err := claimAlias(names, alias, spec.Alias, families[i]+suffixDatabases); err != nil {
+					return nil, err
+				}
+			}
+			cfg.Aliases = append(cfg.Aliases, spec)
+		}
 	}
 	return cfg, nil
+}
+
+// claimAlias records one alias name and refuses a name that is already in use.
+//
+// It is unreachable through [LoadConfigFrom] as this package stands, and it is
+// here rather than deleted because of what makes it unreachable: a derived name
+// always contains [derivedAliasSeparator] and [variableFamily] refuses that
+// character in a declared name, so the two sets cannot meet while that refusal
+// stands — and it stands one edit away from not standing. This is what would stop
+// two connections silently sharing a name on the day somebody relaxes it.
+//
+// The comparison is a map lookup, so it is exact and case-sensitive. That is the
+// same rule alias lookup follows in [Executor.Execute], deliberately: KALLPA and
+// kallpa are two names here as they are everywhere else in this package.
+func claimAlias(names map[string]string, parent, name, variable string) error {
+	if other, taken := names[name]; taken {
+		return fmt.Errorf("db: alias %q: %s derives the alias %q, which alias %q already uses: %w",
+			parent, variable, name, other, ErrDuplicateAlias)
+	}
+	names[name] = parent
+	return nil
 }
 
 // serviceFileVariables are the variables that make pgx read a service file. The
@@ -346,6 +413,13 @@ func refuseForeignConfiguration(specs []AliasSpec) error {
 	// Each check is gated on an alias that would actually reach the driver that
 	// reads the variable. An operator with PGSERVICE set for their own psql and no
 	// PostgreSQL alias configured has broken nothing.
+	//
+	// It scans specs rather than declared aliases, which is what keeps it correct
+	// now that one variable family produces one spec per database it lists: a
+	// derived spec carries its parent's engine, and every declared alias yields at
+	// least one spec whether or not it lists any database. Answer this question from
+	// anything that can be empty for a configured alias and the refusal silently
+	// stops applying to the driver it was written for.
 	uses := func(engine gate.Engine) bool {
 		return slices.ContainsFunc(specs, func(s AliasSpec) bool { return s.Engine == engine })
 	}
@@ -442,7 +516,9 @@ func variableFamily(alias string) (string, error) {
 	return aliasPrefix + b.String(), nil
 }
 
-func parseAlias(alias, family string, environ map[string]string) (AliasSpec, error) {
+// parseAlias resolves one declared alias into the connections it configures:
+// one per database it lists, or a single one exposing no particular database.
+func parseAlias(alias, family string, environ map[string]string) ([]AliasSpec, error) {
 	required := func(suffix string) (string, error) {
 		name := family + suffix
 		v, ok := environ[name]
@@ -452,11 +528,19 @@ func parseAlias(alias, family string, environ map[string]string) (AliasSpec, err
 		return v, nil
 	}
 
+	// Ahead of everything else, including the engine. An operator migrating from
+	// the singular variable wants to be told that before being told what is missing
+	// as a consequence of it.
+	if retired, ok := environ[family+suffixRetiredDatabase]; ok && retired != "" {
+		return nil, fmt.Errorf("db: alias %q: %s was replaced by %s, which takes a comma-separated list of database names: %w",
+			alias, family+suffixRetiredDatabase, family+suffixDatabases, ErrInvalidVariable)
+	}
+
 	spec := AliasSpec{Alias: alias}
 
 	engineName, err := required(suffixEngine)
 	if err != nil {
-		return AliasSpec{}, err
+		return nil, err
 	}
 	engine, err := gate.ParseEngine(engineName)
 	if err != nil {
@@ -464,45 +548,111 @@ func parseAlias(alias, family string, environ map[string]string) (AliasSpec, err
 		// the closed set of accepted values says everything an operator needs, and
 		// the value could be anything — including, when a family is filled in from
 		// the wrong template, a credential.
-		return AliasSpec{}, fmt.Errorf("db: alias %q: %s must be one of %v: %w", alias, family+suffixEngine, gate.Engines(), ErrInvalidVariable)
+		return nil, fmt.Errorf("db: alias %q: %s must be one of %v: %w", alias, family+suffixEngine, gate.Engines(), ErrInvalidVariable)
 	}
 	spec.Engine = engine
 
 	if spec.Host, err = required(suffixHost); err != nil {
-		return AliasSpec{}, err
+		return nil, err
 	}
 	portText, err := required(suffixPort)
 	if err != nil {
-		return AliasSpec{}, err
+		return nil, err
 	}
 	// strconv's error text quotes the input, so it is discarded rather than
 	// wrapped.
 	port, convErr := strconv.Atoi(portText)
 	if convErr != nil || port < 1 || port > 65535 {
-		return AliasSpec{}, fmt.Errorf("db: alias %q: %s must be a TCP port between 1 and 65535: %w", alias, family+suffixPort, ErrInvalidVariable)
+		return nil, fmt.Errorf("db: alias %q: %s must be a TCP port between 1 and 65535: %w", alias, family+suffixPort, ErrInvalidVariable)
 	}
 	spec.Port = port
 
-	if spec.Database, err = required(suffixDatabase); err != nil {
-		return AliasSpec{}, err
+	// After the engine is assigned, because whether this variable is required is a
+	// question about the engine.
+	databases, err := parseDatabases(alias, family, spec.Engine, environ)
+	if err != nil {
+		return nil, err
 	}
 	if spec.User, err = required(suffixUser); err != nil {
-		return AliasSpec{}, err
+		return nil, err
 	}
 	password, err := required(suffixPassword)
 	if err != nil {
-		return AliasSpec{}, err
+		return nil, err
 	}
 	spec.Password = Secret(password)
 
 	if mode, ok := environ[family+suffixTLS]; ok && mode != "" {
 		if !slices.Contains(tlsModes(), TLSMode(mode)) {
-			return AliasSpec{}, fmt.Errorf("db: alias %q: %s must be one of %v: %w", alias, family+suffixTLS, tlsModes(), ErrInvalidVariable)
+			return nil, fmt.Errorf("db: alias %q: %s must be one of %v: %w", alias, family+suffixTLS, tlsModes(), ErrInvalidVariable)
 		}
 		spec.TLS = TLSMode(mode)
 	}
 
-	return spec, nil
+	// One spec whatever happens, which is the invariant [refuseForeignConfiguration]
+	// depends on: it asks whether any spec uses a given engine, and an alias that
+	// produced no spec at all would be an alias whose driver nothing knows is in
+	// play.
+	if len(databases) == 0 {
+		return []AliasSpec{spec}, nil
+	}
+
+	// A single-element list still derives, so CERBERUS_DB_CRM_DATABASES=sales is the
+	// alias crm.sales and not crm. Keeping the parent's name for a one-element list
+	// was the obvious alternative and it was rejected: adding a second database
+	// would then silently rename the first alias, and a renamed alias is something
+	// an agent finds out about by being told the alias it just used is unknown.
+	out := make([]AliasSpec, 0, len(databases))
+	for _, database := range databases {
+		derived := spec
+		derived.Alias = alias + derivedAliasSeparator + database
+		derived.Database = database
+		out = append(out, derived)
+	}
+	return out, nil
+}
+
+// parseDatabases resolves the set of databases one alias exposes. It returns no
+// databases when the variable is absent and the engine allows that.
+//
+// The list is comma-separated to match CERBERUS_DB_ALIASES, each element is
+// trimmed, and an empty element is refused rather than skipped: "a,,b" is a typo
+// far more often than it is a way of writing two databases, and skipping it would
+// produce a configuration the operator did not write.
+//
+// PostgreSQL is the engine where absence cannot be accepted. A pgx connection is
+// bound to one database by the protocol and there is no cross-database query, so
+// there is nothing for a database-less connection to read — and pgx sets no
+// database default of its own, which means omitting the name makes the *server*
+// default it to the user name. That is a silent surprise rather than a useful
+// default, so it is a refusal at startup instead.
+func parseDatabases(alias, family string, engine gate.Engine, environ map[string]string) ([]string, error) {
+	name := family + suffixDatabases
+	raw, ok := environ[name]
+	if !ok || raw == "" {
+		if engine == gate.PostgreSQL {
+			return nil, fmt.Errorf("db: alias %q: %s: %w", alias, name, ErrMissingVariable)
+		}
+		return nil, nil
+	}
+
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		database := strings.TrimSpace(part)
+		if database == "" {
+			return nil, fmt.Errorf("db: alias %q: %s lists an empty database name: %w", alias, name, ErrInvalidVariable)
+		}
+		// Exact, so case-sensitive, for the reason given on [claimAlias]. Two
+		// databases whose names differ only in case are two databases on MySQL and
+		// on PostgreSQL, and folding them together here would refuse a
+		// configuration that works.
+		if slices.Contains(out, database) {
+			return nil, fmt.Errorf("db: alias %q: %s lists the same database twice: %w", alias, name, ErrInvalidVariable)
+		}
+		out = append(out, database)
+	}
+	return out, nil
 }
 
 // milliseconds renders a duration the way every one of the three engines wants

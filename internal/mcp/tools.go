@@ -12,13 +12,15 @@ import (
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 )
 
-// The tool names. There are two, and the list is closed for this objective:
-// schema introspection is a later one, and there is deliberately no dry-run
-// validator and nothing that reads or edits the gate's ruleset — a tool that
-// could relax the rules is a tool an agent could use to relax them.
+// The tool names. There are three, and the list is closed for this objective:
+// schema introspection below the database level is a later one, and there is
+// deliberately no dry-run validator and nothing that reads or edits the gate's
+// ruleset — a tool that could relax the rules is a tool an agent could use to
+// relax them.
 const (
 	ToolListConnections = "list_connections"
 	ToolExecuteQuery    = "execute_query"
+	ToolListDatabases   = "list_databases"
 )
 
 // ListConnectionsInput is empty: listing takes no arguments. It exists as a type
@@ -76,6 +78,33 @@ type ExecuteQueryResult struct {
 	RowCap    int  `json:"row_cap" jsonschema:"the row cap that applied to this result"`
 }
 
+// ListDatabasesInput is list_databases' whole argument list: one alias.
+//
+// There is no pattern and no limit, for the reason written on [ExecuteQueryInput].
+// The statement this tool runs is internal/db's own constant, and its whole safety
+// property is that it is a constant — an argument that reached it would be an
+// argument that moves what this process sends somebody else's server, and the
+// answer is small enough that an agent can filter it itself.
+type ListDatabasesInput struct {
+	Alias string `json:"alias" jsonschema:"which configured connection to ask, named exactly as list_connections gives it; this is an alias and not a database name"`
+}
+
+// ListDatabasesResult is what list_databases returns.
+//
+// It wraps the list in an object for the reason [ListConnectionsResult] does: the
+// SDK derives the output schema from this type and rejects a tool whose output
+// schema is not of type "object".
+//
+// Truncated is carried for the reason it is carried on [ExecuteQueryResult] and on
+// [Connection]: the row cap applies to this statement like any other, and an agent
+// that is not told its list was cut off reads a partial answer as the complete set
+// of databases — which is exactly the question it asked.
+type ListDatabasesResult struct {
+	Databases []string `json:"databases" jsonschema:"the database names this connection's login can see, with the engine's own system databases removed; a name here is not an alias"`
+	Truncated bool     `json:"truncated" jsonschema:"true when the row cap stopped the read, so this list is incomplete"`
+	RowCap    int      `json:"row_cap" jsonschema:"the row cap that applied to this result"`
+}
+
 // internalFailure is what the agent is told when this layer produced an error
 // that is not a *db.Error.
 //
@@ -99,7 +128,7 @@ type agentError struct{ message string }
 
 func (e *agentError) Error() string { return e.message }
 
-// registerTools installs both tools on an SDK server.
+// registerTools installs the three tools on an SDK server.
 //
 // They go through the generic AddTool rather than (*Server).AddTool, and that is
 // load-bearing rather than stylistic. The generic path turns an error returned
@@ -124,6 +153,27 @@ func (s *Server) registerTools(srv *sdk.Server) {
 			"Results are capped and the statement is stopped if it runs too long; call list_connections for the limits in force.",
 		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true},
 	}, s.executeQuery)
+
+	// The description is doing one job above all others, and it is worth saying
+	// which. This tool reports what exists on the server behind an alias, and on
+	// PostgreSQL that is deliberately not the same set as what this server can read:
+	// a cluster database that is not on its alias's configured list has no
+	// connection and no alias of its own, because creating one after startup is a
+	// later objective. An agent that reads a name here and hands it to execute_query
+	// as an alias gets "no database is configured under that alias" — so the
+	// description, and nothing else in this process, is what stops it trying. The
+	// per-engine asymmetry is stated for the same reason: on MySQL and SQL Server a
+	// name is something to qualify a table with on the same alias, and on PostgreSQL
+	// it is something to ask an operator to configure.
+	sdk.AddTool(srv, &sdk.Tool{
+		Name: ToolListDatabases,
+		Description: "List the database names one configured connection's login can see, with that engine's own system databases removed. " +
+			"It answers what exists on that server, which is not the same as what this server can read: a name returned here is not an alias, and passing one to execute_query as its alias is refused. " +
+			"What a name is good for depends on the dialect list_connections reports for the alias. On mysql and sqlserver, qualify a table with it in a statement you run against this same alias — database.table, or database.schema.table. " +
+			"On postgresql a connection can only read the database it was configured for, so a database that is not already its own entry in list_connections cannot be queried at all until an operator configures one; this tool is how you find out which those are, and which of them are worth asking for. " +
+			"The list is capped like any other result and says so when the cap cut it off.",
+		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true},
+	}, s.listDatabases)
 }
 
 // caller resolves the two identity fields of an audit event from the context the
@@ -207,7 +257,7 @@ func (s *Server) executeQuery(ctx context.Context, _ *sdk.CallToolRequest, in Ex
 	elapsed := time.Since(started)
 
 	if err != nil {
-		return nil, nil, s.refuseOrFail(ctx, in, elapsed, err)
+		return nil, nil, s.refuseOrFail(ctx, attempt{tool: ToolExecuteQuery, alias: in.Alias, statement: in.Statement}, elapsed, err)
 	}
 
 	email, subject := s.caller(ctx, ToolExecuteQuery)
@@ -235,6 +285,71 @@ func (s *Server) executeQuery(ctx context.Context, _ *sdk.CallToolRequest, in Ex
 	}, nil
 }
 
+func (s *Server) listDatabases(ctx context.Context, _ *sdk.CallToolRequest, in ListDatabasesInput) (*sdk.CallToolResult, *ListDatabasesResult, error) {
+	started := time.Now()
+
+	// This handler's entire safety argument is that it calls this and nothing else.
+	// internal/db resolves the alias, asks the gate about its own discovery
+	// statement, bounds the context and runs it inside the same read-only,
+	// unconditionally-rolled-back transaction execute_query gets — so the gate is not
+	// something this tool has to remember to consult, and there is no exemption to
+	// widen. This package holds no SQL and no second path to a driver, and
+	// TestListDatabasesIsOneCallThroughTheExecutorAndNothingElse checks that against
+	// the source rather than trusting this comment.
+	list, err := s.executor.ListDatabases(ctx, in.Alias)
+	elapsed := time.Since(started)
+
+	if err != nil {
+		return nil, nil, s.refuseOrFail(ctx, attempt{tool: ToolListDatabases, alias: in.Alias}, elapsed, err)
+	}
+
+	email, subject := s.caller(ctx, ToolListDatabases)
+	s.audit.Record(AuditEvent{
+		Tool:     ToolListDatabases,
+		Identity: email,
+		Subject:  subject,
+		Alias:    list.Alias,
+		Engine:   list.Engine,
+		Outcome:  OutcomeAllowed,
+		// The gate's own decision on the discovery statement, recorded for the reason
+		// execute_query's is: an audit line that cannot say why a statement was
+		// permitted is an audit line that assumes it.
+		Verdict: list.Decision.Verdict,
+		Reason:  list.Decision.Reason,
+		RuleID:  list.Decision.RuleID,
+		// The count is what the agent was given, not what the statement returned: the
+		// system databases were dropped before this point and are not something the
+		// record needs to account for. Truncated is the statement's own fact and stays
+		// true even when everything the cap cut off would have been excluded anyway.
+		Rows:      len(list.Databases),
+		Truncated: list.Truncated,
+		Elapsed:   elapsed,
+	})
+
+	return nil, &ListDatabasesResult{
+		Databases: list.Databases,
+		Truncated: list.Truncated,
+		RowCap:    list.RowCap,
+	}, nil
+}
+
+// attempt is what [Server.refuseOrFail] has to know about the call that failed.
+//
+// It exists so that the two tools which can fail share one reduction from a
+// *db.Error to what the agent may read, instead of the second one getting a copy.
+// That reduction is the credential guarantee at this boundary, and two copies of it
+// are two places for the next tool to diverge from — see the ADR behind
+// [agentError].
+type attempt struct {
+	tool  string
+	alias string
+	// statement is the agent's own SQL, and it is empty for list_databases: that
+	// tool's statement is internal/db's per-engine constant, which this package does
+	// not hold and must not hold a second spelling of just to fill a field. The tool
+	// name says exactly which statement ran.
+	statement string
+}
+
 // refuseOrFail audits a failed call and reduces its error to what the agent may
 // read.
 //
@@ -245,14 +360,14 @@ func (s *Server) executeQuery(ctx context.Context, _ *sdk.CallToolRequest, in Ex
 // It takes the handler's ctx for one reason: the caller's identity is on it, and
 // a refusal is the audit line that most needs to say who submitted the
 // statement, since nothing else in this process recorded that it was attempted.
-func (s *Server) refuseOrFail(ctx context.Context, in ExecuteQueryInput, elapsed time.Duration, err error) error {
-	email, subject := s.caller(ctx, ToolExecuteQuery)
+func (s *Server) refuseOrFail(ctx context.Context, call attempt, elapsed time.Duration, err error) error {
+	email, subject := s.caller(ctx, call.tool)
 	event := AuditEvent{
-		Tool:      ToolExecuteQuery,
+		Tool:      call.tool,
 		Identity:  email,
 		Subject:   subject,
-		Alias:     in.Alias,
-		Statement: in.Statement,
+		Alias:     call.alias,
+		Statement: call.statement,
 		Outcome:   OutcomeFailed,
 		Elapsed:   elapsed,
 	}
@@ -262,8 +377,8 @@ func (s *Server) refuseOrFail(ctx context.Context, in ExecuteQueryInput, elapsed
 		// Not a *db.Error, so this layer has a defect. The operator's side gets
 		// everything; the agent's side gets a sentence with nothing in it.
 		s.log.Error().Err(err).
-			Str("tool", ToolExecuteQuery).
-			Str("alias", in.Alias).
+			Str("tool", call.tool).
+			Str("alias", call.alias).
 			Msg("a tool call failed with an error that did not come from internal/db")
 		s.audit.Record(event)
 		return &agentError{message: internalFailure}
@@ -292,8 +407,8 @@ func (s *Server) refuseOrFail(ctx context.Context, in ExecuteQueryInput, elapsed
 	// The operator-facing rendering, which carries the engine's own words, goes to
 	// the application log and only there.
 	s.log.Warn().
-		Str("tool", ToolExecuteQuery).
-		Str("alias", in.Alias).
+		Str("tool", call.tool).
+		Str("alias", call.alias).
 		Str("kind", string(dbErr.Kind)).
 		Str("detail", dbErr.Error()).
 		Msg("a tool call did not return rows")

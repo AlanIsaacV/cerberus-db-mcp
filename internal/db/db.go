@@ -231,3 +231,70 @@ func (e *Executor) Execute(ctx context.Context, alias, statement string, grants 
 		Elapsed:   time.Since(started),
 	}, nil
 }
+
+// ListDatabases reports the databases an alias's login can reach, by running one
+// fixed per-engine metadata statement on that alias's existing connection.
+//
+// It is [Executor.Execute] with the statement chosen here instead of by the agent,
+// and it keeps every step of it deliberately: the alias is resolved first, the gate
+// is asked before any connection is borrowed, the same context deadline applies, the
+// same row cap applies, and the statement runs inside the same read-only
+// transaction that is rolled back on every exit path. Running it around the gate
+// instead would create an exemption — a statement this process executes that no rule
+// had to allow — and the value of there being no such thing is worth more than the
+// two calls it saves.
+//
+// It opens no connection, caches nothing, and takes no argument but the alias. A
+// pattern or a limit would be a second input to a statement whose whole safety
+// property is that it is a constant, and the answer is small enough that filtering
+// it is the caller's business.
+//
+// The gate is asked with no grants and never with any. The statement is this
+// package's own constant, so a verdict other than Allow does not mean a caller needs
+// approval for something — it means the ruleset overlay removed a rule the baseline
+// has, which is an operator's mistake to hear about rather than an agent's request
+// to escalate.
+func (e *Executor) ListDatabases(ctx context.Context, alias string) (*DatabaseList, error) {
+	c, ok := e.conns[alias]
+	if !ok {
+		return nil, &Error{Op: "list-databases", Alias: alias, Kind: KindUnknownAlias}
+	}
+	spec := c.spec()
+
+	d, ok := discoveryFor(spec.Engine)
+	if !ok {
+		// Unreachable for the same reason [openConn]'s default is, and here for the
+		// same reason: this is where a fourth engine has to be given a statement, and
+		// a missing one must not become an empty list of databases.
+		return nil, &Error{Op: "list-databases", Alias: alias, Engine: spec.Engine, Kind: KindInternal,
+			Detail: "no discovery statement is defined for this engine"}
+	}
+
+	decision := e.gate.Validate(spec.Engine, d.statement, nil)
+	if decision.Verdict != gate.Allow {
+		// The verb is set after construction so that the mapping from a verdict to a
+		// [Kind] stays in one place. Copying those three lines here would be copying
+		// the decision that says which refusals are escalations.
+		refusal := refusalError(spec, decision)
+		refusal.Op = "list-databases"
+		return nil, refusal
+	}
+
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, e.settings.statementDeadline(spec.Engine))
+	defer cancel()
+
+	rows, err := c.query(ctx, d.statement, e.settings.RowCap)
+	if err != nil {
+		return nil, executionError(ctx, "list-databases", spec, err)
+	}
+	return &DatabaseList{
+		Alias:     alias,
+		Engine:    spec.Engine,
+		Decision:  decision,
+		Databases: d.names(rows.rows),
+		Truncated: rows.truncated,
+		RowCap:    e.settings.RowCap,
+		Elapsed:   time.Since(started),
+	}, nil
+}

@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -556,6 +557,128 @@ func TestEveryCallIsAudited(t *testing.T) {
 			// refusals are audited.
 			if !strings.Contains(h.audit.String(), refused) {
 				t.Errorf("the refused statement is not in the audit stream:\n%s", h.audit.String())
+			}
+		})
+	}
+}
+
+// TestListDatabasesReachesTheAgentFromRealEngines is list_databases through the
+// whole stack: real pool, real gate, real HTTP, real MCP client.
+//
+// What it establishes that no loopback test can is that the discovery statement is
+// one a real engine accepts and that its rows survive the trip to a client as names
+// — the gate's approval of it is internal/db's own suite, and the per-engine
+// exclusion lists are its criterion 7. What is asserted here is the boundary: the
+// payload's shape, the truncation flag, and one audit event carrying the alias and
+// the gate's verdict.
+func TestListDatabasesReachesTheAgentFromRealEngines(t *testing.T) {
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			h := setUpEngine(t, engine)
+
+			res := h.call(t, ToolListDatabases, map[string]any{"alias": h.alias})
+			if res.IsError {
+				t.Fatalf("list_databases failed: %s", resultText(t, res))
+			}
+			out, ok := structured(t, res).(map[string]any)
+			if !ok {
+				t.Fatalf("list_databases returned no structured content: %+v", res)
+			}
+
+			raw, ok := out["databases"].([]any)
+			if !ok {
+				t.Fatalf("databases = %s, want an array", jsonOf(t, out["databases"]))
+			}
+			names := make([]string, 0, len(raw))
+			for i, value := range raw {
+				name, ok := value.(string)
+				if !ok {
+					t.Fatalf("databases[%d] = %s, want a string; an agent is going to read this as a name", i, jsonOf(t, value))
+				}
+				names = append(names, name)
+			}
+			if len(names) == 0 {
+				t.Errorf("the login sees no non-system database at all, so this test asserts nothing about a name: give this alias's login at least one database in deploy/compose.test.yaml")
+			}
+			// The database the alias is connected to is necessarily one the login can
+			// see, so its presence is the one name this test can insist on without
+			// depending on another fixture. An alias with no configured database — legal
+			// on MySQL and SQL Server — has nothing to check here.
+			if h.spec.Database != "" && !slices.Contains(names, h.spec.Database) {
+				t.Errorf("databases = %v, which does not include the database this alias is connected to; the discovery statement or its exclusion list is dropping a database the login demonstrably reaches", names)
+			}
+			if out["truncated"] != false {
+				t.Errorf("truncated = %v for %d names under a row cap of %d, want false", out["truncated"], len(names), h.settings.RowCap)
+			}
+			if got, want := out["row_cap"], float64(h.settings.RowCap); got != want {
+				t.Errorf("row_cap = %v, want %v", got, want)
+			}
+
+			events := h.auditEventsFor(t, ToolListDatabases)
+			if len(events) != 1 {
+				t.Fatalf("got %d audit events for one call:\n%s", len(events), h.audit.String())
+			}
+			for field, wantValue := range map[string]any{
+				"tool":    ToolListDatabases,
+				"alias":   h.alias,
+				"engine":  string(engine),
+				"outcome": string(OutcomeAllowed),
+				// The gate allowed internal/db's own constant, and the record says so
+				// rather than leaving a successful discovery call unaccounted for.
+				"verdict": string(gate.Allow),
+				"rows":    float64(len(names)),
+				// This tool's statement is internal/db's, not the agent's.
+				"statement": "",
+			} {
+				if got := events[0][field]; got != wantValue {
+					t.Errorf("%s = %#v, want %#v", field, got, wantValue)
+				}
+			}
+		})
+	}
+}
+
+// TestListDatabasesTellsTheAgentNothingWhenItCannotConnect is the no-leak half of
+// acceptance criterion 9 at this boundary, against an error a real engine's driver
+// produced rather than one this test constructed.
+//
+// The class is the one that can be provoked with a real container: a wrong password
+// on the same alias. Permission-denied on a metadata statement cannot be — pg_database
+// is readable by everyone and MySQL's SHOW DATABASES filters silently instead of
+// failing — and that half of the criterion is internal/db's, against a low-privilege
+// role. What both share is this assertion: one of internal/db's fixed sentences and
+// none of the alias's own values.
+func TestListDatabasesTellsTheAgentNothingWhenItCannotConnect(t *testing.T) {
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			h := setUpEngine(t, engine)
+
+			broken := h.spec
+			broken.Password = db.Secret("definitely-not-the-password")
+			wrong := brokenAliasHarness(t, broken, h.settings)
+
+			res := wrong.call(t, ToolListDatabases, map[string]any{"alias": broken.Alias})
+			// Deliberately the same class as an unreachable host, for the reason
+			// execute_query's twin of this test gives: telling the agent a password is
+			// wrong is telling it something about a credential it cannot see.
+			wrong.assertAgentMessage(t, res, db.KindUnavailable)
+			// The working alias's own values are checked too, since the broken spec
+			// differs from it in exactly one field.
+			h.assertNothingAboutTheConnection(t, resultText(t, res))
+
+			events := wrong.auditEventsFor(t, ToolListDatabases)
+			if len(events) != 1 {
+				t.Fatalf("got %d audit events for one failed call:\n%s", len(events), wrong.audit.String())
+			}
+			for field, wantValue := range map[string]any{
+				"tool":       ToolListDatabases,
+				"alias":      broken.Alias,
+				"outcome":    string(OutcomeFailed),
+				"error_kind": string(db.KindUnavailable),
+			} {
+				if got := events[0][field]; got != wantValue {
+					t.Errorf("%s = %#v, want %#v", field, got, wantValue)
+				}
 			}
 		})
 	}

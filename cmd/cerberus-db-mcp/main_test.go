@@ -63,7 +63,11 @@ func testEnvironment(t *testing.T, address string) {
 	// so this alias never has to be reachable for the wiring to be under test.
 	t.Setenv("CERBERUS_DB_WAREHOUSE_HOST", "127.0.0.1")
 	t.Setenv("CERBERUS_DB_WAREHOUSE_PORT", "1")
-	t.Setenv("CERBERUS_DB_WAREHOUSE_DATABASE", "warehouse")
+	// Plural, and required on this engine: a PostgreSQL connection is bound to one
+	// database by the protocol. The alias this produces is "warehouse.warehouse",
+	// which nothing in this file asserts on — what is under test here is the order
+	// of the calls in [run] and the listener it ends up with.
+	t.Setenv("CERBERUS_DB_WAREHOUSE_DATABASES", "warehouse")
 	t.Setenv("CERBERUS_DB_WAREHOUSE_USER", "reader")
 	t.Setenv("CERBERUS_DB_WAREHOUSE_PASSWORD", "hunter2")
 	t.Setenv("CERBERUS_DB_WAREHOUSE_TLS", "disable")

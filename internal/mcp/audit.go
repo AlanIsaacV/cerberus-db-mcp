@@ -38,8 +38,9 @@ const (
 // them — and there is nothing to redact: the statement is the agent's own text,
 // which is the one input to this process that never touched a credential.
 type AuditEvent struct {
-	// Tool is the tool that was called. Both tools are recorded, because an
-	// enumeration of the configured connections is also something the agent did.
+	// Tool is the tool that was called. Every tool is recorded, because an
+	// enumeration of the configured connections, or of the databases behind one, is
+	// also something the agent did.
 	Tool string
 	// Identity and Subject are the caller internal/auth admitted the request as:
 	// Identity is their verified email address, Subject is Google's `sub` claim
@@ -65,8 +66,12 @@ type AuditEvent struct {
 	Identity string
 	Subject  string
 
-	Alias     string
-	Engine    gate.Engine
+	Alias  string
+	Engine gate.Engine
+	// Statement is empty for the tools whose statement is not the agent's:
+	// list_connections sends none, and list_databases sends internal/db's own
+	// per-engine constant, which this package deliberately does not hold a copy of.
+	// The tool name is what identifies what ran on those records.
 	Statement string
 
 	Outcome Outcome

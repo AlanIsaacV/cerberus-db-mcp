@@ -16,12 +16,16 @@ loads an `.env` beside it.
 ### Required
 
 - `CERBERUS_DB_ALIASES`: comma-separated database aliases. Each alias must have
-  the following six variables, replacing `<ALIAS>` with the alias upper-cased
+  the following five variables, replacing `<ALIAS>` with the alias upper-cased
   and with hyphens changed to underscores:
   `CERBERUS_DB_<ALIAS>_ENGINE` (`mysql`, `postgresql`, or `sqlserver`),
   `CERBERUS_DB_<ALIAS>_HOST`, `CERBERUS_DB_<ALIAS>_PORT`,
-  `CERBERUS_DB_<ALIAS>_DATABASE`, `CERBERUS_DB_<ALIAS>_USER`, and
-  `CERBERUS_DB_<ALIAS>_PASSWORD`.
+  `CERBERUS_DB_<ALIAS>_USER`, and `CERBERUS_DB_<ALIAS>_PASSWORD`.
+- `CERBERUS_DB_<ALIAS>_DATABASES`: the comma-separated databases that alias
+  exposes. Required on PostgreSQL and optional on MySQL and SQL Server, and it
+  changes the names the agent uses — see "The databases an alias exposes" below.
+  The singular `CERBERUS_DB_<ALIAS>_DATABASE` this replaced is now refused at
+  startup; the same section says how to migrate.
 - `CERBERUS_AUTH_GOOGLE_CLIENT_ID`: the Google OAuth client ID that issued the
   access tokens this deployment accepts.
 - `CERBERUS_AUTH_ALLOWED_EMAILS`: the comma-separated verified Google email
@@ -49,6 +53,118 @@ non-empty `PGSERVICE` or `PGSERVICEFILE`, or when a configured SQL Server alias
 has a non-empty `MSSQL_USE_EPA`. Those are driver variables rather than service
 configuration; remove them from this service's environment instead of letting a
 driver silently decide connection behavior.
+
+### The databases an alias exposes
+
+`CERBERUS_DB_<ALIAS>_DATABASES` lists them, comma-separated, each name trimmed.
+An empty element or the same name twice is refused at startup naming the alias
+and the variable, rather than skipped: `a,,b` is a typo far more often than it is
+a way of writing two databases.
+
+Every listed database becomes a connection of its own, named
+`<alias>.<database>`. So `CERBERUS_DB_CRM_DATABASES=sales,billing` gives the
+agent the aliases `crm.sales` and `crm.billing`, and there is no alias `crm`. A
+one-element list derives the same way, so `CERBERUS_DB_CRM_DATABASES=sales` is
+the alias `crm.sales`. That is deliberate: keeping the parent's name for a single
+database would mean that adding a second one silently renames the first alias,
+and a renamed alias is something an agent finds out about by being told the alias
+it just used is unknown. The dot is what makes a derived name safe — a declared
+alias may hold only letters, digits, hyphens and underscores, so nothing derived
+here can collide with a name an operator wrote in `CERBERUS_DB_ALIASES`.
+
+Leaving the variable unset is a different configuration, and the engines do not
+agree about it:
+
+- **MySQL and SQL Server accept it.** The alias stays a single connection under
+  exactly the name declared, with no database configured. On MySQL that means the
+  session has no default schema, so every table reference has to name its
+  database; on SQL Server the login's own default database applies. On both, the
+  login reads whatever it has permission for through a qualified name, and
+  `list_databases` is how the agent finds out what to qualify with.
+- **PostgreSQL refuses to start** and names the alias and the variable. A
+  connection there is bound to one database by the protocol and there is no
+  cross-database query, so a connection with no database has nothing it could
+  read — and the driver supplies no default of its own, which would leave the
+  server quietly defaulting the database to the user name.
+
+#### Migrating from `CERBERUS_DB_<ALIAS>_DATABASE`
+
+The singular variable is gone. Nothing reads it, and a configuration that still
+sets it is refused at startup with an error naming the alias, the old variable
+and the new one — including an `.env` that worked before this change, so a
+deployed Pi needs the edit before its next `docker compose up -d`. Rename it and
+keep the value: `CERBERUS_DB_CRM_DATABASE=sales` becomes
+`CERBERUS_DB_CRM_DATABASES=sales`. The alias the agent names then changes from
+`crm` to `crm.sales`, so anything holding the old name — a saved prompt, a note
+in a client — changes with it.
+
+Refusing rather than tolerating the old spelling is the point. Ignored, it would
+give a MySQL alias a working connection to no database at all and no hint that
+the name in it was never read, and it would tell a PostgreSQL operator that a
+variable is missing while they are looking at one they had set.
+
+### What the list restricts, and on which engine
+
+**On PostgreSQL the list is a boundary.** Each connection can reach only its own
+database, cross-database queries do not exist there, and a database that is not
+on the list has no connection and no alias — so there is nothing for the agent to
+name.
+
+**On MySQL and SQL Server the list is not a boundary.** It decides which
+connections exist and what `list_databases` reports, and it does not prevent a
+read of a database that is not on it. The gate refuses `USE`, but nothing
+restricts a qualified table reference: `SELECT * FROM otherdb.tbl` on MySQL and
+`SELECT * FROM otherdb.dbo.tbl` on SQL Server are approved and return rows
+whenever the login in `CERBERUS_DB_<ALIAS>_USER` has permission on `otherdb` —
+whether or not `otherdb` is on the list, and whether or not the alias has a list
+at all. What bounds what the agent can read on those two engines is that login's
+own database permissions, so grant it only what it should be able to read; the
+list is ergonomics and naming, not enforcement. Teaching the gate to refuse a
+reference outside the list is separate work and has not been done.
+
+### Finding out what exists
+
+An operator configuring this service often does not know which databases are on a
+host, and the agent never does. The `list_databases` tool answers that question
+for one alias: it runs a fixed per-engine metadata statement on that alias's
+existing connection — through the same gate, the same row cap and the same time
+limit as `execute_query`, opening no connection and caching nothing — and returns
+the names that come back with the engine's own system databases removed. Being
+capped like any other result, it reports whether the cap cut the list off. What it
+returns are database names and not aliases: `execute_query` still only accepts an
+alias `list_connections` gave.
+
+- MySQL runs `SHOW DATABASES`, excluding `information_schema`, `mysql`,
+  `performance_schema` and `sys`.
+- PostgreSQL runs `SELECT datname FROM pg_database WHERE NOT datistemplate AND
+  datallowconn ORDER BY datname`, excluding `postgres`, `template0` and
+  `template1`.
+- SQL Server runs `SELECT name FROM sys.databases ORDER BY name`, excluding
+  `master`, `model`, `msdb` and `tempdb`.
+
+The answer is what exists, not what is reachable, and how far the two diverge
+depends on the engine. `SHOW DATABASES` silently omits the schemas the MySQL
+login has no privilege on, with no error and no indication that anything was
+filtered — so a login with no grants and a server with no databases produce the
+same empty list. `sys.databases` is filtered by SQL Server's metadata
+visibility, which is close to but not the same as access: a database whose name
+is visible but whose access has been revoked still appears, and the agent
+discovers that by being refused when it queries. `pg_database` is readable by
+everyone, so on PostgreSQL the list can name databases this login could not open
+at all.
+
+PostgreSQL has a second gap worth knowing before reading a result there: a
+database on that list which is not in the alias's `CERBERUS_DB_<ALIAS>_DATABASES`
+has no connection and no alias, so the agent cannot query it even though the tool
+just named it. Making it reachable means adding it to the variable and
+restarting. Discovering and connecting to PostgreSQL databases automatically is
+later work.
+
+Because startup does not touch a database, a login that cannot run its engine's
+discovery statement is not a startup failure. It surfaces on the first
+`list_databases` call, as the same agent-facing error any other failed call
+returns — naming no credential, host, port or username — and it is audited like
+any other tool call.
 
 ## Raspberry Pi deployment
 
@@ -157,6 +273,17 @@ aliases as described in `.env.example`, then run:
 ```sh
 docker compose -f deploy/compose.test.yaml up -d
 go test -tags integration -race -timeout 20m -p 1 ./...
+```
+
+Each engine's fixtures come from the SQL files in `deploy/postgres-init` and
+`deploy/mysql-init`, and both images run those only while initialising an empty
+data directory. Containers that already existed before those files changed
+therefore lack the second database and the low-privilege PostgreSQL role the
+database-set tests need, and `up -d` will not add them. Recreate them once:
+
+```sh
+docker compose -f deploy/compose.test.yaml down -v
+docker compose -f deploy/compose.test.yaml up -d
 ```
 
 SQL Server has no container coverage because no arm64 image is available. That

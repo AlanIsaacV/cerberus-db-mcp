@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -24,6 +25,83 @@ import (
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 )
+
+// containerEngines are the engines deploy/compose.test.yaml runs, and therefore
+// the only ones against which a claim about a database the fixture created can be
+// made.
+//
+// SQL Server is absent because no arm64 image of it exists (README.md:162-164).
+// The SQL Server answer to the discovery criteria is a manual run against the real
+// instance, and a green result here says nothing about it.
+var containerEngines = []gate.Engine{gate.PostgreSQL, gate.MySQL}
+
+// The two databases deploy/compose.test.yaml's init scripts create on both
+// container engines.
+//
+// They are spelled out here rather than taken from the alias's configuration
+// because they are facts about that fixture, not about a server somebody
+// configured — and only the tests that are about the fixture use them. Every other
+// test in this file still learns its whole topology from the environment, which is
+// what lets them be pointed at an instance nothing here knows the shape of.
+const (
+	fixtureDatabase       = "testbed"
+	fixtureSecondDatabase = "ledger"
+)
+
+// aliasEnvironment renders one alias back into the CERBERUS_DB_* variables it
+// would have been declared with, with databases as the value of _DATABASES and the
+// variable left out entirely when it is empty.
+//
+// It exists so that a test about a configuration shape can take a real server's
+// topology from the environment and change only the shape: the host, the port and
+// the credential come from an alias that is already known to work, and what the
+// test varies is the one variable it is about. Going through [LoadConfigFrom]
+// afterwards rather than assembling an [AliasSpec] is deliberate — the acceptance
+// of the shape is then part of what the test establishes rather than something it
+// assumes.
+//
+// No setting variable is included, so the bounds are the package's own defaults
+// rather than the ones the run was configured with. Every caller reads a handful of
+// rows.
+func aliasEnvironment(alias string, spec AliasSpec, databases string) map[string]string {
+	family := aliasPrefix + strings.ToUpper(alias)
+	env := map[string]string{
+		"CERBERUS_DB_ALIASES":   alias,
+		family + suffixEngine:   string(spec.Engine),
+		family + suffixHost:     spec.Host,
+		family + suffixPort:     strconv.Itoa(spec.Port),
+		family + suffixUser:     spec.User,
+		family + suffixPassword: spec.Password.reveal(),
+	}
+	if spec.TLS != "" {
+		env[family+suffixTLS] = string(spec.TLS)
+	}
+	if databases != "" {
+		env[family+suffixDatabases] = databases
+	}
+	return env
+}
+
+// executorForEnvironment loads a configuration from env and builds an executor
+// over it, through the same two calls the production startup path makes.
+func executorForEnvironment(t *testing.T, env map[string]string) *Executor {
+	t.Helper()
+	neutraliseForeignVariables(t)
+	cfg, err := LoadConfigFrom(env)
+	if err != nil {
+		t.Fatalf("LoadConfigFrom: %v", err)
+	}
+	g, err := gate.New("")
+	if err != nil {
+		t.Fatalf("gate.New: %v", err)
+	}
+	e, err := New(g, cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(e.Close)
+	return e
+}
 
 // slowReadThroughTheGate is, per engine, a read the gate allows and the server
 // cannot finish. SQL Server is absent on purpose: there is no slow read on that
@@ -388,6 +466,77 @@ func assertSanitised(t *testing.T, err error, spec AliasSpec, want Kind) {
 		t.Error("the operator-facing detail is empty: the error was discarded rather than sanitised")
 	}
 	assertAgentSideIsClean(t, dbErr, spec)
+}
+
+// TestListDatabasesReportsTheFixtureDatabaseAndNoSystemOne is acceptance criterion
+// 7 against the two engines that have containers.
+//
+// Both halves of it are needed and neither is enough alone. That a database the
+// fixture created is reported is what says the tool answers the question at all;
+// that no excluded name is reported is what says the exclusion list ran — and the
+// control at the end is what stops the second half passing on a server that simply
+// has nothing to exclude. The exclusion lists are read out of the package rather
+// than restated here, so a name added to one is checked by this test the moment it
+// is added.
+func TestListDatabasesReportsTheFixtureDatabaseAndNoSystemOne(t *testing.T) {
+	for _, engine := range containerEngines {
+		t.Run(string(engine), func(t *testing.T) {
+			h := setUp(t, engine)
+			d, ok := discoveryFor(engine)
+			if !ok {
+				t.Fatalf("no discovery statement is defined for %s", engine)
+			}
+
+			list, err := h.ListDatabases(context.Background(), h.alias)
+			if err != nil {
+				t.Fatalf("ListDatabases() = %v", err)
+			}
+			if list.Alias != h.alias || list.Engine != engine {
+				t.Errorf("the answer does not identify what produced it: %+v", list)
+			}
+			if list.Decision.Verdict != gate.Allow {
+				t.Errorf("the answer carries verdict %q", list.Decision.Verdict)
+			}
+			if list.Elapsed <= 0 {
+				t.Error("the answer reports no elapsed time, so an audit line cannot say how long it took")
+			}
+			if list.Truncated {
+				t.Fatalf("the row cap of %d stopped the discovery read, so a missing name below would mean the cap and not the exclusion list", list.RowCap)
+			}
+			if !slices.Contains(list.Databases, fixtureSecondDatabase) {
+				t.Errorf("the answer %v does not contain %q, which deploy/compose.test.yaml's init scripts create on this engine", list.Databases, fixtureSecondDatabase)
+			}
+			for _, excluded := range d.exclude {
+				if slices.Contains(list.Databases, excluded) {
+					t.Errorf("%q is on this engine's exclusion list and in the answer anyway: %v", excluded, list.Databases)
+				}
+			}
+
+			// The control. Without it the loop above is satisfied by any server that
+			// happens to report none of those names, and a broken exclusion list would
+			// pass. It runs the same statement through Execute — the same gate, the
+			// same bounds — so what it compares against is the rows the answer was
+			// computed from.
+			raw, err := h.Execute(context.Background(), h.alias, d.statement, nil)
+			if err != nil {
+				t.Fatalf("the discovery statement through Execute = %v", err)
+			}
+			var dropped []string
+			for _, row := range raw.Rows {
+				if len(row) == 0 {
+					continue
+				}
+				if name := databaseName(row[0]); slices.Contains(d.exclude, name) {
+					dropped = append(dropped, name)
+				}
+			}
+			if len(dropped) == 0 {
+				t.Errorf("this server reports none of %v, so nothing above was actually excluded; the statement returned %v", d.exclude, raw.Rows)
+			} else {
+				t.Logf("excluded from the answer: %v", dropped)
+			}
+		})
+	}
 }
 
 // executorForSpec builds a one-alias executor over a deliberately broken spec, so

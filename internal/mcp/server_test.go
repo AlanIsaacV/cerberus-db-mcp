@@ -226,12 +226,12 @@ func (h *harness) auditEvents(t *testing.T) []map[string]any {
 	return out
 }
 
-// TestToolsListIsExactlyTheTwoToolsWithDerivedSchemas is acceptance criterion 1.
+// TestToolsListIsExactlyTheThreeToolsWithDerivedSchemas is acceptance criterion 1.
 //
 // The schemas are asserted whole rather than by spot-checking a property, so
 // that a field added to an input type — the shape a limit or a timeout argument
 // would take — fails here instead of quietly becoming part of the contract.
-func TestToolsListIsExactlyTheTwoToolsWithDerivedSchemas(t *testing.T) {
+func TestToolsListIsExactlyTheThreeToolsWithDerivedSchemas(t *testing.T) {
 	h := connect(t, unreachableExecutor(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -245,18 +245,25 @@ func TestToolsListIsExactlyTheTwoToolsWithDerivedSchemas(t *testing.T) {
 	for _, tool := range list.Tools {
 		got[tool.Name] = tool
 	}
-	if len(got) != 2 || got[ToolListConnections] == nil || got[ToolExecuteQuery] == nil {
+	wantTools := []string{ToolListConnections, ToolExecuteQuery, ToolListDatabases}
+	missing := false
+	for _, name := range wantTools {
+		if got[name] == nil {
+			missing = true
+		}
+	}
+	if len(got) != len(wantTools) || missing {
 		names := make([]string, 0, len(list.Tools))
 		for _, tool := range list.Tools {
 			names = append(names, tool.Name)
 		}
-		t.Fatalf("tools/list = %v, want exactly %q and %q", names, ToolListConnections, ToolExecuteQuery)
+		t.Fatalf("tools/list = %v, want exactly %v", names, wantTools)
 	}
 
-	// These are the schemas the SDK derived by reflection from ListConnectionsInput
-	// and ExecuteQueryInput. Written out rather than recomputed from the same
-	// types, because a test that derives its expectation the same way the code
-	// does cannot notice the code changing.
+	// These are the schemas the SDK derived by reflection from ListConnectionsInput,
+	// ExecuteQueryInput and ListDatabasesInput. Written out rather than recomputed
+	// from the same types, because a test that derives its expectation the same way
+	// the code does cannot notice the code changing.
 	for name, wantJSON := range map[string]string{
 		ToolListConnections: `{"additionalProperties":false,"type":"object"}`,
 		ToolExecuteQuery: `{"additionalProperties":false,"type":"object",` +
@@ -264,6 +271,13 @@ func TestToolsListIsExactlyTheTwoToolsWithDerivedSchemas(t *testing.T) {
 			`"alias":{"type":"string","description":"which configured connection to run against, as named by list_connections"},` +
 			`"statement":{"type":"string","description":"one read-only SQL statement in that connection's dialect; writes, DDL, permission changes and multiple statements are refused before they reach the database"}},` +
 			`"required":["alias","statement"]}`,
+		// One property and no others: a pattern or a limit argument would appear here
+		// as a second key, which is the shape the decision on [ListDatabasesInput]
+		// refuses.
+		ToolListDatabases: `{"additionalProperties":false,"type":"object",` +
+			`"properties":{` +
+			`"alias":{"type":"string","description":"which configured connection to ask, named exactly as list_connections gives it; this is an alias and not a database name"}},` +
+			`"required":["alias"]}`,
 	} {
 		var want any
 		if err := json.Unmarshal([]byte(wantJSON), &want); err != nil {
@@ -277,9 +291,19 @@ func TestToolsListIsExactlyTheTwoToolsWithDerivedSchemas(t *testing.T) {
 
 	// A tool with no output schema would mean the SDK is not populating
 	// StructuredContent, which is what a client reads the result out of.
-	for _, name := range []string{ToolListConnections, ToolExecuteQuery} {
+	for _, name := range wantTools {
 		if got[name].OutputSchema == nil {
 			t.Errorf("%q has no output schema, so its result carries no structured content", name)
+		}
+	}
+
+	// Every tool this server offers is annotated read-only. It is a hint and no
+	// client is obliged to honour it, which is exactly why it is asserted here rather
+	// than relied on: what it costs a client to believe it is that a call is made
+	// without asking, and this server has no tool for which that would be wrong.
+	for _, name := range wantTools {
+		if got[name].Annotations == nil || !got[name].Annotations.ReadOnlyHint {
+			t.Errorf("%q is not annotated with ReadOnlyHint: %+v", name, got[name].Annotations)
 		}
 	}
 }
@@ -483,7 +507,7 @@ func TestAnErrorThatIsNotADatabaseErrorSaysNothing(t *testing.T) {
 	}
 
 	leaky := errors.New(`dial tcp 10.0.0.7:5432: connect: postgres://reader:hunter2@db.internal.example/ledger`)
-	in := ExecuteQueryInput{Alias: "warehouse", Statement: "SELECT 1"}
+	in := attempt{tool: ToolExecuteQuery, alias: "warehouse", statement: "SELECT 1"}
 	// A context with no identity on it, which is what a server built with a nil
 	// Middleware hands every handler: the audit record below names nobody, and this
 	// test is about what the agent is told rather than about who asked.

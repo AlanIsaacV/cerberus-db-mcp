@@ -321,6 +321,173 @@ func assertPgBackendGone(t *testing.T, obs *pgx.Conn, marker string) {
 	}
 }
 
+// The fixture's low-privilege role, from
+// deploy/postgres-init/02-second-database-and-catalog-privileges.sql. It is named
+// here because it is a fact about that file rather than about a server anybody
+// configured: the topology it is used with still comes from the environment.
+const (
+	nocatalogUser     = "cerberus_nocatalog"
+	nocatalogPassword = "cerberus-test-pg-nocatalog"
+)
+
+// TestPostgresDatabaseSetIsOneConnectionPerDatabaseAndABoundary is acceptance
+// criterion 6. It is the one engine where the set of databases an alias exposes is
+// enforced rather than documented, and both halves of that are asserted: each
+// listed database is a working connection, and neither of them can see the other's
+// table.
+//
+// The boundary is the protocol's, not this package's. A PostgreSQL connection is
+// bound to one database and the engine implements no cross-database read, which is
+// why _DATABASES is required here and why the same test would be false on MySQL.
+func TestPostgresDatabaseSetIsOneConnectionPerDatabaseAndABoundary(t *testing.T) {
+	h := setUp(t, gate.PostgreSQL)
+	ctx := context.Background()
+
+	// A table per database, each named after the database it lives in. With one name
+	// in both there would be nothing for the second half to be denied: the read would
+	// succeed against the local copy and prove the opposite of what it looks like.
+	tables := map[string]string{
+		fixtureDatabase:       "cerberus_probe_" + fixtureDatabase,
+		fixtureSecondDatabase: "cerberus_probe_" + fixtureSecondDatabase,
+	}
+	for database, table := range tables {
+		spec := h.spec
+		spec.Database = database
+		// One observer per database, because on this engine that is the only way to
+		// write into one. The fixture's second database is owned by this account for
+		// exactly this reason; a connect failure here means it is missing.
+		obs := pgObserver(t, spec)
+		if _, err := obs.Exec(ctx, "DROP TABLE IF EXISTS "+table); err != nil {
+			t.Fatalf("drop %s in %s: %v", table, database, err)
+		}
+		if _, err := obs.Exec(ctx, "CREATE TABLE "+table+" (marker text)"); err != nil {
+			t.Fatalf("create %s in %s: %v", table, database, err)
+		}
+		t.Cleanup(func() {
+			cleanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, _ = obs.Exec(cleanCtx, "DROP TABLE IF EXISTS "+table)
+		})
+		if _, err := obs.Exec(ctx, "INSERT INTO "+table+" (marker) VALUES ($1)", database); err != nil {
+			t.Fatalf("seed %s in %s: %v", table, database, err)
+		}
+	}
+
+	const alias = "pgset"
+	e := executorForEnvironment(t, aliasEnvironment(alias, h.spec, fixtureDatabase+","+fixtureSecondDatabase))
+
+	for database, table := range tables {
+		derived := alias + derivedAliasSeparator + database
+		t.Run(derived, func(t *testing.T) {
+			if _, ok := e.connFor(derived); !ok {
+				t.Fatalf("%s lists %q and there is no connection named %q; the executor has %+v", suffixDatabases, database, derived, e.Aliases())
+			}
+
+			res, err := e.Execute(ctx, derived, "SELECT marker FROM "+table, nil)
+			if err != nil {
+				t.Fatalf("the read of this connection's own table = %v", err)
+			}
+			if len(res.Rows) != 1 || res.Rows[0][0] != database {
+				t.Fatalf("got %+v, want the single row %q", res.Rows, database)
+			}
+
+			for other, otherTable := range tables {
+				if other == database {
+					continue
+				}
+				t.Run("cannot see "+other+"'s table", func(t *testing.T) {
+					_, err := e.Execute(ctx, derived, "SELECT marker FROM "+otherTable, nil)
+					var dbErr *Error
+					if !errors.As(err, &dbErr) {
+						t.Fatalf("Execute() = %v, want a *db.Error: this connection can see a table that exists only in %s", err, other)
+					}
+					if dbErr.Kind != KindObjectNotFound {
+						t.Errorf("Kind = %q, want the object not to exist here (detail: %s)", dbErr.Kind, dbErr.Detail)
+					}
+					assertAgentSideIsClean(t, dbErr, e.conns[derived].spec())
+				})
+
+				t.Run("cannot reach "+other+" by qualifying it", func(t *testing.T) {
+					// The qualified form that does work on MySQL and SQL Server, where the
+					// database set is not a boundary at all. Here the server itself refuses
+					// it — measured as SQLSTATE 0A000, "cross-database references are not
+					// implemented" — and that refusal is the boundary.
+					_, err := e.Execute(ctx, derived, "SELECT marker FROM "+other+".public."+otherTable, nil)
+					var dbErr *Error
+					if !errors.As(err, &dbErr) {
+						t.Fatalf("Execute() = %v, want a *db.Error: a cross-database read succeeded", err)
+					}
+					// Which [Kind] 0A000 lands in is not what this test is about, but where
+					// the refusal came from is: the gate does not restrict a table
+					// reference, so a gate refusal here would mean the boundary under test
+					// is the ruleset rather than the engine.
+					if dbErr.Kind == KindRefused || dbErr.Kind == KindNeedsApproval {
+						t.Fatalf("the gate stopped the qualified read (%v); on this engine the server is what has to refuse it", dbErr)
+					}
+					assertAgentSideIsClean(t, dbErr, e.conns[derived].spec())
+				})
+			}
+		})
+	}
+}
+
+// TestPostgresListDatabasesWithoutPermissionTellsTheAgentNothing is the
+// database-layer half of acceptance criterion 9: a discovery statement that fails
+// for lack of permission comes back as this package's ordinary agent-facing error,
+// carrying nothing about the connection it failed on. That it is audited like any
+// other tool call is the server's half and is asserted in internal/mcp.
+//
+// PostgreSQL is the only engine where this can be established at all. MySQL's SHOW
+// DATABASES filters by privilege silently, so a login with no grants gets an empty
+// list and no error — there is nothing on the wire for this package to classify. And
+// on a stock PostgreSQL cluster it could not be established either, because
+// pg_database is readable by PUBLIC; the fixture takes that grant away from
+// everyone and gives it back to the ordinary test role, which is what leaves this
+// role refused.
+func TestPostgresListDatabasesWithoutPermissionTellsTheAgentNothing(t *testing.T) {
+	h := setUp(t, gate.PostgreSQL)
+	ctx := context.Background()
+
+	spec := h.spec
+	spec.User = nocatalogUser
+	spec.Password = Secret(nocatalogPassword)
+	const alias = "pgnocatalog"
+	env := aliasEnvironment(alias, spec, fixtureDatabase)
+	e := executorForEnvironment(t, env)
+	derived := alias + derivedAliasSeparator + fixtureDatabase
+	refused := e.conns[derived].spec()
+
+	// The control: this role can connect and read. Without it a refusal below could
+	// be a bad password or an unreachable database, and the test would report a
+	// permission failure it never provoked.
+	if _, err := e.Execute(ctx, derived, "SELECT 1", nil); err != nil {
+		t.Fatalf("the fixture's low-privilege role cannot run SELECT 1 (%v), so nothing below would be about the discovery statement", err)
+	}
+
+	_, err := e.ListDatabases(ctx, derived)
+	var dbErr *Error
+	if !errors.As(err, &dbErr) {
+		t.Fatalf("ListDatabases() = %v, want a *db.Error", err)
+	}
+	if !errors.Is(err, ErrPermissionDenied) || dbErr.Kind != KindPermissionDenied {
+		t.Fatalf("Kind = %q, want %q (detail: %s)", dbErr.Kind, KindPermissionDenied, dbErr.Detail)
+	}
+	if dbErr.Op != "list-databases" {
+		t.Errorf("Op = %q, so an operator's log names the wrong call", dbErr.Op)
+	}
+	if dbErr.Detail == "" {
+		t.Error("the operator-facing detail is empty: the error was discarded rather than sanitised")
+	}
+	// Nothing about the connection that failed, and nothing about the privileged
+	// alias either — the two differ only in the credential, so checking both is what
+	// catches a message that names the user.
+	assertAgentSideIsClean(t, dbErr, refused)
+	assertAgentSideIsClean(t, dbErr, h.spec)
+	// And the same check the configuration refusals are held to, against the
+	// variables this alias was built from rather than against a list of patterns.
+	assertNoValues(t, dbErr.Agent(), env)
+}
+
 // TestPostgresReceivesTheStatementByteForByte is acceptance criterion 7's
 // byte-identity half on this engine, taken from the server's own record of what
 // it received rather than from our report of what we sent. The statement carries

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -382,6 +383,81 @@ func killRunning(t *testing.T, obs *sql.DB, marker string) {
 		if _, err := obs.Exec("KILL QUERY " + strconv.FormatInt(id, 10)); err != nil {
 			t.Logf("kill query %d: %v", id, err)
 		}
+	}
+}
+
+// TestMySQLWithNoDatabaseSetReadsTwoDatabasesInOneSession is acceptance criterion
+// 5. What it establishes is the whole reason CERBERUS_DB_<ALIAS>_DATABASES is
+// optional on this engine: a login that can reach several databases needs no
+// variable enumerating them, because one connection with no default schema reads
+// all of them through qualified names.
+//
+// The alias is loaded from an environment with the variable genuinely absent rather
+// than from an AliasSpec with an empty Database, so that the acceptance of the
+// missing variable on this engine is part of what the test shows. Its topology and
+// credential come from the alias the run was configured with; only the shape
+// differs.
+func TestMySQLWithNoDatabaseSetReadsTwoDatabasesInOneSession(t *testing.T) {
+	h := setUp(t, gate.MySQL)
+	obs := myObserver(t, h.spec, h.Settings())
+	ctx := context.Background()
+
+	// One table of the same name in each database, each row naming the database it
+	// lives in — so a row cannot be mistaken for the other table's, and reading both
+	// names back is the only way the assertion below passes.
+	const table = "cerberus_qualified_read_probe"
+	for _, database := range []string{fixtureDatabase, fixtureSecondDatabase} {
+		qualified := database + "." + table
+		if _, err := obs.ExecContext(ctx, "DROP TABLE IF EXISTS "+qualified); err != nil {
+			t.Fatalf("drop %s: %v; deploy/mysql-init creates the %s database and grants it to this account", qualified, err, database)
+		}
+		if _, err := obs.ExecContext(ctx, "CREATE TABLE "+qualified+" (marker varchar(64))"); err != nil {
+			t.Fatalf("create %s: %v", qualified, err)
+		}
+		t.Cleanup(func() { _, _ = obs.Exec("DROP TABLE IF EXISTS " + qualified) })
+		if _, err := obs.ExecContext(ctx, "INSERT INTO "+qualified+" (marker) VALUES (?)", database); err != nil {
+			t.Fatalf("seed %s: %v", qualified, err)
+		}
+	}
+
+	const alias = "myqualified"
+	env := aliasEnvironment(alias, h.spec, "")
+	cfg, err := LoadConfigFrom(env)
+	if err != nil {
+		t.Fatalf("an alias with no %s was refused on this engine: %v", suffixDatabases, err)
+	}
+	if len(cfg.Aliases) != 1 || cfg.Aliases[0].Alias != alias || cfg.Aliases[0].Database != "" {
+		t.Fatalf("an alias with no %s produced %+v, want one connection named %q with no database", suffixDatabases, cfg.Aliases, alias)
+	}
+	e := executorForEnvironment(t, env)
+
+	// One statement, so one transaction on one connection: two calls could be two
+	// pooled sessions, and what the criterion is about is one session reaching both
+	// databases.
+	res, err := e.Execute(ctx, alias,
+		"SELECT marker FROM "+fixtureDatabase+"."+table+
+			" UNION ALL SELECT marker FROM "+fixtureSecondDatabase+"."+table, nil)
+	if err != nil {
+		t.Fatalf("the qualified read across two databases = %v", err)
+	}
+	var markers []string
+	for _, row := range res.Rows {
+		marker, ok := row[0].(string)
+		if !ok {
+			t.Fatalf("a marker came back as %#v, which is not a name", row[0])
+		}
+		markers = append(markers, marker)
+	}
+	slices.Sort(markers)
+	if want := []string{fixtureSecondDatabase, fixtureDatabase}; !slices.Equal(markers, want) {
+		t.Errorf("the rows name %v, want one from each of %v", markers, want)
+	}
+
+	// The control: the connection really has no default schema. Without it the read
+	// above could have been satisfied by a default database that happened to be one
+	// of the two, and the qualification would be decoration.
+	if _, err := e.Execute(ctx, alias, "SELECT marker FROM "+table, nil); err == nil {
+		t.Error("an unqualified read succeeded, so this connection has a default schema and the qualified read above shows less than it looks")
 	}
 }
 

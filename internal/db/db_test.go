@@ -37,6 +37,20 @@ func deadPort(t *testing.T) int {
 	return port
 }
 
+// deadPortDatabase is the database name a dead-port PostgreSQL alias lists.
+//
+// Only PostgreSQL gets one, and the asymmetry is the configuration under test
+// rather than an accident of this helper: PostgreSQL requires
+// CERBERUS_DB_<ALIAS>_DATABASES because a connection there is bound to one database
+// by the protocol, while on MySQL and SQL Server leaving it out is a supported
+// choice. So a PostgreSQL alias here is always a derived one and its name always
+// carries the dot, and the other two keep the name they were declared under.
+const deadPortDatabase = "nothing_is_there"
+
+// pgAlias is the name the PostgreSQL alias in [allThreeEngines] actually ends up
+// with, which is not the name it was declared under.
+const pgAlias = "pg" + derivedAliasSeparator + deadPortDatabase
+
 // deadPortEnvironment builds an environment with one alias per requested engine,
 // each pointing at a port with nothing behind it.
 func deadPortEnvironment(t *testing.T, engines map[string]gate.Engine) map[string]string {
@@ -53,15 +67,19 @@ func deadPortEnvironment(t *testing.T, engines map[string]gate.Engine) map[strin
 		env[family+"_ENGINE"] = string(engine)
 		env[family+"_HOST"] = "127.0.0.1"
 		env[family+"_PORT"] = strconv.Itoa(deadPort(t))
-		env[family+"_DATABASE"] = "nothing_is_there"
 		env[family+"_USER"] = "nobody"
 		env[family+"_PASSWORD"] = "irrelevant-because-nothing-listens"
+		if engine == gate.PostgreSQL {
+			env[family+"_DATABASES"] = deadPortDatabase
+		}
 	}
 	env["CERBERUS_DB_ALIASES"] = strings.Join(names, ",")
 	return env
 }
 
-// allThreeEngines is the alias-to-engine map most of this file's tests use.
+// allThreeEngines is the alias-to-engine map most of this file's tests use. Its
+// PostgreSQL entry is declared as "pg" and configured as [pgAlias]; see
+// [deadPortDatabase].
 func allThreeEngines() map[string]gate.Engine {
 	return map[string]gate.Engine{"pg": gate.PostgreSQL, "my": gate.MySQL, "ms": gate.SQLServer}
 }
@@ -129,14 +147,14 @@ func TestRefusedStatementsNeverReachADriver(t *testing.T) {
 		statement string
 		want      Kind
 	}{
-		{"a write", "pg", "DELETE FROM users", KindRefused},
-		{"a write hidden in a CTE", "pg", "WITH w AS (DELETE FROM users RETURNING id) SELECT * FROM w", KindRefused},
+		{"a write", pgAlias, "DELETE FROM users", KindRefused},
+		{"a write hidden in a CTE", pgAlias, "WITH w AS (DELETE FROM users RETURNING id) SELECT * FROM w", KindRefused},
 		{"two statements separated by a semicolon", "my", "SELECT 1; SELECT 2", KindRefused},
 		{"two statements separated by one space", "ms", "SELECT 1 SELECT 2", KindRefused},
 		{"schema change", "ms", "DROP TABLE dbo.Invoices", KindRefused},
 		{"a permission change", "my", "GRANT ALL ON *.* TO 'x'@'%'", KindRefused},
 		{"a shell out", "ms", "EXEC xp_cmdshell 'dir'", KindRefused},
-		{"an unknown leading keyword", "pg", "COMMENT ON TABLE users IS 'x'", KindRefused},
+		{"an unknown leading keyword", pgAlias, "COMMENT ON TABLE users IS 'x'", KindRefused},
 		{"a call to a function nobody has approved", "ms", "SELECT dbo.CalcularSaldo(1)", KindNeedsApproval},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -167,7 +185,7 @@ func TestRefusedStatementsNeverReachADriver(t *testing.T) {
 
 	// The control: nothing is listening, so an allowed statement must fail at the
 	// socket. If this passed, every case above would be meaningless.
-	for _, alias := range []string{"pg", "my", "ms"} {
+	for _, alias := range []string{pgAlias, "my", "ms"} {
 		t.Run("the port really is dead for "+alias, func(t *testing.T) {
 			_, err := e.Execute(context.Background(), alias, "SELECT 1", nil)
 			var dbErr *Error
@@ -233,10 +251,53 @@ func TestAliasesListsNameAndEngineOnly(t *testing.T) {
 	for _, a := range got {
 		byName[a.Name] = a.Engine
 	}
-	for name, engine := range map[string]gate.Engine{"pg": gate.PostgreSQL, "my": gate.MySQL, "ms": gate.SQLServer} {
+	for name, engine := range map[string]gate.Engine{pgAlias: gate.PostgreSQL, "my": gate.MySQL, "ms": gate.SQLServer} {
 		if byName[name] != engine {
 			t.Errorf("alias %q = %q, want %q", name, byName[name], engine)
 		}
+	}
+}
+
+// TestAliasesPutDerivedNamesWhereTheParentWasDeclared is the second half of
+// acceptance criterion 2, at the executor rather than at the loader: the registry
+// preserves declared order and list_connections shows it to the agent unsorted, so
+// where a derived alias lands is something an agent sees.
+func TestAliasesPutDerivedNamesWhereTheParentWasDeclared(t *testing.T) {
+	env := deadPortEnvironment(t, map[string]gate.Engine{
+		"first":  gate.MySQL,
+		"middle": gate.PostgreSQL,
+		"last":   gate.SQLServer,
+	})
+	// deadPortEnvironment writes CERBERUS_DB_ALIASES from a map, so the order it
+	// chose is whatever the runtime chose. It is restated here because the property
+	// under test is a claim about that order.
+	env["CERBERUS_DB_ALIASES"] = "first,middle,last"
+	env["CERBERUS_DB_MIDDLE_DATABASES"] = "sales, ops ,archive"
+
+	neutraliseForeignVariables(t)
+	g, err := gate.New("")
+	if err != nil {
+		t.Fatalf("gate.New: %v", err)
+	}
+	cfg, err := LoadConfigFrom(env)
+	if err != nil {
+		t.Fatalf("LoadConfigFrom: %v", err)
+	}
+	e, err := New(g, cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(e.Close)
+
+	want := []Alias{
+		{Name: "first", Engine: gate.MySQL},
+		{Name: "middle.sales", Engine: gate.PostgreSQL},
+		{Name: "middle.ops", Engine: gate.PostgreSQL},
+		{Name: "middle.archive", Engine: gate.PostgreSQL},
+		{Name: "last", Engine: gate.SQLServer},
+	}
+	if got := e.Aliases(); !slices.Equal(got, want) {
+		t.Errorf("Aliases() = %+v, want %+v", got, want)
 	}
 }
 
@@ -485,6 +546,68 @@ func TestNewToleratesAnEPAVariableItCannotAffect(t *testing.T) {
 	}
 }
 
+// TestForeignVariablesAreStillRefusedWhateverTheDatabaseSetIs guards the one place
+// where per-alias database sets could silently switch [refuseForeignConfiguration]
+// off. Each of its checks asks "does any alias use the driver that reads this
+// variable", and it answers that from the parsed specs — so the refusal depends on
+// every declared alias producing at least one spec that carries its engine.
+//
+// Both directions of that are here. An alias listing several databases must not
+// answer the question once per family and lose the engine on the way, and an alias
+// listing none at all must still count: an alias that produced no spec would be an
+// alias whose driver nothing knows is in play, and the refusal would then quietly
+// stop applying to exactly the configuration that made it disappear.
+func TestForeignVariablesAreStillRefusedWhateverTheDatabaseSetIs(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		engines  map[string]gate.Engine
+		bend     func(env map[string]string)
+		variable string
+		value    string
+	}{
+		{
+			name:     "a PostgreSQL alias listing three databases",
+			engines:  map[string]gate.Engine{"pg": gate.PostgreSQL},
+			bend:     func(env map[string]string) { env["CERBERUS_DB_PG_DATABASES"] = "one,two,three" },
+			variable: "PGSERVICE",
+			value:    "cerberus-service-entry",
+		},
+		{
+			name:     "a SQL Server alias listing no databases at all",
+			engines:  map[string]gate.Engine{"ms": gate.SQLServer},
+			bend:     func(env map[string]string) {},
+			variable: epaVariable,
+			value:    "true",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			env := deadPortEnvironment(t, tt.engines)
+			tt.bend(env)
+			neutraliseForeignVariables(t)
+			t.Setenv(tt.variable, tt.value)
+
+			g, err := gate.New("")
+			if err != nil {
+				t.Fatalf("gate.New: %v", err)
+			}
+			cfg, err := LoadConfigFrom(env)
+			if err != nil {
+				t.Fatalf("LoadConfigFrom: %v", err)
+			}
+			e, err := New(g, cfg)
+			if e != nil {
+				t.Cleanup(e.Close)
+			}
+			if !errors.Is(err, ErrUnsupportedVariable) {
+				t.Fatalf("New() = %v, want ErrUnsupportedVariable", err)
+			}
+			if !strings.Contains(err.Error(), tt.variable) {
+				t.Errorf("the error does not name %s: %s", tt.variable, err)
+			}
+		})
+	}
+}
+
 // TestPostgresURLAnswersEveryKeyThatWouldReadAFile is the passfile half of the
 // same criterion, and it is asserted through pgx rather than by looking for a
 // substring: pgx reads a passfile on every ParseConfig — PGPASSFILE's, or ~/.pgpass
@@ -538,7 +661,7 @@ func TestOpenIsNotAReachabilityCheck(t *testing.T) {
 // It has to run under -race, which the repository's CI does for every test.
 func TestCloseIsSafeWhileQueriesAreInFlight(t *testing.T) {
 	e := executorOnDeadPorts(t)
-	aliases := []string{"pg", "my", "ms"}
+	aliases := []string{pgAlias, "my", "ms"}
 
 	// Enough readers that Close lands in the middle of one. The queries go to
 	// dead ports, so each one is a dial that fails rather than a query that

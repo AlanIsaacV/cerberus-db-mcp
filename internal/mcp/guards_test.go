@@ -258,6 +258,90 @@ func TestNoGrantIsNamedAnywhereInThisLayer(t *testing.T) {
 	}
 }
 
+// TestListDatabasesIsOneCallThroughTheExecutorAndNothingElse is the source half of
+// "list_databases runs its statement through the same gate as execute_query".
+//
+// The gate is not something this layer consults for that tool: it is inside
+// [db.Executor.ListDatabases], which resolves the alias, validates its own
+// per-engine constant and only then borrows the connection. What this layer can get
+// wrong is having a second route — a copy of the statement handed to Execute, a
+// pattern appended to it, a second call somewhere that skips the audit line — and
+// each of those is one more call to this method than there should be. One call, two
+// arguments, and the second is the alias.
+//
+// It is scanned over the objective rather than this package, for the reason
+// TestExecuteIsCalledOnceWithNoGrants is: a main that reached the executor directly
+// would run a discovery statement nothing here can see.
+func TestListDatabasesIsOneCallThroughTheExecutorAndNothingElse(t *testing.T) {
+	fset, files := parseObjectiveFiles(t)
+	calls := 0
+	for name, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "ListDatabases" {
+				return true
+			}
+			calls++
+			if len(call.Args) != 2 {
+				t.Errorf("%s:%d calls ListDatabases with %d arguments; it takes a context and an alias, and nothing that could change the statement",
+					name, fset.Position(call.Pos()).Line, len(call.Args))
+			}
+			return true
+		})
+	}
+	if calls != 1 {
+		t.Errorf("found %d calls to ListDatabases in this objective, want exactly 1", calls)
+	}
+}
+
+// TestNoSQLIsWrittenAnywhereInThisLayer is acceptance criterion 10's "no exemption
+// added anywhere", for the part of the repository this layer owns.
+//
+// Every statement this process sends is one of exactly two things: the agent's own
+// text, which the gate sees, or one of internal/db's per-engine discovery
+// constants, which the gate also sees. A statement written here would be a third
+// kind — one this layer could hand to a driver, or hand to Execute alongside an
+// alias the agent did not name, without any rule having allowed it. There is no such
+// statement, and there is no way to add one without this failing.
+//
+// The check is on string literals, so the Go keyword `select` and the word
+// "selects" in a comment are not candidates. Struct tags are literals too, and the
+// jsonschema descriptions in tools.go are what a widening of this list would trip
+// over first — which is the correct outcome: a tool description is not the place a
+// statement is kept either.
+func TestNoSQLIsWrittenAnywhereInThisLayer(t *testing.T) {
+	// Fragments no string in this layer has a reason to contain. The three
+	// engine-specific ones are the discovery statements' own spellings, which is
+	// where a copy would most plausibly come from.
+	sqlSpellings := []string{"select ", "show databases", "pg_database", "sys.databases", "information_schema"}
+
+	fset, files := parseObjectiveFiles(t)
+	for name, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != gotoken.STRING {
+				return true
+			}
+			value, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				return true
+			}
+			lowered := strings.ToLower(value)
+			for _, spelling := range sqlSpellings {
+				if strings.Contains(lowered, spelling) {
+					t.Errorf("%s:%d contains %q; no SQL statement may be written in this layer, because a statement kept here is one this process could send without the gate having allowed it",
+						name, fset.Position(lit.Pos()).Line, spelling)
+				}
+			}
+			return true
+		})
+	}
+}
+
 // TestNoOtherListenAddressDefaultExists is acceptance criterion 9's source half.
 //
 // The loader test shows that the default resolves to loopback today. This shows

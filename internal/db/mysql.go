@@ -96,6 +96,9 @@ func mysqlConfig(spec AliasSpec, s Settings, bound serverBound) *mysqldriver.Con
 	cfg := mysqldriver.NewConfig()
 	cfg.Net = "tcp"
 	cfg.Addr = net.JoinHostPort(spec.Host, strconv.Itoa(spec.Port))
+	// An empty DBName is a configuration an operator may choose here: the connection
+	// opens with no default schema and a qualified otherdb.table still reads. That is
+	// what an alias with no CERBERUS_DB_<ALIAS>_DATABASES means on this engine.
 	cfg.DBName = spec.Database
 	cfg.User = spec.User
 	cfg.Passwd = spec.Password.reveal()
@@ -137,6 +140,24 @@ func mysqlConfig(spec AliasSpec, s Settings, bound serverBound) *mysqldriver.Con
 	// validates the config, which is where a bad TLS name or address is caught.
 	return cfg
 }
+
+// mysqlDatabases is the fixed statement [Executor.ListDatabases] runs on this
+// engine. It is the shortest text that answers the question, and the gate allows
+// SHOW on MySQL and on no other engine (rule read-show).
+//
+// One property of it is worth knowing before reading a result: SHOW DATABASES
+// reports the schemas the login has some privilege on and silently omits the rest,
+// with no error and no indication that anything was filtered. So an account with no
+// grants and a server with no databases produce the same empty answer here, and
+// there is no error for this package to surface — the distinction does not exist on
+// the wire.
+const mysqlDatabases = "SHOW DATABASES"
+
+// mysqlSystemDatabases are the schemas MySQL keeps for itself. They are excluded
+// because an agent asked to understand somebody's data model has no use for the
+// server's own bookkeeping, and four names of noise in a list is four names of
+// context spent.
+var mysqlSystemDatabases = []string{"information_schema", "mysql", "performance_schema", "sys"}
 
 func (c *myConn) spec() AliasSpec { return c.alias }
 

@@ -181,6 +181,36 @@ func postgresURL(spec AliasSpec) string {
 	return u.String()
 }
 
+// postgresDatabases is the fixed statement [Executor.ListDatabases] runs on this
+// engine.
+//
+// The two predicates are in the statement rather than on the exclusion list
+// because neither is a name. datistemplate covers template0 and template1 without
+// naming them, which matters on a cluster carrying templates of its own, and
+// datallowconn is the one part of "can this login use it" that is a property of the
+// database: a database with datallowconn false refuses every connection including
+// ours, so listing it would offer the agent something no configuration could reach.
+//
+// It is not filtered by privilege, and that is a limitation rather than an
+// oversight. pg_database is readable by everyone, so the rows come back whether or
+// not this login could connect to them; the predicate that would fix it,
+// has_database_privilege, is not on the gate's safe-function allowlist and this
+// objective does not widen that list. The result can therefore be longer than what
+// the login can open, and the honest report of that is the connection failing when
+// somebody configures one.
+const postgresDatabases = "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname"
+
+// postgresSystemDatabases are the databases a cluster creates for itself.
+//
+// The two templates are named as well as being excluded by datistemplate above,
+// which is not redundant for free: datistemplate is a flag an operator can clear,
+// and a cleared flag on template1 would put a database nobody means to read into an
+// agent's list. postgres is the one entry here that is a judgement rather than a
+// fact — it is a real database somebody may genuinely use — and it is excluded
+// because on a cluster nobody has customised it exists only as a place to connect
+// to.
+var postgresSystemDatabases = []string{"postgres", "template0", "template1"}
+
 func (c *pgConn) spec() AliasSpec { return c.alias }
 
 func (c *pgConn) close() { c.pool.Close() }

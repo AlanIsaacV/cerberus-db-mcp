@@ -87,6 +87,10 @@ func sessionInitSQL(s Settings) string {
 // rather than stored.
 func sqlServerDSN(spec AliasSpec, s Settings) string {
 	q := url.Values{}
+	// Empty is a configuration an operator may choose here: the driver then leaves
+	// the choice to the login's own default database and a qualified otherdb.dbo.tbl
+	// still reads. That is what an alias with no CERBERUS_DB_<ALIAS>_DATABASES means
+	// on this engine.
 	q.Set("database", spec.Database)
 	q.Set("app name", applicationName)
 	q.Set("dial timeout", strconv.FormatInt(seconds(s.ConnectTimeout), 10))
@@ -152,6 +156,28 @@ func sqlServerDSN(spec AliasSpec, s Settings) string {
 	}
 	return u.String()
 }
+
+// sqlServerDatabases is the fixed statement [Executor.ListDatabases] runs on this
+// engine.
+//
+// HAS_DBACCESS(name) = 1 is the obvious predicate and it is deliberately not here.
+// Measured against the baseline ruleset as it stands, the statement carrying it
+// comes back needs-approval on rule function:has_dbaccess — the gate does not have
+// HAS_DBACCESS on its safe-function allowlist — which would make this package's own
+// constant an escalation an operator has to grant. The rule for that situation is
+// that the statement changes and the ruleset does not, so it did.
+//
+// Little is lost, because sys.databases is already filtered by metadata visibility:
+// a login sees master and tempdb plus the databases it owns or holds a permission
+// in, which is close to the set HAS_DBACCESS would have kept. What survives the
+// change is that a database whose name is visible but whose access has been revoked
+// can still appear in the list, and the agent finds that out by being refused when
+// it asks for something in it.
+const sqlServerDatabases = "SELECT name FROM sys.databases ORDER BY name"
+
+// sqlServerSystemDatabases are the four databases every instance has and nobody
+// asks an agent to explore.
+var sqlServerSystemDatabases = []string{"master", "model", "msdb", "tempdb"}
 
 func (c *msConn) spec() AliasSpec { return c.alias }
 
