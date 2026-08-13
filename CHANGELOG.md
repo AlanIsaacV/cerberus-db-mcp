@@ -17,3 +17,5 @@ All notable changes to this project are documented in this file.
 
 - Add mcp auth and CI/CD
 
+- Replace `_DATABASE` by an optional `_DATABASES`
+
