@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -132,7 +134,7 @@ func connect(t *testing.T, e *db.Executor, adjust ...func(*Deps)) *harness {
 	h := &harness{audit: &bytes.Buffer{}, appLog: &bytes.Buffer{}}
 
 	deps := Deps{
-		Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: 5 * time.Second, Audit: AuditStdout},
+		Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: 5 * time.Second},
 		Executor: e,
 		Log:      NewLogger(h.appLog),
 		Audit:    NewAuditor(h.audit),
@@ -471,7 +473,7 @@ func TestUnreachableDatabaseSaysNothingAboutTheConnection(t *testing.T) {
 func TestAnErrorThatIsNotADatabaseErrorSaysNothing(t *testing.T) {
 	h := &harness{audit: &bytes.Buffer{}, appLog: &bytes.Buffer{}}
 	srv, err := New(Deps{
-		Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second, Audit: AuditStdout},
+		Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second},
 		Executor: unreachableExecutor(t),
 		Log:      zerolog.New(h.appLog),
 		Audit:    NewAuditor(h.audit),
@@ -534,7 +536,7 @@ func TestMiddlewareIsTheOnlySeamAndItWrapsTheEndpoint(t *testing.T) {
 	t.Run("an injected middleware sees every request and can refuse", func(t *testing.T) {
 		var calls int
 		srv, err := New(Deps{
-			Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second, Audit: AuditStdout},
+			Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second},
 			Executor: e,
 			Audit:    NewAuditor(&bytes.Buffer{}),
 			Middleware: func(next http.Handler) http.Handler {
@@ -630,13 +632,192 @@ func TestALoopbackListenerRefusesAForeignHostHeader(t *testing.T) {
 	}
 }
 
+// TestANonLoopbackListenerDoesNotRefuseAForeignHostHeader is the complement to
+// the loopback guard above. It uses no middleware so the SDK itself answers the
+// request; a test-local 401 would hide the DNS-rebinding check this protects.
+func TestANonLoopbackListenerDoesNotRefuseAForeignHostHeader(t *testing.T) {
+	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("listen on all interfaces: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	audit := &bytes.Buffer{}
+	srv, err := New(Deps{
+		Config:   Config{Address: "0.0.0.0:0", Path: "/mcp", ShutdownTimeout: time.Second},
+		Executor: unreachableExecutor(t),
+		Audit:    NewAuditor(audit),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	httpServer := &http.Server{Handler: srv.Handler()}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpServer.Serve(listener) }()
+	t.Cleanup(func() {
+		if err := httpServer.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("close HTTP server: %v", err)
+		}
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("serve HTTP server: %v", err)
+		}
+	})
+
+	address := nonLoopbackAddress(t, listener.Addr().String())
+	req, err := http.NewRequest(http.MethodPost, "http://"+address+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Host = "cerberus-db-mcp:8080"
+	resp, err := (&http.Client{Transport: &http.Transport{Proxy: nil}}).Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	contentType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil {
+		t.Errorf("parse Content-Type %q: %v", resp.Header.Get("Content-Type"), err)
+	} else if contentType != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want %q", contentType, "text/event-stream")
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		t.Errorf("status = %d, want a response from the SDK rather than its Host-header refusal", resp.StatusCode)
+	}
+	if strings.HasPrefix(string(body), "Forbidden: invalid Host header") {
+		t.Errorf("body = %q, want a response from the SDK rather than its Host-header refusal", body)
+	}
+
+	var response struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  *struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		if err := json.Unmarshal([]byte(data), &response); err != nil {
+			t.Fatalf("decode tools/list JSON-RPC response %q: %v", data, err)
+		}
+		break
+	}
+	if response.JSONRPC != "2.0" || string(response.ID) != "1" || response.Result == nil {
+		t.Fatalf("response = %s, want a JSON-RPC 2.0 tools/list result for request 1", body)
+	}
+	for _, tool := range response.Result.Tools {
+		if tool.Name == ToolExecuteQuery {
+			return
+		}
+	}
+	t.Errorf("tools/list response = %s, want %q", body, ToolExecuteQuery)
+}
+
+// nonLoopbackAddress returns an address on this host which reaches a wildcard
+// listener without making the accepted connection local to loopback. The SDK
+// checks that accepted connection address, not the address passed to Listen.
+func nonLoopbackAddress(t *testing.T, listenerAddress string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(listenerAddress)
+	if err != nil {
+		t.Fatalf("split listener address %q: %v", listenerAddress, err)
+	}
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("list network interfaces: %v", err)
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addresses, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, address := range addresses {
+			ip, _, err := net.ParseCIDR(address.String())
+			if err == nil && ip.To4() != nil && !ip.IsLoopback() {
+				return net.JoinHostPort(ip.String(), port)
+			}
+		}
+	}
+	t.Fatal("deployment-critical DNS-rebinding guard could not run: this environment needs an up, non-loopback IPv4 interface to exercise a network-facing listener")
+	return ""
+}
+
+func TestHealthzIsUnauthenticatedAndDoesNotAudit(t *testing.T) {
+	audit := &bytes.Buffer{}
+	var middlewareCalls int
+	srv, err := New(Deps{
+		Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second},
+		Executor: unreachableExecutor(t),
+		Audit:    NewAuditor(audit),
+		Middleware: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				middlewareCalls++
+				w.WriteHeader(http.StatusUnauthorized)
+			})
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	httpServer := httptest.NewServer(srv.Handler())
+	defer httpServer.Close()
+	resp, err := http.Get(httpServer.URL + healthPath)
+	if err != nil {
+		t.Fatalf("GET %s: %v", healthPath, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := string(body); got != healthBody {
+		t.Errorf("body = %q, want %q", got, healthBody)
+	}
+	if middlewareCalls != 0 {
+		t.Errorf("middleware called %d times for health, want 0", middlewareCalls)
+	}
+	if audit.Len() != 0 {
+		t.Errorf("health emitted an audit event: %s", audit.String())
+	}
+
+	resp, err = http.Post(httpServer.URL+"/mcp", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("POST /mcp: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized || middlewareCalls != 1 {
+		t.Errorf("the MCP route is not served beside health: status = %d, middleware calls = %d", resp.StatusCode, middlewareCalls)
+	}
+}
+
 // TestNewRefusesToBuildWithoutItsGuarantees covers the construction mistakes
 // that would leave a guarantee unenforced: no executor is a server with nothing
 // to serve, no auditor is a server that answers calls without recording them,
 // and an unusable configuration is one that must not become a listener.
 func TestNewRefusesToBuildWithoutItsGuarantees(t *testing.T) {
 	e := unreachableExecutor(t)
-	valid := Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second, Audit: AuditStdout}
+	valid := Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second}
 
 	for _, tt := range []struct {
 		name string
@@ -645,14 +826,14 @@ func TestNewRefusesToBuildWithoutItsGuarantees(t *testing.T) {
 	}{
 		{"no executor", Deps{Config: valid, Audit: NewAuditor(&bytes.Buffer{})}, ErrNoExecutor},
 		{"no auditor", Deps{Config: valid, Executor: e}, ErrNoAuditor},
-		{"an empty address", Deps{Config: Config{Path: "/mcp", ShutdownTimeout: time.Second, Audit: AuditStdout}, Executor: e, Audit: NewAuditor(&bytes.Buffer{})}, ErrInvalidVariable},
-		{"an address with no host", Deps{Config: Config{Address: ":8080", Path: "/mcp", ShutdownTimeout: time.Second, Audit: AuditStdout}, Executor: e, Audit: NewAuditor(&bytes.Buffer{})}, ErrInvalidVariable},
-		{"a relative path", Deps{Config: Config{Address: "127.0.0.1:0", Path: "mcp", ShutdownTimeout: time.Second, Audit: AuditStdout}, Executor: e, Audit: NewAuditor(&bytes.Buffer{})}, ErrInvalidVariable},
+		{"an empty address", Deps{Config: Config{Path: "/mcp", ShutdownTimeout: time.Second}, Executor: e, Audit: NewAuditor(&bytes.Buffer{})}, ErrInvalidVariable},
+		{"an address with no host", Deps{Config: Config{Address: ":8080", Path: "/mcp", ShutdownTimeout: time.Second}, Executor: e, Audit: NewAuditor(&bytes.Buffer{})}, ErrInvalidVariable},
+		{"a relative path", Deps{Config: Config{Address: "127.0.0.1:0", Path: "mcp", ShutdownTimeout: time.Second}, Executor: e, Audit: NewAuditor(&bytes.Buffer{})}, ErrInvalidVariable},
 		// New is where this one has to be caught. Handler mounts the path on an
 		// http.ServeMux, which reads it as a pattern: a space in it panics inside
 		// mux.Handle, and Run reaches Handler only after the listener has bound
 		// and logged that it is serving.
-		{"a path that is a mux pattern", Deps{Config: Config{Address: "127.0.0.1:0", Path: "/mcp x", ShutdownTimeout: time.Second, Audit: AuditStdout}, Executor: e, Audit: NewAuditor(&bytes.Buffer{})}, ErrInvalidVariable},
+		{"a path that is a mux pattern", Deps{Config: Config{Address: "127.0.0.1:0", Path: "/mcp x", ShutdownTimeout: time.Second}, Executor: e, Audit: NewAuditor(&bytes.Buffer{})}, ErrInvalidVariable},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := New(tt.deps)

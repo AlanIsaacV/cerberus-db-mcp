@@ -34,10 +34,9 @@ import (
 
 func main() {
 	// Built before anything that can fail, so that the first failure already has
-	// somewhere to be reported. It goes to stdout because that is where the audit
-	// stream goes by default too, and internal/mcp's Auditor tags its records with
-	// a "stream" field precisely so the two remain separable when they share a
-	// destination.
+	// somewhere to be reported. It goes to stdout, as does the audit stream;
+	// internal/mcp's Auditor tags its records with a "stream" field so the two
+	// remain separable when they share a destination.
 	log := mcp.NewLogger(os.Stdout)
 
 	if err := run(log); err != nil {
@@ -103,19 +102,6 @@ func run(log zerolog.Logger) error {
 		Strs("allowed_identities_normalised", authCfg.Allowlist()).
 		Msg("callers must present a Google credential this client issued, held by an allowlisted identity")
 
-	auditWriter, closeAudit, err := mcp.OpenAuditWriter(cfg.Audit)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		// Reported rather than returned: by the time this runs the server has
-		// already stopped for its own reason, and losing that reason to a failure
-		// closing a file would be trading the interesting error for the dull one.
-		if err := closeAudit(); err != nil {
-			log.Error().Err(err).Msg("closing the audit destination")
-		}
-	}()
-
 	// The empty overlay path is the embedded baseline ruleset and nothing else.
 	// An overlay can remove a baseline rule and add a safe-function allowance, so
 	// it is an input capable of weakening this process — the argument internal/db
@@ -140,7 +126,7 @@ func run(log zerolog.Logger) error {
 		Config:   *cfg,
 		Executor: executor,
 		Log:      log,
-		Audit:    mcp.NewAuditor(auditWriter),
+		Audit:    mcp.NewAuditor(os.Stdout),
 		// Wraps the MCP endpoint only, which is internal/mcp's own arrangement and
 		// not something this file chooses.
 		Middleware: middleware,

@@ -44,7 +44,7 @@ func TestTheNonLoopbackWarningSaysOnlyWhatIsTrueOfThisServer(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			appLog := &bytes.Buffer{}
 			srv, err := New(Deps{
-				Config:     Config{Address: exposed, Path: "/mcp", ShutdownTimeout: time.Second, Audit: AuditStdout},
+				Config:     Config{Address: exposed, Path: "/mcp", ShutdownTimeout: time.Second},
 				Executor:   unreachableExecutor(t),
 				Log:        NewLogger(appLog),
 				Audit:      NewAuditor(&bytes.Buffer{}),
@@ -79,7 +79,7 @@ func TestTheNonLoopbackWarningSaysOnlyWhatIsTrueOfThisServer(t *testing.T) {
 	t.Run("a loopback listener says nothing at all", func(t *testing.T) {
 		appLog := &bytes.Buffer{}
 		srv, err := New(Deps{
-			Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second, Audit: AuditStdout},
+			Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second},
 			Executor: unreachableExecutor(t),
 			Log:      NewLogger(appLog),
 			Audit:    NewAuditor(&bytes.Buffer{}),

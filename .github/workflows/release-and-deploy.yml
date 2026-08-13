@@ -1,0 +1,128 @@
+# Auto-release + arm64 image publish to ghcr.io.
+#
+# On every push to main, git-cliff computes the next version from conventional
+# commits. If there is a releasable change, this workflow updates CHANGELOG.md,
+# tags the release, publishes :vX.Y.Z and :latest, and creates a GitHub Release.
+# A push containing only unreleasable commits deliberately does nothing.
+#
+# The Raspberry Pi deploy remains operator-controlled:
+#   docker compose pull && docker compose up -d
+#
+# No configured secret is required: ghcr authentication uses GITHUB_TOKEN.
+
+name: release-and-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Avoids overlapping releases when pushes arrive close together.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # create the tag, commit CHANGELOG.md and create the Release
+  packages: write   # push the image to ghcr
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # git-cliff needs the complete history and its tags
+
+      - name: Lowercase image name
+        # ghcr/Docker require a lowercase repository path. The owner can contain
+        # uppercase letters, so normalize GITHUB_REPOSITORY before it reaches a tag.
+        run: |
+          echo "IMAGE=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Anything to release? Compute version
+        id: version
+        run: |
+          set -euo pipefail
+          LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          RANGE=${LATEST:+$LATEST..HEAD}
+          # RANGE is deliberately unquoted so it vanishes when no prior tag exists.
+          # shellcheck disable=SC2086
+          COMMITS=$(git log --format='%s%n%b' ${RANGE})
+          # Releasable = feat/fix/perf, any conventional breaking change, or
+          # a BREAKING CHANGE footer. Everything else leaves the repository alone.
+          if echo "$COMMITS" | grep -qiE '^(feat|fix|perf)(\([^)]+\))?!?:' \
+             || echo "$COMMITS" | grep -qE '^[a-z]+(\([^)]+\))?!:' \
+             || echo "$COMMITS" | grep -q 'BREAKING CHANGE'; then
+            NEXT=$(git cliff --bumped-version)
+            echo "Next version: $NEXT (from ${LATEST:-the beginning})"
+            {
+              echo "release=true"
+              echo "version=$NEXT"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "No releasable commits since ${LATEST:-the beginning}. Nothing to publish."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate CHANGELOG and release notes
+        if: steps.version.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          git cliff --bump -o CHANGELOG.md
+          git cliff --unreleased --bump --strip all -o RELEASE_NOTES.md
+
+      - name: Commit CHANGELOG and create the tag
+        if: steps.version.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          # [skip ci] prevents this release commit from re-triggering the workflow.
+          git commit -m "chore(release): ${{ steps.version.outputs.version }} [skip ci]"
+          git tag "${{ steps.version.outputs.version }}"
+          git push origin "HEAD:${{ github.ref_name }}"
+          git push origin "${{ steps.version.outputs.version }}"
+
+      - uses: docker/setup-qemu-action@v4
+        if: steps.version.outputs.release == 'true'
+      - uses: docker/setup-buildx-action@v4
+        if: steps.version.outputs.release == 'true'
+
+      - uses: docker/login-action@v4
+        if: steps.version.outputs.release == 'true'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish arm64 image
+        if: steps.version.outputs.release == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.version }}" \
+            --title "${{ steps.version.outputs.version }}" \
+            --notes-file RELEASE_NOTES.md

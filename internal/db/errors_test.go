@@ -75,6 +75,15 @@ func TestEveryKindHasASentinelAndAMessage(t *testing.T) {
 	}
 }
 
+func TestPermissionDeniedDoesNotClaimAnythingAboutAccountPrivileges(t *testing.T) {
+	message := (&Error{Kind: KindPermissionDenied}).Agent()
+	for _, forbidden := range []string{"read-only account", "account privileges", "account is read-only"} {
+		if strings.Contains(message, forbidden) {
+			t.Errorf("permission-denied message makes an unsupported privilege claim %q: %s", forbidden, message)
+		}
+	}
+}
+
 // declaredKinds returns every constant of type Kind declared in this package's
 // non-test files, keyed by the constant's Go name so a failure can name it.
 //

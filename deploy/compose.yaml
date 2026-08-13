@@ -1,0 +1,37 @@
+# ── "cerberus-db-mcp" stack on the Raspberry Pi ─────────────────────────────
+# Ships no code and compiles nothing: it only references the arm64 image
+# published on ghcr by .github/workflows/release-and-deploy.yml.
+#
+# Deploy:   cd /opt/stacks/cerberus-db-mcp && docker compose pull && docker compose up -d
+# Rollback: pin an older tag in 'image:' and repeat pull && up.
+#
+# The shared cloudflared container reaches this service by name over the
+# external `homelab` network. There is intentionally no published host port:
+# the MCP route has no LAN surface, and publishing one would undo that boundary.
+
+services:
+  cerberus-db-mcp:  # the shared cloudflared targets http://cerberus-db-mcp:8080
+    image: ghcr.io/alanisaacv/cerberus-db-mcp:latest  # switch to :vX.Y.Z to pin or roll back
+    restart: unless-stopped
+    # The operator's untracked .env belongs beside this file. Requiring it makes
+    # `docker compose config` fail in a clean checkout, so a missing Pi config
+    # stops visibly instead of starting the restart loop.
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      # The service must listen beyond container loopback for cloudflared on the
+      # shared network; no host port makes that listener reachable only there.
+      CERBERUS_MCP_ADDRESS: "0.0.0.0:8080"
+    # Starting reservation and ceiling pending measurement on the 2GB Pi already
+    # running six services; reserve 128m, cap at 256m, and tune both under load.
+    mem_reservation: 128m
+    mem_limit: 256m
+    networks:
+      - homelab
+    # No healthcheck on purpose: the distroless image has no shell or wget, and
+    # adding either only to probe the process would increase its Pi footprint.
+
+networks:
+  homelab:
+    external: true

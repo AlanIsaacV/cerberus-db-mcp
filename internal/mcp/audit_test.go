@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -279,53 +278,4 @@ func TestConcurrentRecordsArriveWhole(t *testing.T) {
 			}
 		}
 	}
-}
-
-func TestOpenAuditWriter(t *testing.T) {
-	t.Run("stdout and stderr are named, not paths", func(t *testing.T) {
-		for name, want := range map[string]*os.File{AuditStdout: os.Stdout, AuditStderr: os.Stderr} {
-			w, closeFn, err := OpenAuditWriter(name)
-			if err != nil {
-				t.Fatalf("OpenAuditWriter(%q) = %v", name, err)
-			}
-			if w != want {
-				t.Errorf("OpenAuditWriter(%q) = %v, want %v", name, w, want)
-			}
-			if err := closeFn(); err != nil {
-				t.Errorf("closing %q = %v; neither standard stream is ours to close", name, err)
-			}
-		}
-	})
-
-	t.Run("a path is appended to, not truncated", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "audit.jsonl")
-		if err := os.WriteFile(path, []byte("earlier\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		w, closeFn, err := OpenAuditWriter(path)
-		if err != nil {
-			t.Fatalf("OpenAuditWriter(%q) = %v", path, err)
-		}
-		NewAuditor(w).Record(AuditEvent{Tool: ToolExecuteQuery, Statement: "SELECT 1"})
-		if err := closeFn(); err != nil {
-			t.Fatalf("close: %v", err)
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.HasPrefix(string(content), "earlier\n") {
-			t.Errorf("the existing content was truncated: %s", content)
-		}
-		if !strings.Contains(string(content), "SELECT 1") {
-			t.Errorf("the new record was not appended: %s", content)
-		}
-	})
-
-	t.Run("a destination that cannot be opened is a startup failure", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "no-such-directory", "audit.jsonl")
-		if _, _, err := OpenAuditWriter(path); err == nil {
-			t.Errorf("OpenAuditWriter(%q) succeeded, so a server would start with nowhere to record calls", path)
-		}
-	})
 }

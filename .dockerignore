@@ -1,0 +1,9 @@
+# The build needs the whole Go source tree because embedded rules are compiled
+# into the binary, but repository history and local planning state do not belong
+# in the remote BuildKit context.
+.git
+.github
+.ai-kit
+.env
+.env.*
+!.env.example

@@ -1,9 +1,7 @@
 package mcp
 
 import (
-	"fmt"
 	"io"
-	"os"
 	"sync"
 	"time"
 
@@ -110,11 +108,10 @@ type Auditor struct {
 	// in the one stream whose completeness is its entire justification, and a
 	// mangled audit record cannot be reconstructed from anywhere else.
 	//
-	// The destinations [OpenAuditWriter] returns are all *os.File, which today
-	// does hold a per-file write lock across the whole write (internal/poll's
-	// FD.Write), so those in particular would survive without this. That is a
-	// property of what main happens to pass, not of what this type accepts, and
-	// it is not what the guarantee should rest on.
+	// The process passes stdout, whose file descriptor currently holds a per-file
+	// write lock across each Write (internal/poll's FD.Write), so it would survive
+	// without this. That is a property of what main happens to pass, not of what
+	// this type accepts, and it is not what the guarantee should rest on.
 	mu  sync.Mutex
 	log zerolog.Logger
 }
@@ -127,32 +124,6 @@ type Auditor struct {
 // without one.
 func NewAuditor(w io.Writer) *Auditor {
 	return &Auditor{log: zerolog.New(w).With().Timestamp().Logger()}
-}
-
-// OpenAuditWriter resolves a [Config.Audit] destination to a writer and a close
-// function.
-//
-// It lives here rather than in the process's main so that main stays a shell
-// that wires things together, and so that the file mode below — append, create,
-// owner-only — is decided next to the thing that decides what goes in the file.
-func OpenAuditWriter(destination string) (io.Writer, func() error, error) {
-	noClose := func() error { return nil }
-	switch destination {
-	case AuditStdout:
-		return os.Stdout, noClose, nil
-	case AuditStderr:
-		return os.Stderr, noClose, nil
-	}
-	// Appended rather than truncated: an audit stream that starts empty on every
-	// restart cannot answer a question about yesterday. 0600 because the
-	// statements in it are a description of somebody else's schema.
-	f, err := os.OpenFile(destination, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		// The path is the operator's own and is named back to them, because a
-		// server that will not start has to say what it could not open.
-		return nil, nil, fmt.Errorf("mcp: open the audit destination %q: %w", destination, err)
-	}
-	return f, f.Close, nil
 }
 
 // Record writes one event.

@@ -1,0 +1,38 @@
+# Release notes and versions follow this repository's Conventional Commits policy.
+# Types not listed below intentionally produce neither a release-note entry nor a bump.
+
+[changelog]
+header = "# Changelog\n\nAll notable changes to this project are documented in this file.\n"
+body = """
+{% if version %}
+## {{ version }} - {{ timestamp | date(format=\"%Y-%m-%d\") }}
+{% else %}
+## Unreleased
+{% endif %}
+{% for group, commits in commits | group_by(attribute=\"group\") %}
+### {{ group }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }}
+{% endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+protect_breaking_commits = true
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^(docs|chore|ci|test)(\\([^)]+\\))?!?:", skip = true },
+  { message = ".*", skip = true },
+]
+tag_pattern = "v[0-9].*"
+sort_commits = "oldest"
+
+[bump]
+features_always_bump_minor = true
+breaking_always_bump_major = true
+initial_tag = "v0.1.0"

@@ -3,10 +3,9 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -46,20 +45,17 @@ func (l *lockedBuffer) String() string {
 	return l.b.String()
 }
 
-// testEnvironment is a whole usable environment for one run of [run], with the
-// audit stream pointed into the test's own directory.
+// testEnvironment is a whole usable environment for one run of [run].
 //
 // It sets the two PG* variables and MSSQL_USE_EPA to the empty string, which
 // internal/db reads as unset, so that a developer's own shell cannot make this test
 // fail on a refusal that is about their psql habits.
-func testEnvironment(t *testing.T, address string) (auditPath string) {
+func testEnvironment(t *testing.T, address string) {
 	t.Helper()
-	auditPath = filepath.Join(t.TempDir(), "audit.jsonl")
 
 	t.Setenv("CERBERUS_MCP_ADDRESS", address)
 	t.Setenv("CERBERUS_MCP_PATH", "/mcp")
 	t.Setenv("CERBERUS_MCP_SHUTDOWN_TIMEOUT", "5s")
-	t.Setenv("CERBERUS_MCP_AUDIT", auditPath)
 
 	t.Setenv("CERBERUS_DB_ALIASES", "warehouse")
 	t.Setenv("CERBERUS_DB_WAREHOUSE_ENGINE", "postgresql")
@@ -75,20 +71,16 @@ func testEnvironment(t *testing.T, address string) (auditPath string) {
 	t.Setenv("PGSERVICE", "")
 	t.Setenv("PGSERVICEFILE", "")
 	t.Setenv("MSSQL_USE_EPA", "")
-	return auditPath
 }
 
 // TestTheProcessRefusesToStartWithoutAuthenticationBeforeItOpensAnythingElse is
 // acceptance criterion 7 at the only place it is a property of the process rather
 // than of a loader: the order of the calls in [run].
 //
-// The absent audit file is the observable half. internal/auth's own tests show that
-// the configuration is refused; what they cannot show is that it is refused *first*.
-// An audit file created by a start that was never going to be authenticated is
-// evidence of a deployment that did not happen, sitting in the place an operator
-// goes to find out what did.
+// internal/auth's own tests show that the configuration is refused; this test
+// keeps the process wiring on that same early path.
 func TestTheProcessRefusesToStartWithoutAuthenticationBeforeItOpensAnythingElse(t *testing.T) {
-	auditPath := testEnvironment(t, "127.0.0.1:0")
+	testEnvironment(t, "127.0.0.1:0")
 	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "")
 	t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "")
 
@@ -96,11 +88,6 @@ func TestTheProcessRefusesToStartWithoutAuthenticationBeforeItOpensAnythingElse(
 	if !errors.Is(err, auth.ErrNoClientID) {
 		t.Fatalf("run() = %v, want an error wrapping auth.ErrNoClientID", err)
 	}
-	if _, statErr := os.Stat(auditPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Errorf("os.Stat(%s) = %v, want the file not to exist: the audit destination was opened by a start that was refused",
-			auditPath, statErr)
-	}
-
 	t.Run("and it refuses the same way when only the allowlist is missing", func(t *testing.T) {
 		t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
 		t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "")
@@ -108,9 +95,6 @@ func TestTheProcessRefusesToStartWithoutAuthenticationBeforeItOpensAnythingElse(
 		err := run(zerolog.New(&lockedBuffer{}))
 		if !errors.Is(err, auth.ErrNoAllowlist) {
 			t.Fatalf("run() = %v, want an error wrapping auth.ErrNoAllowlist", err)
-		}
-		if _, statErr := os.Stat(auditPath); !errors.Is(statErr, os.ErrNotExist) {
-			t.Errorf("os.Stat(%s) = %v, want the file not to exist", auditPath, statErr)
 		}
 	})
 }
@@ -128,7 +112,7 @@ func TestTheProcessRefusesToStartWithoutAuthenticationBeforeItOpensAnythingElse(
 // else entirely.
 func TestTheListenerTheBinaryStartsAnswersAnUnauthenticatedRequestWithAChallenge(t *testing.T) {
 	address := reservedAddress(t)
-	auditPath := testEnvironment(t, address)
+	testEnvironment(t, address)
 	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
 	// Written with a stray space and a trailing comma, so the startup log's two
 	// allowlist fields are visibly different values.
@@ -138,7 +122,7 @@ func TestTheListenerTheBinaryStartsAnswersAnUnauthenticatedRequestWithAChallenge
 	runErr := make(chan error, 1)
 	go func() { runErr <- run(zerolog.New(appLog)) }()
 
-	resp := postWhenServing(t, "http://"+address+"/mcp", runErr)
+	resp := postWhenServing(t, "http://"+address+"/mcp", "", runErr)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -147,12 +131,6 @@ func TestTheListenerTheBinaryStartsAnswersAnUnauthenticatedRequestWithAChallenge
 	}
 	if resp.Header.Get("WWW-Authenticate") == "" {
 		t.Error("the refusal carries no WWW-Authenticate; nothing but the authentication middleware answers a request here that way")
-	}
-
-	// The audit destination was opened this time, which is what makes its absence in
-	// the test above evidence of an ordering rather than of a path nothing writes.
-	if _, err := os.Stat(auditPath); err != nil {
-		t.Errorf("os.Stat(%s) = %v, want the audit destination to have been opened by a start that succeeded", auditPath, err)
 	}
 
 	// Both forms of the allowlist, which is what an operator debugging a 403 reads:
@@ -184,6 +162,50 @@ func TestTheListenerTheBinaryStartsAnswersAnUnauthenticatedRequestWithAChallenge
 	}
 }
 
+// TestANetworkFacingListenerTheBinaryStartsAuthenticatesBeforeTheSDKChecksTheHost
+// closes criterion 4 where both its topology and its real authentication middleware
+// are present: a cloudflared request reaches the non-loopback listener under its
+// Docker service name, without a credential.
+func TestANetworkFacingListenerTheBinaryStartsAuthenticatesBeforeTheSDKChecksTheHost(t *testing.T) {
+	address := reservedNetworkFacingAddress(t)
+	testEnvironment(t, address)
+	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
+	t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "one@example.test")
+
+	appLog := &lockedBuffer{}
+	runErr := make(chan error, 1)
+	go func() { runErr <- run(zerolog.New(appLog)) }()
+
+	resp := postWhenServing(t, "http://"+address+"/mcp", "cerberus-db-mcp:8080", runErr)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d: the non-loopback listener did not let the real authentication middleware refuse the unauthenticated request",
+			resp.StatusCode, http.StatusUnauthorized)
+	}
+	if resp.Header.Get("WWW-Authenticate") == "" {
+		t.Error("the refusal carries no WWW-Authenticate; the real authentication middleware did not answer this request")
+	}
+	if string(body) != "unauthorized\n" {
+		t.Errorf("body = %q, want the authentication middleware's unauthorized response", body)
+	}
+	// The real authentication middleware wraps the SDK handler, so it refuses this
+	// unauthenticated request before the SDK sees its Host header. This test therefore
+	// cannot distinguish the bind address, and an assertion that the SDK did not
+	// refuse the request could never fail. TestANonLoopbackListenerDoesNotRefuseAForeignHostHeader
+	// in internal/mcp is the discriminating guard: it runs without middleware, so the
+	// SDK itself answers.
+	if !strings.Contains(appLog.String(), `"failure_class":"absent_header"`) {
+		t.Errorf("the application log has no absent-header authentication refusal: %s", appLog.String())
+	}
+
+	shutdownRun(t, runErr)
+}
+
 // reservedAddress is a loopback address with a port the kernel has just confirmed
 // was free.
 //
@@ -205,9 +227,57 @@ func reservedAddress(t *testing.T) string {
 	return address
 }
 
+// reservedNetworkFacingAddress reserves a wildcard port and returns an address
+// that reaches it through this host's network-facing interface.
+func reservedNetworkFacingAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("reserve a network-facing port: %v", err)
+	}
+	address := nonLoopbackAddress(t, listener.Addr().String())
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release the reserved port: %v", err)
+	}
+	return address
+}
+
+// nonLoopbackAddress mirrors internal/mcp's test-only helper because its
+// unexported package-local form cannot cross into the command package. The SDK
+// examines the accepted local address, so dialing the wildcard listener through
+// loopback would not exercise the deployed Docker topology.
+func nonLoopbackAddress(t *testing.T, listenerAddress string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(listenerAddress)
+	if err != nil {
+		t.Fatalf("split listener address %q: %v", listenerAddress, err)
+	}
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("list network interfaces: %v", err)
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addresses, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, address := range addresses {
+			ip, _, err := net.ParseCIDR(address.String())
+			if err == nil && ip.To4() != nil && !ip.IsLoopback() {
+				return net.JoinHostPort(ip.String(), port)
+			}
+		}
+	}
+	t.Fatal("deployment-critical DNS-rebinding and authentication guard could not run: this environment needs an up, non-loopback IPv4 interface to exercise a network-facing listener")
+	return ""
+}
+
 // postWhenServing posts once the listener is accepting, failing the test if run
 // returned instead of serving.
-func postWhenServing(t *testing.T, endpoint string, runErr <-chan error) *http.Response {
+func postWhenServing(t *testing.T, endpoint, host string, runErr <-chan error) *http.Response {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
@@ -216,8 +286,16 @@ func postWhenServing(t *testing.T, endpoint string, runErr <-chan error) *http.R
 			t.Fatalf("run returned before it was serving: %v", err)
 		default:
 		}
-		resp, err := http.Post(endpoint, "application/json",
+		req, err := http.NewRequest(http.MethodPost, endpoint,
 			strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+		if err != nil {
+			t.Fatalf("create request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if host != "" {
+			req.Host = host
+		}
+		resp, err := (&http.Client{Transport: &http.Transport{Proxy: nil}}).Do(req)
 		if err == nil {
 			return resp
 		}
@@ -225,5 +303,20 @@ func postWhenServing(t *testing.T, endpoint string, runErr <-chan error) *http.R
 			t.Fatalf("the listener never answered at %s: %v", endpoint, err)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func shutdownRun(t *testing.T, runErr <-chan error) {
+	t.Helper()
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM: %v", err)
+	}
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Errorf("run() = %v, want a clean shutdown", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("run did not return after SIGTERM")
 	}
 }

@@ -579,7 +579,7 @@ func TestSignalShutsDownAndClosesEveryPool(t *testing.T) {
 	const shutdownTimeout = 10 * time.Second
 	ready := make(chan string, 1)
 	srv, err := New(Deps{
-		Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: shutdownTimeout, Audit: AuditStdout},
+		Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: shutdownTimeout},
 		Executor: e,
 		Log:      NewLogger(os.Stderr),
 		Audit:    NewAuditor(os.Stderr),

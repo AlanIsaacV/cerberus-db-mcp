@@ -116,15 +116,17 @@ var kindSentinels = map[Kind]error{
 // composed from an engine's bytes, a DSN or an [AliasSpec], which is what makes
 // the credential guarantee a property of the code rather than of a test.
 var agentMessages = map[Kind]string{
-	KindRefused:             "the statement was refused because it is not provably a read",
-	KindNeedsApproval:       "the statement cannot be run until a human grants the listed rules",
-	KindUnknownAlias:        "no database is configured under that alias",
-	KindUnavailable:         "the database is not reachable right now",
-	KindTimeout:             "the statement was stopped for exceeding its time limit; read less at once",
-	KindLockTimeout:         "the statement waited too long for a lock and was stopped; the data is in use by someone else",
-	KindPermissionDenied:    "the read-only account used for this connection may not read that object",
-	KindInvalidStatement:    "the database rejected the statement as invalid",
-	KindObjectNotFound:      "the statement names a table, view or column this database does not have",
+	KindRefused:          "the statement was refused because it is not provably a read",
+	KindNeedsApproval:    "the statement cannot be run until a human grants the listed rules",
+	KindUnknownAlias:     "no database is configured under that alias",
+	KindUnavailable:      "the database is not reachable right now",
+	KindTimeout:          "the statement was stopped for exceeding its time limit; read less at once",
+	KindLockTimeout:      "the statement waited too long for a lock and was stopped; the data is in use by someone else",
+	KindPermissionDenied: "the connection may not read that object",
+	KindInvalidStatement: "the database rejected the statement as invalid",
+	KindObjectNotFound:   "the statement names a table, view or column this database does not have",
+	// Only PostgreSQL and MySQL classify here from their engine-enforced read-only
+	// transactions; SQL Server cannot produce this Kind, so the claim is faithful.
 	KindReadOnlyTransaction: "the database refused the statement because the connection is read-only",
 	KindCancelled:           "the call was cancelled before it finished",
 	KindInternal:            "the database call failed",

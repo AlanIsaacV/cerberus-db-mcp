@@ -55,22 +55,7 @@ type Config struct {
 	// own shutdown. It is a bound and not a promise: a client holding a
 	// connection open cannot delay this process indefinitely.
 	ShutdownTimeout time.Duration `env:"CERBERUS_MCP_SHUTDOWN_TIMEOUT" envDefault:"30s"`
-
-	// Audit names where the audit stream is written: "stdout", "stderr", or a
-	// path to a file that is appended to.
-	//
-	// It is configurable because where this stream belongs is a deployment
-	// question that this objective cannot answer — beside the application log on
-	// a host with log shipping, in its own file on one without — and answering it
-	// wrongly in code would be answering it for every deployment.
-	Audit string `env:"CERBERUS_MCP_AUDIT" envDefault:"stdout"`
 }
-
-// The audit destinations that are not file paths.
-const (
-	AuditStdout = "stdout"
-	AuditStderr = "stderr"
-)
 
 // pathRejected are the characters [Config.Path] may not contain: every ASCII
 // whitespace character, and the two that make an http.ServeMux pattern a
@@ -119,7 +104,6 @@ var variableForms = map[string]struct{ variable, form string }{
 	"Address":         {"CERBERUS_MCP_ADDRESS", "a host and port, such as 127.0.0.1:8080"},
 	"Path":            {"CERBERUS_MCP_PATH", "an absolute path with no spaces or braces, such as /mcp"},
 	"ShutdownTimeout": {"CERBERUS_MCP_SHUTDOWN_TIMEOUT", "a duration with a unit, such as 30s"},
-	"Audit":           {"CERBERUS_MCP_AUDIT", `"stdout", "stderr", or a path to a file`},
 }
 
 func parseError(err error) error {
@@ -163,9 +147,6 @@ func (c Config) validate() error {
 	}
 	if c.ShutdownTimeout <= 0 {
 		return fmt.Errorf("mcp: %s must be a positive duration: %w", variableForms["ShutdownTimeout"].variable, ErrInvalidVariable)
-	}
-	if c.Audit == "" {
-		return fmt.Errorf("mcp: %s must be %s: %w", variableForms["Audit"].variable, variableForms["Audit"].form, ErrInvalidVariable)
 	}
 	return nil
 }

@@ -45,7 +45,6 @@ func TestDefaultsAreLoopbackAndNothingElse(t *testing.T) {
 		Address:         "127.0.0.1:8080",
 		Path:            "/mcp",
 		ShutdownTimeout: 30 * time.Second,
-		Audit:           AuditStdout,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("LoadConfigFrom(nothing) = %+v, want %+v", cfg, want)

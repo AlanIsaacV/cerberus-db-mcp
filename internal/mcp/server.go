@@ -46,6 +46,8 @@ import (
 const (
 	serverName    = "cerberus-db-mcp"
 	serverVersion = "0.1.0"
+	healthPath    = "/healthz"
+	healthBody    = "ok\n"
 )
 
 // readHeaderTimeout bounds how long a client may take to send its request
@@ -144,6 +146,12 @@ func New(deps Deps) (*Server, error) {
 // what this package registers is what a client actually sees.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	// Health only says that this HTTP server can answer. It deliberately avoids
+	// the MCP handler and its middleware, so a probe never authenticates, opens a
+	// database connection, or adds an audit event.
+	mux.HandleFunc("GET "+healthPath, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, healthBody)
+	})
 	mux.Handle(s.cfg.Path, s.middlewareOrPassThrough()(s.mcpHandler()))
 	return mux
 }
