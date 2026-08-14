@@ -276,10 +276,11 @@ go test -tags integration -race -timeout 20m -p 1 ./...
 ```
 
 Each engine's fixtures come from the SQL files in `deploy/postgres-init` and
-`deploy/mysql-init`, and both images run those only while initialising an empty
-data directory. Containers that already existed before those files changed
-therefore lack the second database and the low-privilege PostgreSQL role the
-database-set tests need, and `up -d` will not add them. Recreate them once:
+`deploy/mysql-init`, including the generated wide schema fixture, and both images
+run those only while initialising an empty data directory. Containers that already
+existed before those files changed therefore lack the second database, the
+low-privilege PostgreSQL role, or the wide schema the integration tests need, and
+`up -d` will not add them. Recreate them once:
 
 ```sh
 docker compose -f deploy/compose.test.yaml down -v
