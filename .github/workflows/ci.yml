@@ -113,6 +113,13 @@ jobs:
     services:
       postgres:
         image: postgres:16-alpine
+        # deploy/compose.test.yaml runs this engine with max_connections=50, so
+        # that the tests which watch a running query from a second connection have
+        # room beyond the executor's own pool. That is a server command flag, and a
+        # service container takes no command — but the image's own default is 100,
+        # which is above it, so the headroom is there and the flag is deliberately
+        # not reproduced. Nothing asserts a ceiling on connections; if something
+        # ever does, it needs a compose-backed engine rather than this one.
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: cerberus-test-pg-root
@@ -157,14 +164,28 @@ jobs:
       CERBERUS_DB_PGTEST_PORT: '55432'
       # The database name and the user name are deliberately unalike, and neither
       # is a substring of the other. See MYSQL_DATABASE above for why.
-      CERBERUS_DB_PGTEST_DATABASE: testbed
+      #
+      # One name and not both the fixture creates. An alias that lists databases is
+      # replaced by one connection per database named <alias>.<database>, so this is
+      # the connection pgtest.testbed and nothing is reachable under the bare name
+      # pgtest. ledger is deliberately left off: the tests that are about a set of
+      # databases build their own alias over both names from this one's topology, and
+      # the discovery tests need ledger to exist rather than to be connected to.
+      CERBERUS_DB_PGTEST_DATABASES: testbed
       CERBERUS_DB_PGTEST_USER: cerberus
       CERBERUS_DB_PGTEST_PASSWORD: cerberus-test-pg
       CERBERUS_DB_PGTEST_TLS: disable
       CERBERUS_DB_MYTEST_ENGINE: mysql
       CERBERUS_DB_MYTEST_HOST: 127.0.0.1
       CERBERUS_DB_MYTEST_PORT: '53306'
-      CERBERUS_DB_MYTEST_DATABASE: testbed
+      # Set even though MySQL accepts an alias with no databases at all, because an
+      # alias without one has an empty database name and the sanitisation tests
+      # check the database name and the user name as substrings: the empty string is
+      # a substring of every user name, so the guard that keeps the two values
+      # distinguishable would fail on it rather than on a leak. The engine's
+      # acceptance of the absent variable is established by a test that builds its
+      # own alias for it, not by this job's configuration.
+      CERBERUS_DB_MYTEST_DATABASES: testbed
       CERBERUS_DB_MYTEST_USER: cerberus
       CERBERUS_DB_MYTEST_PASSWORD: cerberus-test-my
       CERBERUS_DB_MYTEST_TLS: disable
@@ -181,29 +202,42 @@ jobs:
           go-version: '1.26'
           check-latest: true
 
-      # A service container cannot mount a repository file, so the two pieces of
-      # setup that deploy/compose.test.yaml does declaratively are done here
-      # instead. Both exist for a reason a comment in those files explains:
+      # A service container starts before the checkout and cannot mount a repository
+      # file, so the files deploy/compose.test.yaml hands to the entrypoints are fed
+      # to the engines from the runner instead — the same files, in the same lexical
+      # order, through the same client, against the same default database each
+      # entrypoint would use: postgres for psql, because the image falls back to
+      # POSTGRES_USER when POSTGRES_DB is unset, and testbed for mysql, because that
+      # is MYSQL_DATABASE. They are the fixture's only definition, so CI and
+      # `docker compose -f deploy/compose.test.yaml up` cannot come to disagree
+      # about what a test is running against; each file says why its own statements
+      # are there.
       #
-      #   - the test account is created without superuser, because a superuser is
-      #     denied nothing and one of the error classes the sanitisation criterion
-      #     asks for cannot then be provoked at all;
-      #   - the general log is turned on with TABLE output and made readable,
-      #     because it is the server's own record of the statement it received,
-      #     which is the only witness to byte-identity that is not this process
-      #     reporting on itself.
+      # Mounting them would not be enough even if a service container could, for a
+      # reason worth knowing before trying: both images run
+      # /docker-entrypoint-initdb.d only while initialising an empty data
+      # directory, so a cached volume comes up healthy and missing whatever a script
+      # gained since. Replaying them unconditionally is what makes the fixture
+      # depend on the workflow rather than on the runner's disk.
       - name: prepare the engines
         env:
           PGPASSWORD: cerberus-test-pg-root
         run: |
-          psql -h 127.0.0.1 -p 55432 -U postgres -d postgres -v ON_ERROR_STOP=1 \
-            -c "CREATE ROLE cerberus LOGIN PASSWORD 'cerberus-test-pg'" \
-            -c "CREATE DATABASE testbed OWNER cerberus"
-          mysql -h 127.0.0.1 -P 53306 --protocol=TCP -uroot -pcerberus-test-my-root -e "
-            SET GLOBAL log_output = 'TABLE';
-            SET GLOBAL general_log = 1;
-            GRANT SELECT ON mysql.general_log TO 'cerberus'@'%';
-            FLUSH PRIVILEGES;"
+          for script in deploy/postgres-init/*.sql; do
+            psql -h 127.0.0.1 -p 55432 -U postgres -d postgres \
+              -v ON_ERROR_STOP=1 --no-psqlrc -f "$script"
+          done
+
+          # The one piece of the compose fixture that is not an init script, and so
+          # the one piece that is still written out here: general_log is a server
+          # command flag there, and a service container takes no command.
+          mysql -h 127.0.0.1 -P 53306 --protocol=TCP -uroot -pcerberus-test-my-root \
+            -e "SET GLOBAL log_output = 'TABLE'; SET GLOBAL general_log = 1;"
+
+          for script in deploy/mysql-init/*.sql; do
+            mysql -h 127.0.0.1 -P 53306 --protocol=TCP -uroot -pcerberus-test-my-root \
+              --database=testbed < "$script"
+          done
 
       # The whole repository, not an enumerated list of the packages that have
       # container-backed tests today. The list is what went wrong once already:

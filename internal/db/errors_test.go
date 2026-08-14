@@ -284,7 +284,7 @@ func TestRefusalAgentMessageCarriesTheGatesOwnWords(t *testing.T) {
 		t.Fatalf("gate.New: %v", err)
 	}
 	decision := g.Validate(spec.Engine, "DROP TABLE dbo.Invoices", nil)
-	dbErr := refusalError(spec, decision)
+	dbErr := refusalError("execute", spec, decision)
 
 	agent := dbErr.Agent()
 	if !strings.Contains(agent, string(decision.Reason)) {

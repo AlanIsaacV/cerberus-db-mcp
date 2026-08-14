@@ -169,6 +169,9 @@ func TestRefusedStatementsNeverReachADriver(t *testing.T) {
 			if dbErr.Detail != "" {
 				t.Errorf("a refusal carries a driver detail, so something spoke to a driver: %s", dbErr.Detail)
 			}
+			if dbErr.Op != "execute" {
+				t.Errorf("Op = %q, so an operator's log names the wrong call", dbErr.Op)
+			}
 			if dbErr.Decision == nil {
 				t.Fatal("the gate's decision is not carried on the error")
 			}

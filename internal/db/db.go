@@ -209,7 +209,7 @@ func (e *Executor) Execute(ctx context.Context, alias, statement string, grants 
 
 	decision := e.gate.Validate(spec.Engine, statement, grants)
 	if decision.Verdict != gate.Allow {
-		return nil, refusalError(spec, decision)
+		return nil, refusalError("execute", spec, decision)
 	}
 
 	started := time.Now()
@@ -272,12 +272,7 @@ func (e *Executor) ListDatabases(ctx context.Context, alias string) (*DatabaseLi
 
 	decision := e.gate.Validate(spec.Engine, d.statement, nil)
 	if decision.Verdict != gate.Allow {
-		// The verb is set after construction so that the mapping from a verdict to a
-		// [Kind] stays in one place. Copying those three lines here would be copying
-		// the decision that says which refusals are escalations.
-		refusal := refusalError(spec, decision)
-		refusal.Op = "list-databases"
-		return nil, refusal
+		return nil, refusalError("list-databases", spec, decision)
 	}
 
 	started := time.Now()

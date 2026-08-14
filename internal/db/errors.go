@@ -239,12 +239,12 @@ func (e *Error) Agent() string {
 
 // refusalError turns a non-Allow verdict into an [Error]. The decision is copied
 // so that the caller cannot reach the gate's own value through the pointer.
-func refusalError(spec AliasSpec, d gate.Decision) *Error {
+func refusalError(op string, spec AliasSpec, d gate.Decision) *Error {
 	kind := KindRefused
 	if d.Verdict == gate.NeedsApproval {
 		kind = KindNeedsApproval
 	}
-	return &Error{Op: "execute", Alias: spec.Alias, Engine: spec.Engine, Kind: kind, Decision: &d}
+	return &Error{Op: op, Alias: spec.Alias, Engine: spec.Engine, Kind: kind, Decision: &d}
 }
 
 // openError is the failure of opening an alias's pool. Every engine's open path
