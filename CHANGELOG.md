@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.2.0 - 2026-08-15
+
+
+### Features
+
+- Add tool to search in schema
+
+
 ## v0.1.0 - 2026-08-13
 
 
@@ -18,4 +26,8 @@ All notable changes to this project are documented in this file.
 - Add mcp auth and CI/CD
 
 - Replace `_DATABASE` by an optional `_DATABASES`
+
+- Improve `list_database`
+
+- Wide schema
 
