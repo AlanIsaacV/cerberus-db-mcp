@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.2.1 - 2026-08-15
+
+
+### Fixes
+
+- Bound search_schema results by bytes, not only by rows
+
+
 ## v0.2.0 - 2026-08-15
 
 
