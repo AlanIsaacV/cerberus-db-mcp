@@ -198,7 +198,12 @@ func wideFixtureHarness(t *testing.T, engine gate.Engine) harness {
 			return harness{Executor: e, alias: alias, spec: c.spec()}
 		}
 	}
-	t.Skipf("no PostgreSQL alias is configured for the fixture database %q; include it in CERBERUS_DB_*_DATABASES", fixtureDatabase)
+	// Through skipOrFail rather than t.Skipf, because this is the skip most able to
+	// hide something: a configured, reachable PostgreSQL server whose alias list has
+	// simply stopped naming the fixture database silences every wide-fixture
+	// assertion behind a green run. When CERBERUS_TEST_REQUIRE_ENGINES names
+	// PostgreSQL, that is a failure and not an absence.
+	skipOrFail(t, required, engine, fmt.Sprintf("no PostgreSQL alias is configured for the fixture database %q; include it in CERBERUS_DB_*_DATABASES", fixtureDatabase))
 	return harness{}
 }
 

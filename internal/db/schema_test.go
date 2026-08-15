@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -144,6 +146,84 @@ func TestSearchSchemaShortPatternNeverReachesADriver(t *testing.T) {
 	}
 	if dbErr.Kind != KindInvalidArgument {
 		t.Fatalf("SearchSchema() Kind = %q, want %q; a driver call would fail as unavailable", dbErr.Kind, KindInvalidArgument)
+	}
+}
+
+// TestSearchSchemaIsRefusedWhenAnOverlayRemovesTheRuleThatAllowsIt is acceptance
+// criterion 5's evidence that a statement the gate refuses never reaches a
+// connection, in the shape
+// [TestListDatabasesIsRefusedWhenAnOverlayRemovesTheRuleThatAllowsIt] already
+// established for the other fixed statement this package owns.
+//
+// It is an ordinary unit test and not an integration one on purpose. The gate
+// allows every engine's search statement — that is what
+// [TestEveryEngineHasASchemaSearchStatementTheGateAllows] proves — so no server,
+// however real, can make one of them be refused. A ruleset overlay is the only
+// input that can, and an overlay behaves identically with and without a container.
+// Moving this under the integration build tag would take the criterion's only
+// evidence out of every run a developer makes.
+//
+// The overlay removes read-with, the rule the leading keyword of all three search
+// statements depends on; it is what an operator tightening the ruleset against
+// CTEs would do without realising this server's own catalog search is one. The
+// refusal has to arrive instead of a dial failure — every alias here points at a
+// dead port, so a KindUnavailable would mean the statement was carried to a
+// connection with no rule allowing it.
+//
+// The two aliases together pin the ordering inside [Executor.SearchSchema]: the
+// MySQL alias is bound to no database and is asked for a one-character pattern,
+// and each of those is a refusal of its own, so a gate check moved after either
+// one reports KindInvalidArgument here.
+func TestSearchSchemaIsRefusedWhenAnOverlayRemovesTheRuleThatAllowsIt(t *testing.T) {
+	neutraliseForeignVariables(t)
+	overlay := filepath.Join(t.TempDir(), "overlay.json")
+	if err := os.WriteFile(overlay, []byte(`{"version": 1, "remove_rules": ["read-with"]}`), 0o600); err != nil {
+		t.Fatalf("write overlay: %v", err)
+	}
+	g, err := gate.New(overlay)
+	if err != nil {
+		t.Fatalf("gate.New: %v", err)
+	}
+	cfg, err := LoadConfigFrom(deadPortEnvironment(t, map[string]gate.Engine{"pg": gate.PostgreSQL, "my": gate.MySQL}))
+	if err != nil {
+		t.Fatalf("LoadConfigFrom: %v", err)
+	}
+	e, err := New(g, cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(e.Close)
+
+	for _, tt := range []struct {
+		name    string
+		alias   string
+		pattern string
+	}{
+		{name: "an alias and a pattern the executor would otherwise accept", alias: pgAlias, pattern: "archive"},
+		{name: "the gate answers before the argument refusals", alias: "my", pattern: "a"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := e.SearchSchema(context.Background(), tt.alias, tt.pattern)
+			var dbErr *Error
+			if !errors.As(err, &dbErr) {
+				t.Fatalf("SearchSchema() = %v, want a *db.Error", err)
+			}
+			if dbErr.Kind == KindUnavailable {
+				t.Fatalf("the statement reached a connection with no rule allowing it: %s", dbErr.Detail)
+			}
+			if dbErr.Kind != KindRefused {
+				t.Fatalf("Kind = %q, want the gate to have refused; detail: %s", dbErr.Kind, dbErr.Detail)
+			}
+			if dbErr.Op != "search-schema" {
+				t.Errorf("Op = %q, so an operator's log names the wrong call", dbErr.Op)
+			}
+			if dbErr.Decision == nil {
+				t.Fatal("the gate's decision is not carried on the error")
+			}
+			if dbErr.Detail != "" {
+				t.Errorf("a refusal carries a driver detail, so something spoke to a driver: %s", dbErr.Detail)
+			}
+		})
 	}
 }
 
