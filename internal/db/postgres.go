@@ -200,6 +200,11 @@ func postgresURL(spec AliasSpec) string {
 // somebody configures one.
 const postgresDatabases = "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname"
 
+// postgresSchemaSearch is the fixed, current-database catalog query for
+// [Executor.SearchSchema]. Its CTE lets the positional parameter be bound once
+// even though both table and column names are compared to it.
+const postgresSchemaSearch = "WITH pattern AS (SELECT $1 AS value) SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable = 'YES' AS is_nullable, c.table_name ILIKE pattern.value ESCAPE '!' AS table_name_matched, c.column_name ILIKE pattern.value ESCAPE '!' AS column_name_matched FROM information_schema.columns AS c JOIN information_schema.tables AS t ON t.table_schema = c.table_schema AND t.table_name = c.table_name JOIN pattern ON true WHERE t.table_type = 'BASE TABLE' AND c.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND c.table_schema NOT LIKE 'pg_temp_%' AND c.table_schema NOT LIKE 'pg_toast_temp_%' AND (c.table_name ILIKE pattern.value ESCAPE '!' OR c.column_name ILIKE pattern.value ESCAPE '!') ORDER BY c.table_schema, c.table_name, c.column_name"
+
 // postgresSystemDatabases are the databases a cluster creates for itself.
 //
 // The two templates are named as well as being excluded by datistemplate above,
@@ -215,14 +220,14 @@ func (c *pgConn) spec() AliasSpec { return c.alias }
 
 func (c *pgConn) close() { c.pool.Close() }
 
-func (c *pgConn) query(ctx context.Context, statement string, rowCap int) (*rowSet, error) {
+func (c *pgConn) query(ctx context.Context, statement string, rowCap int, args ...any) (*rowSet, error) {
 	var out *rowSet
 	err := c.withTx(ctx, txReadOnly, func(ctx context.Context, tx pgx.Tx) error {
 		// statement is passed through untouched. It is the exact bytes the gate
 		// approved, and any edit — a LIMIT, a comment, a wrapping subquery —
 		// would make the validated text and the executed text two different
 		// things.
-		rows, err := tx.Query(ctx, statement)
+		rows, err := tx.Query(ctx, statement, args...)
 		if err != nil {
 			return err
 		}

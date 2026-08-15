@@ -175,6 +175,13 @@ func sqlServerDSN(spec AliasSpec, s Settings) string {
 // it asks for something in it.
 const sqlServerDatabases = "SELECT name FROM sys.databases ORDER BY name"
 
+// sqlServerSchemaSearch is the fixed, current-database catalog query for
+// [Executor.SearchSchema]. sys.tables, sys.columns and sys.types have no
+// database-qualified name here, so the query cannot reach a second database on
+// the same login. @p1 is reusable in T-SQL; the CTE still keeps the pattern
+// transformation and both match reasons visibly in one place.
+const sqlServerSchemaSearch = "WITH pattern AS (SELECT LOWER(@p1) AS value) SELECT s.name, t.name, c.name, ty.name, c.is_nullable, LOWER(t.name) LIKE pattern.value ESCAPE '!' AS table_name_matched, LOWER(c.name) LIKE pattern.value ESCAPE '!' AS column_name_matched FROM sys.tables AS t JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.columns AS c ON c.object_id = t.object_id JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id JOIN pattern ON 1 = 1 WHERE LOWER(t.name) LIKE pattern.value ESCAPE '!' OR LOWER(c.name) LIKE pattern.value ESCAPE '!' ORDER BY s.name, t.name, c.name"
+
 // sqlServerSystemDatabases are the four databases every instance has and nobody
 // asks an agent to explore.
 var sqlServerSystemDatabases = []string{"master", "model", "msdb", "tempdb"}
@@ -183,13 +190,13 @@ func (c *msConn) spec() AliasSpec { return c.alias }
 
 func (c *msConn) close() { _ = c.pool.Close() }
 
-func (c *msConn) query(ctx context.Context, statement string, rowCap int) (*rowSet, error) {
+func (c *msConn) query(ctx context.Context, statement string, rowCap int, args ...any) (*rowSet, error) {
 	var out *rowSet
 	err := c.withTx(ctx, txReadOnly, func(tx *sql.Tx) error {
 		// Byte-identical to what the gate approved. On this engine that is not a
 		// stylistic commitment: appending anything to the text — even a semicolon —
 		// would be appending to a batch that executes whatever follows.
-		rows, err := tx.QueryContext(ctx, statement)
+		rows, err := tx.QueryContext(ctx, statement, args...)
 		if err != nil {
 			return err
 		}

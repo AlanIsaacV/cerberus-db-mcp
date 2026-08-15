@@ -203,6 +203,20 @@
       "source": "PostgreSQL manual, Lexical Structure: https://www.postgresql.org/docs/current/sql-syntax-lexical.html"
     },
     {
+      "statement": "SELECT t.table_name, c.column_name FROM information_schema.tables AS t JOIN information_schema.columns AS c ON c.table_schema = t.table_schema AND c.table_name = t.table_name WHERE LOWER(t.table_name) LIKE ?",
+      "engine": "mysql",
+      "verdict": "allow",
+      "reason": "read-select over information_schema: the ? placeholder remains in the constant catalog search while its name pattern is bound separately",
+      "source": "hand-written catalog search"
+    },
+    {
+      "statement": "SELECT s.name AS schema_name, t.name AS table_name, c.name AS column_name FROM sys.tables AS t JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.columns AS c ON c.object_id = t.object_id WHERE LOWER(t.name) LIKE @p1",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "read-select over sys.tables and sys.columns: the @p1 placeholder remains in the constant catalog search while its name pattern is bound separately",
+      "source": "hand-written catalog search"
+    },
+    {
       "statement": "SELECT $1$ ; DROP TABLE t $1$",
       "engine": "postgresql",
       "verdict": "deny",

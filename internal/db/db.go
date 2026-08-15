@@ -46,7 +46,7 @@ type conn interface {
 	spec() AliasSpec
 	// query runs an already-gated statement inside a read-only,
 	// unconditionally-rolled-back transaction and returns at most rowCap rows.
-	query(ctx context.Context, statement string, rowCap int) (*rowSet, error)
+	query(ctx context.Context, statement string, rowCap int, args ...any) (*rowSet, error)
 	close()
 }
 
@@ -288,6 +288,66 @@ func (e *Executor) ListDatabases(ctx context.Context, alias string) (*DatabaseLi
 		Engine:    spec.Engine,
 		Decision:  decision,
 		Databases: d.names(rows.rows),
+		Truncated: rows.truncated,
+		RowCap:    e.settings.RowCap,
+		Elapsed:   time.Since(started),
+	}, nil
+}
+
+// SearchSchema finds tables and columns in the one database the selected alias
+// is bound to. Like [Executor.ListDatabases], it validates its fixed statement
+// before borrowing a connection and applies the ordinary deadline and row cap.
+//
+// pattern is deliberately a plain substring, rather than a caller-controlled
+// LIKE expression. It is trimmed and must contain at least two characters; the
+// bound pattern is then constructed in schemaPattern, which escapes LIKE's
+// metacharacters before adding the two wildcards this package owns.
+func (e *Executor) SearchSchema(ctx context.Context, alias, pattern string) (*SchemaSearch, error) {
+	c, ok := e.conns[alias]
+	if !ok {
+		return nil, &Error{Op: "search-schema", Alias: alias, Kind: KindUnknownAlias}
+	}
+	spec := c.spec()
+
+	s, ok := schemaSearchFor(spec.Engine)
+	if !ok {
+		return nil, &Error{Op: "search-schema", Alias: alias, Engine: spec.Engine, Kind: KindInternal,
+			Detail: "no schema search statement is defined for this engine"}
+	}
+
+	decision := e.gate.Validate(spec.Engine, s.statement, nil)
+	if decision.Verdict != gate.Allow {
+		return nil, refusalError("search-schema", spec, decision)
+	}
+	// Validate the fixed statement before this configuration refusal so every
+	// search statement follows the mandatory gate path; both checks precede a
+	// connection borrow.
+	if spec.Database == "" {
+		return nil, &Error{Op: "search-schema", Alias: alias, Engine: spec.Engine, Kind: KindInvalidArgument,
+			Detail: "search_schema requires the alias to be bound to one configured database"}
+	}
+
+	boundPattern, ok := schemaPattern(pattern)
+	if !ok {
+		// This is an input refusal, not a driver failure. Detail is only
+		// available to the operator.
+		return nil, &Error{Op: "search-schema", Alias: alias, Engine: spec.Engine, Kind: KindInvalidArgument,
+			Detail: "pattern must contain at least two non-space characters"}
+	}
+
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, e.settings.statementDeadline(spec.Engine))
+	defer cancel()
+
+	rows, err := c.query(ctx, s.statement, e.settings.RowCap, boundPattern)
+	if err != nil {
+		return nil, executionError(ctx, "search-schema", spec, err)
+	}
+	return &SchemaSearch{
+		Alias:     alias,
+		Engine:    spec.Engine,
+		Decision:  decision,
+		Tables:    schemaTables(rows.rows),
 		Truncated: rows.truncated,
 		RowCap:    e.settings.RowCap,
 		Elapsed:   time.Since(started),

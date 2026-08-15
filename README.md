@@ -6,6 +6,10 @@ deployment's allowlist before it can reach a tool; the statement gate executes
 no statement it cannot establish is a read, and each query is audited with the
 calling identity.
 
+SQL Server has no reproducible grading for the schema-search surface: there is
+no arm64 SQL Server image, so there is no CI container or fixture. Its fixed
+statement is gate-validated and exercised only by hand against the real instance.
+
 ## Configuration
 
 Copy the root `.env.example` to an untracked `.env` and fill in the required

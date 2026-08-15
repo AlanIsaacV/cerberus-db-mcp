@@ -226,12 +226,11 @@ func (h *harness) auditEvents(t *testing.T) []map[string]any {
 	return out
 }
 
-// TestToolsListIsExactlyTheThreeToolsWithDerivedSchemas is acceptance criterion 1.
-//
-// The schemas are asserted whole rather than by spot-checking a property, so
-// that a field added to an input type — the shape a limit or a timeout argument
-// would take — fails here instead of quietly becoming part of the contract.
-func TestToolsListIsExactlyTheThreeToolsWithDerivedSchemas(t *testing.T) {
+// TestToolsListIsExactlyTheFourToolsWithDerivedSchemas is the explicit tool
+// contract. The schemas are asserted whole rather than by spot-checking a
+// property, so a new input — especially a limit or object-type argument — fails
+// rather than quietly becoming part of the surface.
+func TestToolsListIsExactlyTheFourToolsWithDerivedSchemas(t *testing.T) {
 	h := connect(t, unreachableExecutor(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -245,7 +244,7 @@ func TestToolsListIsExactlyTheThreeToolsWithDerivedSchemas(t *testing.T) {
 	for _, tool := range list.Tools {
 		got[tool.Name] = tool
 	}
-	wantTools := []string{ToolListConnections, ToolExecuteQuery, ToolListDatabases}
+	wantTools := []string{ToolListConnections, ToolExecuteQuery, ToolListDatabases, ToolSearchSchema}
 	missing := false
 	for _, name := range wantTools {
 		if got[name] == nil {
@@ -260,10 +259,10 @@ func TestToolsListIsExactlyTheThreeToolsWithDerivedSchemas(t *testing.T) {
 		t.Fatalf("tools/list = %v, want exactly %v", names, wantTools)
 	}
 
-	// These are the schemas the SDK derived by reflection from ListConnectionsInput,
-	// ExecuteQueryInput and ListDatabasesInput. Written out rather than recomputed
-	// from the same types, because a test that derives its expectation the same way
-	// the code does cannot notice the code changing.
+	// These are the schemas the SDK derived by reflection from the four input types.
+	// Written out rather than recomputed from the same types, because a test that
+	// derives its expectation the same way the code does cannot notice the code
+	// changing.
 	for name, wantJSON := range map[string]string{
 		ToolListConnections: `{"additionalProperties":false,"type":"object"}`,
 		ToolExecuteQuery: `{"additionalProperties":false,"type":"object",` +
@@ -278,6 +277,13 @@ func TestToolsListIsExactlyTheThreeToolsWithDerivedSchemas(t *testing.T) {
 			`"properties":{` +
 			`"alias":{"type":"string","description":"which configured connection to ask, named exactly as list_connections gives it; this is an alias and not a database name"}},` +
 			`"required":["alias"]}`,
+		// Exactly two properties: per-call limits and object types would change the
+		// row-bound or surface this tool deliberately fixes in server code.
+		ToolSearchSchema: `{"additionalProperties":false,"type":"object",` +
+			`"properties":{` +
+			`"alias":{"type":"string","description":"which configured connection to search, named exactly as list_connections gives it; this is an alias and not a database name"},` +
+			`"pattern":{"type":"string","description":"a plain case-insensitive substring of a table or column name; do not use LIKE wildcard syntax because % and _ are literal characters"}},` +
+			`"required":["alias","pattern"]}`,
 	} {
 		var want any
 		if err := json.Unmarshal([]byte(wantJSON), &want); err != nil {

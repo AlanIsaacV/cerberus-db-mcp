@@ -9,8 +9,8 @@
 //
 // SQL Server is absent for the reason it is absent there: no arm64 image exists,
 // and this repository has already accepted that gap. Its path through this layer
-// is engine-neutral — the same Executor.Execute and the same db.Result — so what
-// is untested is the driver below, not the code above.
+// is engine-neutral — the same Executor.SearchSchema and the same
+// db.SchemaSearch — so what is untested is the driver below, not the code above.
 package mcp
 
 import (
@@ -30,6 +30,7 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 )
@@ -635,6 +636,187 @@ func TestListDatabasesReachesTheAgentFromRealEngines(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSearchSchemaReachesTheAgentFromTheWideFixture covers the schema-search
+// surface end to end: the real SDK client receives the already-grouped result of
+// internal/db's fixed, bound catalog statement. The MySQL connection is rebuilt
+// for ledger because CI intentionally configures only testbed, while ledger is
+// where that engine's deliberately wide archive table lives.
+func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
+	wantIdentity := testIdentity()
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			h := wideSchemaSearchHarness(t, engine, wantIdentity)
+
+			res := h.call(t, ToolSearchSchema, map[string]any{"alias": h.alias, "pattern": "measure"})
+			if res.IsError {
+				t.Fatalf("search_schema failed: %s", resultText(t, res))
+			}
+			out, ok := structured(t, res).(map[string]any)
+			if !ok {
+				t.Fatalf("search_schema returned no structured content: %+v", res)
+			}
+			assertSearchSchemaDoesNotLeakConnection(t, h, jsonOf(t, out))
+			assertSearchSchemaDoesNotLeakConnection(t, h, resultText(t, res))
+			for _, forbidden := range []string{"alias", "database", "host", "port", "user", "password"} {
+				if _, found := out[forbidden]; found {
+					t.Errorf("search_schema result has a %q field: %s", forbidden, jsonOf(t, out))
+				}
+			}
+
+			tables, ok := out["tables"].([]any)
+			if !ok || len(tables) != 1 {
+				t.Fatalf("tables = %s, want exactly the wide archive table", jsonOf(t, out["tables"]))
+			}
+			table, ok := tables[0].(map[string]any)
+			if !ok {
+				t.Fatalf("tables[0] = %s, want an object", jsonOf(t, tables[0]))
+			}
+			wantSchema := "harbor"
+			if engine == gate.MySQL {
+				wantSchema = "ledger"
+			}
+			if table["schema"] != wantSchema || table["table"] != "archive" {
+				t.Errorf("table = %s, want %s.archive", jsonOf(t, table), wantSchema)
+			}
+
+			columns, ok := table["columns"].([]any)
+			if !ok || len(columns) == 0 {
+				t.Fatalf("archive columns = %s, want matching measure columns", jsonOf(t, table["columns"]))
+			}
+			hasNullable, hasRequired := false, false
+			for i, raw := range columns {
+				column, ok := raw.(map[string]any)
+				if !ok {
+					t.Fatalf("columns[%d] = %s, want an object", i, jsonOf(t, raw))
+				}
+				name, nameOK := column["name"].(string)
+				dataType, typeOK := column["data_type"].(string)
+				nullable, nullableOK := column["nullable"].(bool)
+				if !nameOK || !strings.HasPrefix(name, "measure_") || !typeOK || dataType == "" || !nullableOK {
+					t.Errorf("columns[%d] = %s, want a measure name, a type and a nullability boolean", i, jsonOf(t, column))
+				}
+				hasNullable = hasNullable || nullable
+				hasRequired = hasRequired || !nullable
+			}
+			if !hasNullable || !hasRequired {
+				t.Errorf("measure columns do not show both nullable and required metadata: %s", jsonOf(t, columns))
+			}
+			if got, want := out["row_cap"], float64(h.settings.RowCap); got != want {
+				t.Errorf("row_cap = %v, want %v", got, want)
+			}
+
+			// A table-name match deliberately does not turn every one of that table's
+			// columns into a match. The empty array must survive the MCP mapping so an
+			// agent does not infer that those columns matched its substring.
+			byTableName := h.call(t, ToolSearchSchema, map[string]any{"alias": h.alias, "pattern": "archive"})
+			if byTableName.IsError {
+				t.Fatalf("search_schema by table name failed: %s", resultText(t, byTableName))
+			}
+			nameOut, ok := structured(t, byTableName).(map[string]any)
+			if !ok {
+				t.Fatalf("table-name search returned no structured content: %+v", byTableName)
+			}
+			nameTables, ok := nameOut["tables"].([]any)
+			if !ok || len(nameTables) == 0 {
+				t.Fatalf("table-name search tables = %s, want archive", jsonOf(t, nameOut["tables"]))
+			}
+			for i, raw := range nameTables {
+				nameTable, ok := raw.(map[string]any)
+				if !ok || nameTable["table"] != "archive" {
+					t.Fatalf("table-name search tables[%d] = %s, want archive", i, jsonOf(t, raw))
+				}
+				columns, ok := nameTable["columns"].([]any)
+				if !ok || len(columns) != 0 {
+					t.Errorf("name-matched archive columns = %s, want an empty array", jsonOf(t, nameTable["columns"]))
+				}
+			}
+
+			// The allowed and invalid-argument calls follow different executor exits.
+			// The latter still reached the gate before pattern validation, so both records
+			// must carry its allow verdict and this caller's identity.
+			invalidArgument := h.call(t, ToolSearchSchema, map[string]any{"alias": h.alias, "pattern": "m"})
+			if !invalidArgument.IsError {
+				t.Fatal("a one-character schema pattern succeeded")
+			}
+			if got, want := resultText(t, invalidArgument), (&db.Error{Kind: db.KindInvalidArgument}).Agent(); got != want {
+				t.Errorf("the client was told %q, want the invalid-argument message %q", got, want)
+			}
+			events := h.auditEventsFor(t, ToolSearchSchema)
+			if len(events) != 3 {
+				t.Fatalf("got %d audit events for three calls:\n%s", len(events), h.audit.String())
+			}
+			for i, want := range []struct {
+				outcome   Outcome
+				errorKind db.Kind
+			}{
+				{OutcomeAllowed, ""},
+				{OutcomeAllowed, ""},
+				{OutcomeFailed, db.KindInvalidArgument},
+			} {
+				event := events[i]
+				for field, wantValue := range map[string]any{
+					"tool":       ToolSearchSchema,
+					"identity":   wantIdentity.Email,
+					"subject":    wantIdentity.Subject,
+					"alias":      h.alias,
+					"engine":     string(engine),
+					"outcome":    string(want.outcome),
+					"verdict":    string(gate.Allow),
+					"error_kind": string(want.errorKind),
+					// internal/db owns the catalog statement and never returns it here.
+					"statement": "",
+				} {
+					if got := event[field]; got != wantValue {
+						t.Errorf("event %d: %s = %#v, want %#v", i, field, got, wantValue)
+					}
+				}
+			}
+		})
+	}
+}
+
+// assertSearchSchemaDoesNotLeakConnection checks the values an MCP result has no
+// reason to contain. PostgreSQL's configured database is distinct from returned
+// schemas, so it is checked too. MySQL's schema is its database by definition
+// and is a required result field, so treating that one expected schema value as a
+// credential leak would make the required grouped result impossible; the absence
+// of a database or alias field above is the boundary in that dialect.
+func assertSearchSchemaDoesNotLeakConnection(t *testing.T, h engineHarness, text string) {
+	t.Helper()
+	values := map[string]string{
+		"the host":     h.spec.Host,
+		"the port":     strconv.Itoa(h.spec.Port),
+		"the username": h.spec.User,
+		"the password": string(h.spec.Password),
+	}
+	if h.spec.Engine != gate.MySQL {
+		values["the database name"] = h.spec.Database
+	}
+	for label, value := range values {
+		if value != "" && strings.Contains(text, value) {
+			t.Errorf("the client-visible schema-search result contains %s (%q): %q", label, value, text)
+		}
+	}
+}
+
+func wideSchemaSearchHarness(t *testing.T, engine gate.Engine, identity auth.Identity) engineHarness {
+	t.Helper()
+	cfg, spec := liveConfig(t, engine)
+	if engine == gate.MySQL {
+		// CI binds mytest.testbed only, to keep ordinary calls unable to cross into
+		// ledger. This separate connection is solely the wide-fixture test subject.
+		spec.Alias = "schema-search-ledger"
+		spec.Database = "ledger"
+	}
+	executor := executorFor(t, &db.Config{Settings: cfg.Settings, Aliases: []db.AliasSpec{spec}}, engine, spec.Alias)
+	return engineHarness{
+		harness:  connect(t, executor, admittingEveryRequestAs(identity)),
+		spec:     spec,
+		alias:    spec.Alias,
+		settings: cfg.Settings,
 	}
 }
 

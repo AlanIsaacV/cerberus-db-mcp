@@ -153,6 +153,12 @@ func mysqlConfig(spec AliasSpec, s Settings, bound serverBound) *mysqldriver.Con
 // the wire.
 const mysqlDatabases = "SHOW DATABASES"
 
+// mysqlSchemaSearch is the fixed catalog query for [Executor.SearchSchema].
+// DATABASE() ties information_schema to the database selected by this alias's
+// connection, so a login that can see other schemas cannot search across them.
+// The CTE binds MySQL's positional ? once and reuses it for both match reasons.
+const mysqlSchemaSearch = "WITH pattern AS (SELECT LOWER(?) AS value) SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable = 'YES' AS is_nullable, LOWER(c.table_name) LIKE pattern.value ESCAPE '!' AS table_name_matched, LOWER(c.column_name) LIKE pattern.value ESCAPE '!' AS column_name_matched FROM information_schema.columns AS c JOIN information_schema.tables AS t ON t.table_schema = c.table_schema AND t.table_name = c.table_name JOIN pattern ON 1 = 1 WHERE c.table_schema = DATABASE() AND t.table_type = 'BASE TABLE' AND (LOWER(c.table_name) LIKE pattern.value ESCAPE '!' OR LOWER(c.column_name) LIKE pattern.value ESCAPE '!') ORDER BY c.table_schema, c.table_name, c.column_name"
+
 // mysqlSystemDatabases are the schemas MySQL keeps for itself. They are excluded
 // because an agent asked to understand somebody's data model has no use for the
 // server's own bookkeeping, and four names of noise in a list is four names of
@@ -163,11 +169,11 @@ func (c *myConn) spec() AliasSpec { return c.alias }
 
 func (c *myConn) close() { _ = c.pool.Close() }
 
-func (c *myConn) query(ctx context.Context, statement string, rowCap int) (*rowSet, error) {
+func (c *myConn) query(ctx context.Context, statement string, rowCap int, args ...any) (*rowSet, error) {
 	var out *rowSet
 	err := c.withTx(ctx, txReadOnly, func(tx *sql.Tx) error {
 		// Byte-identical to what the gate approved.
-		rows, err := tx.QueryContext(ctx, statement)
+		rows, err := tx.QueryContext(ctx, statement, args...)
 		if err != nil {
 			return err
 		}

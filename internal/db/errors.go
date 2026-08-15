@@ -41,6 +41,10 @@ const (
 	// KindNeedsApproval is the gate's escalation. The agent is told which rule
 	// IDs a human would have to grant.
 	KindNeedsApproval Kind = "needs-approval"
+	// KindInvalidArgument means this package refused the call's arguments or
+	// required alias configuration after the gate allowed its statement. Unlike
+	// KindRefused, it says nothing about whether the statement is a read.
+	KindInvalidArgument Kind = "invalid-argument"
 	// KindUnknownAlias means no connection is configured under that name.
 	KindUnknownAlias Kind = "unknown-alias"
 	// KindUnavailable covers everything that stopped us reaching a working
@@ -84,6 +88,7 @@ const (
 var (
 	ErrRefused              = errors.New("the statement is not provably a read")
 	ErrNeedsApproval        = errors.New("the statement needs human approval")
+	ErrInvalidArgument      = errors.New("the call has an invalid argument or missing required configuration")
 	ErrUnknownAlias         = errors.New("no database is configured under that alias")
 	ErrUnavailable          = errors.New("the database could not be reached")
 	ErrTimeout              = errors.New("the statement exceeded its time bound")
@@ -99,6 +104,7 @@ var (
 var kindSentinels = map[Kind]error{
 	KindRefused:             ErrRefused,
 	KindNeedsApproval:       ErrNeedsApproval,
+	KindInvalidArgument:     ErrInvalidArgument,
 	KindUnknownAlias:        ErrUnknownAlias,
 	KindUnavailable:         ErrUnavailable,
 	KindTimeout:             ErrTimeout,
@@ -118,6 +124,7 @@ var kindSentinels = map[Kind]error{
 var agentMessages = map[Kind]string{
 	KindRefused:          "the statement was refused because it is not provably a read",
 	KindNeedsApproval:    "the statement cannot be run until a human grants the listed rules",
+	KindInvalidArgument:  "the call has an invalid argument or missing required alias configuration; change the argument or ask an operator to update the configuration",
 	KindUnknownAlias:     "no database is configured under that alias",
 	KindUnavailable:      "the database is not reachable right now",
 	KindTimeout:          "the statement was stopped for exceeding its time limit; read less at once",
@@ -131,6 +138,8 @@ var agentMessages = map[Kind]string{
 	KindCancelled:           "the call was cancelled before it finished",
 	KindInternal:            "the database call failed",
 }
+
+type agentMessage string
 
 // Error is the only failure this package hands to a caller, and it is two-sided
 // on purpose.
@@ -164,6 +173,10 @@ type Error struct {
 	// Detail is the operator-facing text: whatever the engine or the driver
 	// actually said, with the password removed. It is never shown to the agent.
 	Detail string
+	// agentMessage is a package-owned, allowlisted explanation for a local
+	// preflight refusal. It is distinct from Detail so configuration is never
+	// disclosed through [Error.Agent].
+	agentMessage agentMessage
 
 	// cause is the driver's own error, kept so that this package's tests can
 	// assert on an engine's SQLSTATE or error number rather than on its message
@@ -205,12 +218,16 @@ func (e *Error) Unwrap() error {
 }
 
 // Agent is the agent-facing rendering: a sentence chosen from [agentMessages] by
-// [Error.Kind], plus the gate's own reason when the gate is what refused.
+// [Error.Kind], or a package-owned preflight explanation, plus the gate's own
+// reason when the gate is what refused.
 //
 // It never consults [Error.Detail]. That is the whole mechanism, and it is why
 // there is no list of patterns to keep up to date: a host name cannot appear in
 // this string because no code path puts one there.
 func (e *Error) Agent() string {
+	if e.agentMessage != "" {
+		return string(e.agentMessage)
+	}
 	msg, ok := agentMessages[e.Kind]
 	if !ok {
 		msg = agentMessages[KindInternal]

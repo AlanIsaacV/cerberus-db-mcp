@@ -12,15 +12,15 @@ import (
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 )
 
-// The tool names. There are three, and the list is closed for this objective:
-// schema introspection below the database level is a later one, and there is
-// deliberately no dry-run validator and nothing that reads or edits the gate's
-// ruleset — a tool that could relax the rules is a tool an agent could use to
-// relax them.
+// The tool names. There are four: search_schema is the deliberately narrow
+// schema-introspection step below the database level. There is still no dry-run
+// validator and nothing that reads or edits the gate's ruleset — a tool that
+// could relax the rules is a tool an agent could use to relax them.
 const (
 	ToolListConnections = "list_connections"
 	ToolExecuteQuery    = "execute_query"
 	ToolListDatabases   = "list_databases"
+	ToolSearchSchema    = "search_schema"
 )
 
 // ListConnectionsInput is empty: listing takes no arguments. It exists as a type
@@ -105,6 +105,44 @@ type ListDatabasesResult struct {
 	RowCap    int      `json:"row_cap" jsonschema:"the row cap that applied to this result"`
 }
 
+// SearchSchemaInput is search_schema's whole argument list. pattern is a plain
+// substring, not a LIKE expression: internal/db owns the wildcards and escapes
+// LIKE metacharacters before it binds the value to its fixed catalog statement.
+//
+// There is no limit or object-type argument. The row cap is server configuration
+// reported by list_connections, and a tool argument must not move a safety bound.
+type SearchSchemaInput struct {
+	Alias   string `json:"alias" jsonschema:"which configured connection to search, named exactly as list_connections gives it; this is an alias and not a database name"`
+	Pattern string `json:"pattern" jsonschema:"a plain case-insensitive substring of a table or column name; do not use LIKE wildcard syntax because % and _ are literal characters"`
+}
+
+// SchemaSearchColumn is the wire form of one matching column. It deliberately
+// carries only metadata needed to recognise a column; connection configuration
+// remains on the server side of this boundary.
+type SchemaSearchColumn struct {
+	Name     string `json:"name" jsonschema:"the matching column's name"`
+	DataType string `json:"data_type" jsonschema:"the database's reported type for this column"`
+	Nullable bool   `json:"nullable" jsonschema:"whether this column accepts NULL values"`
+}
+
+// SchemaSearchTable is one matching table. A table matched only by its own name
+// has an empty Columns list, because no column name matched the substring.
+type SchemaSearchTable struct {
+	Schema  string               `json:"schema" jsonschema:"the table's schema or namespace within the configured database"`
+	Table   string               `json:"table" jsonschema:"the matching table's name"`
+	Columns []SchemaSearchColumn `json:"columns" jsonschema:"the columns whose names match the substring; empty when only the table name matched"`
+}
+
+// SearchSchemaResult is the grouped catalog answer. Truncated needs particular
+// care: the row cap applies to flat catalog rows before internal/db groups them,
+// so a true value can mean a returned table has only part of its matching columns
+// and must not be treated as a complete table description.
+type SearchSchemaResult struct {
+	Tables    []SchemaSearchTable `json:"tables" jsonschema:"one entry per matching table, each with its matching columns"`
+	Truncated bool                `json:"truncated" jsonschema:"true when the row cap stopped flat catalog rows before grouping; a returned table can then have only part of its matching column list and is incomplete"`
+	RowCap    int                 `json:"row_cap" jsonschema:"the row cap that applied to the flat catalog rows before grouping"`
+}
+
 // internalFailure is what the agent is told when this layer produced an error
 // that is not a *db.Error.
 //
@@ -128,7 +166,7 @@ type agentError struct{ message string }
 
 func (e *agentError) Error() string { return e.message }
 
-// registerTools installs the three tools on an SDK server.
+// registerTools installs the four tools on an SDK server.
 //
 // They go through the generic AddTool rather than (*Server).AddTool, and that is
 // load-bearing rather than stylistic. The generic path turns an error returned
@@ -174,6 +212,14 @@ func (s *Server) registerTools(srv *sdk.Server) {
 			"The list is capped like any other result and says so when the cap cut it off.",
 		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true},
 	}, s.listDatabases)
+
+	sdk.AddTool(srv, &sdk.Tool{
+		Name: ToolSearchSchema,
+		Description: "Find tables and columns in the one database an alias is bound to, by a plain case-insensitive substring; aliases not bound to one database are refused. " +
+			"Pass an alias from list_connections and ordinary text such as archive or measure; do not write LIKE wildcards, because % and _ are searched literally. " +
+			"Results are grouped by table and capped under the same server-configured row limit reported by list_connections. If truncated is true, the cap applied before grouping, so a returned table can have only part of its matching columns and is incomplete.",
+		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true},
+	}, s.searchSchema)
 }
 
 // caller resolves the two identity fields of an audit event from the context the
@@ -333,6 +379,61 @@ func (s *Server) listDatabases(ctx context.Context, _ *sdk.CallToolRequest, in L
 	}, nil
 }
 
+func (s *Server) searchSchema(ctx context.Context, _ *sdk.CallToolRequest, in SearchSchemaInput) (*sdk.CallToolResult, *SearchSchemaResult, error) {
+	started := time.Now()
+
+	// As with list_databases, the fixed per-engine statement, gate validation,
+	// bound pattern and read-only transaction all belong to internal/db. This
+	// layer maps its already-grouped answer without holding SQL or regrouping it.
+	search, err := s.executor.SearchSchema(ctx, in.Alias, in.Pattern)
+	elapsed := time.Since(started)
+	if err != nil {
+		return nil, nil, s.refuseOrFail(ctx, attempt{tool: ToolSearchSchema, alias: in.Alias}, elapsed, err)
+	}
+
+	email, subject := s.caller(ctx, ToolSearchSchema)
+	s.audit.Record(AuditEvent{
+		Tool:      ToolSearchSchema,
+		Identity:  email,
+		Subject:   subject,
+		Alias:     search.Alias,
+		Engine:    search.Engine,
+		Outcome:   OutcomeAllowed,
+		Verdict:   search.Decision.Verdict,
+		Reason:    search.Decision.Reason,
+		RuleID:    search.Decision.RuleID,
+		Rows:      len(search.Tables),
+		Truncated: search.Truncated,
+		Elapsed:   elapsed,
+	})
+
+	tables := make([]SchemaSearchTable, len(search.Tables))
+	for i, table := range search.Tables {
+		columns := make([]SchemaSearchColumn, len(table.Columns))
+		for j, column := range table.Columns {
+			// Keep the MCP value boundary uniform even though this fixed API presently
+			// supplies primitive metadata. A future driver representation must pass
+			// through the same conversion as every execute_query value.
+			columns[j] = SchemaSearchColumn{
+				Name:     jsonValue(column.Name).(string),
+				DataType: jsonValue(column.DataType).(string),
+				Nullable: jsonValue(column.Nullable).(bool),
+			}
+		}
+		tables[i] = SchemaSearchTable{
+			Schema:  jsonValue(table.Schema).(string),
+			Table:   jsonValue(table.Table).(string),
+			Columns: columns,
+		}
+	}
+
+	return nil, &SearchSchemaResult{
+		Tables:    tables,
+		Truncated: search.Truncated,
+		RowCap:    search.RowCap,
+	}, nil
+}
+
 // attempt is what [Server.refuseOrFail] has to know about the call that failed.
 //
 // It exists so that the two tools which can fail share one reduction from a
@@ -343,10 +444,11 @@ func (s *Server) listDatabases(ctx context.Context, _ *sdk.CallToolRequest, in L
 type attempt struct {
 	tool  string
 	alias string
-	// statement is the agent's own SQL, and it is empty for list_databases: that
-	// tool's statement is internal/db's per-engine constant, which this package does
-	// not hold and must not hold a second spelling of just to fill a field. The tool
-	// name says exactly which statement ran.
+	// statement is the agent's own SQL, and it is empty for list_databases and
+	// search_schema: those tools' statements are internal/db's per-engine
+	// constants, which this package does not hold and must not hold second
+	// spellings of just to fill a field. The tool name says exactly which statement
+	// ran.
 	statement string
 }
 

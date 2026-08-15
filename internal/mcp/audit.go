@@ -69,8 +69,9 @@ type AuditEvent struct {
 	Alias  string
 	Engine gate.Engine
 	// Statement is empty for the tools whose statement is not the agent's:
-	// list_connections sends none, and list_databases sends internal/db's own
-	// per-engine constant, which this package deliberately does not hold a copy of.
+	// list_connections sends none, and list_databases and search_schema send
+	// internal/db's own per-engine constants, which this package deliberately does
+	// not hold copies of.
 	// The tool name is what identifies what ran on those records.
 	Statement string
 
