@@ -94,6 +94,12 @@ func TestSearchSchemaGroupsOnlyMatchingColumns(t *testing.T) {
 				if table.Columns == nil || len(table.Columns) != 0 {
 					t.Errorf("name-matched %s.%s columns = %#v, want an empty non-nil list", table.Schema, table.Table, table.Columns)
 				}
+				// The empty list is criterion 6's claim only while the entry says it is
+				// whole; the same two fields with the marker set would mean the budget cut
+				// this table's columns off, which is the ambiguity the marker removes.
+				if table.ColumnsTruncated {
+					t.Errorf("name-matched %s.%s reports a cut column list under a %d-byte budget it never approached", table.Schema, table.Table, byTableName.ByteBudget)
+				}
 			}
 			if byTableName.Truncated {
 				t.Errorf("a two-table name match reports truncation under a %d-byte budget and a row cap of %d", byTableName.ByteBudget, byTableName.RowCap)
@@ -119,16 +125,23 @@ func TestSearchSchemaGroupsOnlyMatchingColumns(t *testing.T) {
 			if !measureTruncated {
 				t.Fatal("the 250-column measure search no longer overruns the budget, so this case has stopped grading the truncation it was written for")
 			}
-			// The budget stops inside the wide table rather than at its boundary, so
-			// the entry survives with part of its column list. An empty list here would
-			// be the shape that means "matched by table name alone", and the budget must
-			// never produce it.
+			// The budget stops inside the wide table rather than at its boundary, so the
+			// entry survives with part of its column list and declares it. Dropping the
+			// entry instead would answer this search — 250 matching columns of one table —
+			// with no tables at all, and leaving it unmarked would make its columns read
+			// as the complete set.
 			assertSchemaTables(t, byMeasure.Tables, wantMeasure)
+			if last := len(byMeasure.Tables) - 1; last < 0 || !byMeasure.Tables[last].ColumnsTruncated {
+				t.Errorf("SearchSchema(measure) returned %d of 250 columns and no entry saying its column list was cut: %v",
+					schemaColumnCount(byMeasure.Tables), schemaTableIDs(byMeasure.Tables))
+			}
 			if !byMeasure.Truncated {
 				t.Errorf("SearchSchema(measure) returned %d of 250 columns without reporting truncation", schemaColumnCount(byMeasure.Tables))
 			}
 			assertSchemaOrder(t, byColumn.Tables)
 			assertSchemaOrder(t, byMeasure.Tables)
+			assertOnlyTheLastTableCanBeMarked(t, byColumn.Tables)
+			assertOnlyTheLastTableCanBeMarked(t, byMeasure.Tables)
 		})
 	}
 }
@@ -304,6 +317,7 @@ func TestSearchSchemaSharedColumnPatternCannotReturnTheCatalog(t *testing.T) {
 			}
 			assertSchemaTables(t, result.Tables, want)
 			assertSchemaOrder(t, result.Tables)
+			assertOnlyTheLastTableCanBeMarked(t, result.Tables)
 
 			// The three properties the budget is spent to keep true.
 			every := schemaFixtureTableIDs(engine, database)
@@ -311,8 +325,14 @@ func TestSearchSchemaSharedColumnPatternCannotReturnTheCatalog(t *testing.T) {
 				t.Errorf("SearchSchema(%q) returned %d of this database's %d tables: a pattern the tool accepts returns the catalog", pattern, len(result.Tables), len(every))
 			}
 			for _, table := range result.Tables {
-				if len(table.Columns) == 0 {
+				// No table name contains this pattern, so every entry here matched by a
+				// column of its own and an empty list would mean the budget dropped one.
+				// Unmarked, that entry would be indistinguishable from a name match.
+				if len(table.Columns) == 0 && !table.ColumnsTruncated {
 					t.Errorf("%s.%s came back with no columns, which is the shape that means the table name matched; the budget dropped its columns instead", table.Schema, table.Table)
+				}
+				if len(table.Columns) == 0 && table.ColumnsTruncated {
+					t.Errorf("%s.%s was opened by the budget with no room for the column that matched in it, which the charging rule is supposed to prevent for a column-only match", table.Schema, table.Table)
 				}
 			}
 			if cost := schemaBudgetCost(result.Tables); cost > SchemaResultBudget {
@@ -521,6 +541,13 @@ func schemaFixtureMatchedRows(engine gate.Engine, database, pattern string) int 
 // *and* by column would open its entry on whichever of its columns the catalog
 // returns first; no pattern these tests use does both at once, so that ordering is
 // not modelled.
+//
+// ColumnsTruncated is derived from where the cut fell rather than from the product's
+// rule for setting it: an entry that had already been emitted when the budget ran out
+// is holding part of its column list and says so, and an entry that never opened is
+// simply absent, so nothing before it is marked. An expectation built the other way
+// round — by copying whichever entry schemaTables happened to mark — would agree with
+// any implementation, including one that marked every entry or none.
 func schemaWithinBudget(want []SchemaTable) ([]SchemaTable, bool) {
 	out := make([]SchemaTable, 0, len(want))
 	spent := 0
@@ -540,6 +567,9 @@ func schemaWithinBudget(want []SchemaTable) ([]SchemaTable, bool) {
 				cost += entry
 			}
 			if spent+cost > SchemaResultBudget {
+				if i > 0 {
+					out[len(out)-1].ColumnsTruncated = true
+				}
 				return out, true
 			}
 			spent += cost
@@ -640,14 +670,19 @@ func schemaArchiveTableIDs(engine gate.Engine, database string) []string {
 
 // assertSchemaTables compares a result against a whole expected answer: the same
 // tables in the same order, each carrying the same columns with the same types and
-// nullability. It replaces the per-table lookups this file used before the byte
-// budget existed, which could only name one table at a time and had no way to say
-// where a truncated answer should stop.
+// nullability, and each saying the same thing about whether that column list is all
+// of them. It replaces the per-table lookups this file used before the byte budget
+// existed, which could only name one table at a time and had no way to say where a
+// truncated answer should stop.
 func assertSchemaTables(t *testing.T, got, want []SchemaTable) {
 	t.Helper()
 	assertSchemaTableIDs(t, got, schemaTableIDs(want))
 	for i := range want {
 		assertSchemaColumns(t, got[i].Columns, want[i].Columns)
+		if got[i].ColumnsTruncated != want[i].ColumnsTruncated {
+			t.Errorf("%s.%s columns_truncated = %v over %d columns, want %v",
+				got[i].Schema, got[i].Table, got[i].ColumnsTruncated, len(got[i].Columns), want[i].ColumnsTruncated)
+		}
 	}
 }
 
@@ -670,6 +705,21 @@ func assertSchemaColumns(t *testing.T, got, want []SchemaColumn) {
 	t.Helper()
 	if !slices.Equal(got, want) {
 		t.Fatalf("schema search columns = %#v, want %#v", got, want)
+	}
+}
+
+// assertOnlyTheLastTableCanBeMarked is the structural half of the marker's meaning,
+// independent of any budget arithmetic: the answer is a prefix of the ordered rows,
+// so the only table whose column list can have been cut is the one the cut fell in,
+// and that is always the last. A marker anywhere else would mean an entry was
+// completed after the budget had already stopped inside it.
+func assertOnlyTheLastTableCanBeMarked(t *testing.T, tables []SchemaTable) {
+	t.Helper()
+	for i := 0; i < len(tables)-1; i++ {
+		if tables[i].ColumnsTruncated {
+			t.Errorf("%s.%s reports a cut column list although %d entries follow it",
+				tables[i].Schema, tables[i].Table, len(tables)-1-i)
+		}
 	}
 }
 

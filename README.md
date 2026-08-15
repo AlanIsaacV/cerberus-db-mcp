@@ -197,6 +197,16 @@ timestamp, a tenant id — so a two-character substring can match a few hundred
 catalog rows, far below the default cap of 1000, and still group into an entry for
 every table in the database.
 
+Each table says for itself whether its own column list is complete, in
+`columns_truncated`. That field is what keeps an empty `columns` readable: where it
+is false, an empty list is the answer that the table name matched and none of its
+columns did; where it is true, the columns listed are only the ones that fit, and
+an empty list says nothing about that table at all. The budget stops at a column
+rather than at a table boundary, and the table it stopped in is kept rather than
+dropped — a search for a column name that matches 250 columns of one wide table
+would otherwise answer with no tables at all — so the marked entry is the last one
+in a truncated result, holding the part of its column list that fit.
+
 The byte budget is a constant in the code and deliberately not a `CERBERUS_DB_*`
 setting. The row cap is configurable because it trades completeness against load
 on somebody else's server, and that trade belongs to the operator who runs against

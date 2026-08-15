@@ -661,6 +661,7 @@ func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
 			assertSearchSchemaDoesNotLeakConnection(t, h, jsonOf(t, out))
 			assertSearchSchemaDoesNotLeakConnection(t, h, resultText(t, res))
 			assertTheSchemaFieldSaysItIsNotAnAlias(t, h)
+			assertColumnsTruncatedTellsTheAgentWhatItMeansAndWhatToDo(t, h)
 			for _, forbidden := range []string{"alias", "database", "host", "port", "user", "password"} {
 				if _, found := out[forbidden]; found {
 					t.Errorf("search_schema result has a %q field: %s", forbidden, jsonOf(t, out))
@@ -687,6 +688,14 @@ func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
 			if !ok || len(columns) == 0 {
 				t.Fatalf("archive columns = %s, want matching measure columns", jsonOf(t, table["columns"]))
 			}
+			// Whether this particular call was cut by the byte budget or by the row cap
+			// depends on the cap this job configures, so what is asserted here is that the
+			// marker crosses the wire as a boolean on every entry. Its true case is graded
+			// in TestSearchSchemaWireSizeStaysUnderItsBounds, which raises the cap so that
+			// the budget is the bound that bites.
+			if _, ok := table["columns_truncated"].(bool); !ok {
+				t.Errorf("table = %s, want a columns_truncated boolean saying whether that column list is all of them", jsonOf(t, table))
+			}
 			hasNullable, hasRequired := false, false
 			for i, raw := range columns {
 				column, ok := raw.(map[string]any)
@@ -711,7 +720,10 @@ func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
 
 			// A table-name match deliberately does not turn every one of that table's
 			// columns into a match. The empty array must survive the MCP mapping so an
-			// agent does not infer that those columns matched its substring.
+			// agent does not infer that those columns matched its substring — and it must
+			// arrive with columns_truncated false, because that is the only thing on the
+			// wire separating this claim from a budget that cut a column list off before
+			// its first entry.
 			byTableName := h.call(t, ToolSearchSchema, map[string]any{"alias": h.alias, "pattern": "archive"})
 			if byTableName.IsError {
 				t.Fatalf("search_schema by table name failed: %s", resultText(t, byTableName))
@@ -732,6 +744,10 @@ func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
 				columns, ok := nameTable["columns"].([]any)
 				if !ok || len(columns) != 0 {
 					t.Errorf("name-matched archive columns = %s, want an empty array", jsonOf(t, nameTable["columns"]))
+				}
+				if nameTable["columns_truncated"] != false {
+					t.Errorf("name-matched archive columns_truncated = %v, want false: two table entries cannot exhaust the byte budget, and a true here would tell the agent this empty list means nothing",
+						nameTable["columns_truncated"])
 				}
 			}
 
@@ -844,6 +860,13 @@ func TestSearchSchemaWireSizeStaysUnderItsBounds(t *testing.T) {
 					t.Errorf("search_schema(%q) reports a complete answer at row cap %d, so the byte budget did not bind and this call does not measure the worst case: %s",
 						pattern, rowCap, jsonOf(t, out))
 				}
+				if pattern == "measure" {
+					// The budget binds here, and it binds inside the one wide table: 250
+					// matching columns of a single entry, of which about half fit. The entry
+					// stays — dropping it would answer this search with nothing — so it is
+					// the entry itself that has to say its column list is a prefix.
+					assertTheCutTableSaysSo(t, out)
+				}
 				if size := wireBytes(t, res); size > worstSize {
 					worstSize, worstPattern = size, pattern
 					worstTables, worstColumns = countSearchSchemaTables(t, out)
@@ -896,6 +919,29 @@ func shippedRowCap(t *testing.T) int {
 		t.Fatalf("db.LoadConfigFrom() = %v", err)
 	}
 	return cfg.Settings.RowCap
+}
+
+// assertTheCutTableSaysSo grades the marker's true case over a result the byte
+// budget stopped: the last entry is the one the cut fell in — a truncated answer is
+// a prefix of the ordered rows, so no other entry can be the one — and it is the
+// only entry allowed to carry the marker.
+func assertTheCutTableSaysSo(t *testing.T, out map[string]any) {
+	t.Helper()
+	tables, ok := out["tables"].([]any)
+	if !ok || len(tables) == 0 {
+		t.Fatalf("tables = %s, want the entry the budget cut into", jsonOf(t, out["tables"]))
+	}
+	for i, raw := range tables {
+		table, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("tables[%d] = %s, want an object", i, jsonOf(t, raw))
+		}
+		want := i == len(tables)-1
+		if table["columns_truncated"] != want {
+			t.Errorf("tables[%d] of %d has columns_truncated = %v, want %v: only the entry the cut fell in reports a partial column list, and that is the last one",
+				i, len(tables), table["columns_truncated"], want)
+		}
+	}
 }
 
 func countSearchSchemaTables(t *testing.T, out map[string]any) (tables, columns int) {
@@ -985,6 +1031,39 @@ func withoutTableNamespaces(t *testing.T, text string) string {
 // asserted, on every engine because it is one description for all three.
 func assertTheSchemaFieldSaysItIsNotAnAlias(t *testing.T, h engineHarness) {
 	t.Helper()
+	description := searchSchemaTableFieldDescription(t, h, "schema")
+
+	// Both halves are required. "not an alias" is the refusal the agent needs; the
+	// engine's name is what makes it actionable on MySQL, where the value is the
+	// database's own name and the agent would otherwise have to guess what it is.
+	for _, want := range []string{"not an alias", string(gate.MySQL)} {
+		if !strings.Contains(description, want) {
+			t.Errorf("the advertised description of a table's schema field does not mention %q, so an agent reading a database name there is told nothing: %q", want, description)
+		}
+	}
+}
+
+// assertColumnsTruncatedTellsTheAgentWhatItMeansAndWhatToDo grades the marker where
+// the schema field is graded, and for the same reason: an agent that cannot read a
+// field's meaning off the tool's advertised schema cannot act on the value. The
+// marker is worth less than nothing unread — the shape it disambiguates looks
+// exactly like the claim criterion 6 makes — so both halves are required: that an
+// empty or short column list under it says nothing about the table, and that the
+// remedy is a narrower substring rather than paging.
+func assertColumnsTruncatedTellsTheAgentWhatItMeansAndWhatToDo(t *testing.T, h engineHarness) {
+	t.Helper()
+	description := searchSchemaTableFieldDescription(t, h, "columns_truncated")
+	for _, want := range []string{"beginning", "empty list says nothing", "substring"} {
+		if !strings.Contains(description, want) {
+			t.Errorf("the advertised description of columns_truncated does not mention %q, so an agent reading it cannot tell what the field claims or what to do about it: %q", want, description)
+		}
+	}
+}
+
+// searchSchemaTableFieldDescription reads one field of a returned table out of the
+// tool's own advertised output schema, as a client sees it over tools/list.
+func searchSchemaTableFieldDescription(t *testing.T, h engineHarness, field string) string {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	list, err := h.session.ListTools(ctx, nil)
@@ -1006,23 +1085,15 @@ func assertTheSchemaFieldSaysItIsNotAnAlias(t *testing.T, h engineHarness) {
 	if !ok {
 		t.Fatalf("%s output schema = %s, want an object", ToolSearchSchema, jsonOf(t, tool.OutputSchema))
 	}
-	for _, step := range []string{"properties", "tables", "items", "properties", "schema"} {
+	for _, step := range []string{"properties", "tables", "items", "properties", field} {
 		next, ok := node[step].(map[string]any)
 		if !ok {
-			t.Fatalf("%s output schema has no %q on the way to a table's schema field: %s", ToolSearchSchema, step, jsonOf(t, tool.OutputSchema))
+			t.Fatalf("%s output schema has no %q on the way to a table's %s field: %s", ToolSearchSchema, step, field, jsonOf(t, tool.OutputSchema))
 		}
 		node = next
 	}
 	description, _ := node["description"].(string)
-
-	// Both halves are required. "not an alias" is the refusal the agent needs; the
-	// engine's name is what makes it actionable on MySQL, where the value is the
-	// database's own name and the agent would otherwise have to guess what it is.
-	for _, want := range []string{"not an alias", string(gate.MySQL)} {
-		if !strings.Contains(description, want) {
-			t.Errorf("the advertised description of a table's schema field does not mention %q, so an agent reading a database name there is told nothing: %q", want, description)
-		}
-	}
+	return description
 }
 
 // wideSchemaSearchHarness is the whole stack over the database that holds the

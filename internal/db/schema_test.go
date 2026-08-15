@@ -268,14 +268,44 @@ func TestSchemaTablesKeepsANameMatchedTableWithoutItsOtherColumns(t *testing.T) 
 	if truncated {
 		t.Error("three rows exhausted the byte budget")
 	}
+	// Both entries are complete, so neither marks itself: the empty list on archive is
+	// the claim criterion 6 makes, and it is readable as that claim only here.
 	want := []SchemaTable{
 		{Schema: "atelier", Table: "archive", Columns: []SchemaColumn{}},
 		{Schema: "harbor", Table: "beacon", Columns: []SchemaColumn{{Name: "measure", DataType: "numeric", Nullable: true}}},
 	}
 	if !slices.EqualFunc(got, want, func(a, b SchemaTable) bool {
-		return a.Schema == b.Schema && a.Table == b.Table && slices.Equal(a.Columns, b.Columns)
+		return a.Schema == b.Schema && a.Table == b.Table && a.ColumnsTruncated == b.ColumnsTruncated && slices.Equal(a.Columns, b.Columns)
 	}) {
 		t.Errorf("schemaTables() = %#v, want %#v", got, want)
+	}
+}
+
+// TestTheByteBudgetMarksANameMatchedTableItCutTheColumnsOff is the boundary the
+// marker exists for, and the one the charging rule cannot close. A table matched by
+// its name is opened by a row whose column did not match, so its entry is added on
+// its own; when the next row is the first column that did match and it no longer
+// fits, the entry left behind is byte-for-byte the shape that means "this table
+// matched by name and none of its columns did". Only ColumnsTruncated separates the
+// two, and because a truncated answer is a prefix this lands on the last entry of
+// every answer the budget stops there.
+func TestTheByteBudgetMarksANameMatchedTableItCutTheColumnsOff(t *testing.T) {
+	rows := [][]any{
+		{"atelier", "archive", "id", "bigint", false, true, false},
+		{"atelier", "archive", "archived_at", "timestamp", true, true, true},
+	}
+	// Room for the entry the first row opens, and not for the column the second
+	// carries.
+	budget := schemaTableBytes + len("atelier") + len("archive")
+	got, truncated := schemaTables(rows, budget)
+	if !truncated {
+		t.Fatal("a matching column fitted a budget with room for the table entry alone")
+	}
+	if len(got) != 1 || len(got[0].Columns) != 0 {
+		t.Fatalf("got %#v, want the archive entry with no column in it", got)
+	}
+	if !got[0].ColumnsTruncated {
+		t.Error("the budget dropped a matching column and left an entry that claims none matched")
 	}
 }
 
@@ -342,6 +372,9 @@ func TestTheByteBudgetStopsInsideAWideTable(t *testing.T) {
 	if len(got[0].Columns) != 4 {
 		t.Errorf("got %d columns, want the 4 the budget covers", len(got[0].Columns))
 	}
+	if !got[0].ColumnsTruncated {
+		t.Error("the entry holding 4 of 256 columns does not say its column list is a prefix")
+	}
 }
 
 // TestTheByteBudgetNeverOpensATableItCannotPutAColumnIn keeps the budget from
@@ -359,6 +392,11 @@ func TestTheByteBudgetNeverOpensATableItCannotPutAColumnIn(t *testing.T) {
 	}
 	if len(got) != 1 || len(got[0].Columns) != 1 {
 		t.Fatalf("got %#v, want only beacon with its one matching column", got)
+	}
+	// The cut fell on canvas's own entry, which was never opened, so beacon is a
+	// complete statement about itself and must not be marked as anything else.
+	if got[0].ColumnsTruncated {
+		t.Error("beacon reports a cut column list although the budget stopped at the next table's entry")
 	}
 }
 
@@ -461,13 +499,14 @@ func wireBytes(t *testing.T, tables []SchemaTable) int {
 		Nullable bool   `json:"nullable"`
 	}
 	type table struct {
-		Schema  string   `json:"schema"`
-		Table   string   `json:"table"`
-		Columns []column `json:"columns"`
+		Schema           string   `json:"schema"`
+		Table            string   `json:"table"`
+		Columns          []column `json:"columns"`
+		ColumnsTruncated bool     `json:"columns_truncated"`
 	}
 	out := make([]table, 0, len(tables))
 	for _, source := range tables {
-		entry := table{Schema: source.Schema, Table: source.Table, Columns: make([]column, 0, len(source.Columns))}
+		entry := table{Schema: source.Schema, Table: source.Table, Columns: make([]column, 0, len(source.Columns)), ColumnsTruncated: source.ColumnsTruncated}
 		for _, c := range source.Columns {
 			entry.Columns = append(entry.Columns, column{Name: c.Name, DataType: c.DataType, Nullable: c.Nullable})
 		}

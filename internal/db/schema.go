@@ -19,7 +19,8 @@ type SchemaSearch struct {
 	// the flat catalog rows before they are grouped, or [SchemaResultBudget] on the
 	// grouped result. Either way a returned table can hold only part of its matching
 	// column list, so callers must report it rather than treating Tables as
-	// complete.
+	// complete. Where the byte budget was the bound that bit,
+	// [SchemaTable.ColumnsTruncated] names the one table it cut into.
 	Truncated bool
 	RowCap    int
 	// ByteBudget is the budget that applied, reported for the reason RowCap is: a
@@ -36,6 +37,19 @@ type SchemaTable struct {
 	Schema  string
 	Table   string
 	Columns []SchemaColumn
+	// ColumnsTruncated is true when [SchemaResultBudget] stopped this entry's column
+	// list short: Columns is then a prefix of what matched here, and an empty Columns
+	// says nothing at all about this table's columns.
+	//
+	// It exists because without it an empty Columns has two meanings the caller
+	// cannot tell apart. One is the claim this surface makes — the table matched by
+	// its own name and none of its columns matched. The other is an accident of where
+	// the budget landed: a name-matched table is opened by a row whose column did not
+	// match, so its entry can be added alone and the very next row, the one carrying a
+	// matching column, be the one that no longer fits. Because a truncated answer is a
+	// prefix, that boundary is always the last entry, which makes it a recurring event
+	// rather than a rare one.
+	ColumnsTruncated bool
 }
 
 // SchemaColumn is the metadata a schema search returns for a matching column.
@@ -74,13 +88,14 @@ type SchemaColumn struct {
 const SchemaResultBudget = 8 << 10
 
 // The per-entry cost the budget is spent in, counted as the JSON internal/mcp
-// renders these values into: 38 bytes of punctuation and field names for a table
-// entry, 44 for a column, plus one separator each. Both are rounded up to 48, so
-// the accounting over-estimates — a name carrying a few characters JSON has to
-// escape still spends more budget than it costs on the wire, and the ceiling
-// above keeps margin for the rest.
+// renders these values into: 63 bytes of punctuation and field names for a table
+// entry — 25 of them the columns_truncated marker, which is why a table costs more
+// than a column does — and 43 for a column, plus one separator each. Both are
+// rounded up, so the accounting over-estimates: a name carrying a few characters
+// JSON has to escape still spends more budget than it costs on the wire, and the
+// ceiling above keeps margin for the rest.
 const (
-	schemaTableBytes  = 48
+	schemaTableBytes  = 72
 	schemaColumnBytes = 48
 )
 
@@ -127,13 +142,23 @@ func schemaPattern(pattern string) (string, bool) {
 //     Skipping the entry that did not fit and continuing with later smaller ones
 //     would return a set no ordering explains.
 //   - A table entry and the column that opens it are charged together, so a table
-//     is never added without room for a column in it. An entry with no columns is
-//     the documented shape of a table that matched by name alone, and the budget
-//     must not manufacture that claim about a table whose columns it dropped.
+//     matched by a column of its own is never added without room for that column.
+//     That charge does not cover a table matched by its name: the statements return
+//     every column of such a table so that it is represented even when none of them
+//     match, so its entry is opened by a row that costs nothing but the entry, and
+//     the cut can land between it and the first of its columns that did match.
 //   - Within a table it stops at a column, not at the table boundary. Stopping at
 //     the boundary would return nothing at all for a search whose first matching
 //     table is wide — the 256-column case this surface exists for — and a partial
 //     column list under Truncated is the same contract the row cap already has.
+//   - The entry the cut landed inside stays in the answer and sets ColumnsTruncated
+//     on itself, rather than being dropped so that every returned entry is complete.
+//     Dropping it was considered and rejected on the case this surface exists for:
+//     "measure" matches 250 columns of the fixture's one 256-column table, the budget
+//     returns about half of them, and under a drop rule that entirely reasonable
+//     search would answer with no tables at all. A marked partial entry is worth more
+//     to an agent than an empty answer, and it is the marker rather than the shape of
+//     the entry that keeps [SchemaTable.Columns] readable either way.
 func schemaTables(rows [][]any, budget int) ([]SchemaTable, bool) {
 	out := make([]SchemaTable, 0)
 	byName := make(map[string]int)
@@ -189,6 +214,13 @@ func schemaTables(rows [][]any, budget int) ([]SchemaTable, bool) {
 			cost += schemaColumnBytes + len(column.Name) + len(column.DataType)
 		}
 		if spent+cost > budget {
+			if found {
+				// The cut landed inside a table the answer already holds, so what it dropped
+				// is one of that table's columns. Only this entry can say so: Truncated says
+				// the answer is a prefix, not which table stops being a complete statement
+				// about its own columns.
+				out[index].ColumnsTruncated = true
+			}
 			return out, true
 		}
 		spent += cost

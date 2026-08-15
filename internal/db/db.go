@@ -306,7 +306,9 @@ func (e *Executor) ListDatabases(ctx context.Context, alias string) (*DatabaseLi
 // The answer is bounded twice: by the row cap on the flat catalog rows, as every
 // other statement is, and by [SchemaResultBudget] on the grouped result. The
 // second bound is what a short pattern actually runs into — see the constant —
-// and either of them sets Truncated.
+// and either of them sets Truncated. The table the budget cut into carries
+// [SchemaTable.ColumnsTruncated] as well, because an empty column list means
+// "nothing here matched" only on a table the budget left whole.
 func (e *Executor) SearchSchema(ctx context.Context, alias, pattern string) (*SchemaSearch, error) {
 	c, ok := e.conns[alias]
 	if !ok {

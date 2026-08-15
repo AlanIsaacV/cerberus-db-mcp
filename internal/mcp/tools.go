@@ -126,7 +126,12 @@ type SchemaSearchColumn struct {
 }
 
 // SchemaSearchTable is one matching table. A table matched only by its own name
-// has an empty Columns list, because no column name matched the substring.
+// has an empty Columns list, because no column name matched the substring —
+// unless ColumnsTruncated says the byte budget cut that list off, which is the
+// one other way an empty list can arise and the reason the field is on the wire
+// at all. The two are the same JSON without it, and an agent that reads the
+// budget's cut as "no column matched" acts on a claim this server never made.
+//
 // The schema description states what the value is on each engine rather than one
 // word that is true on two of them. On MySQL a table's schema is the database the
 // alias is bound to, so the field carries a database name there; on PostgreSQL
@@ -135,16 +140,19 @@ type SchemaSearchColumn struct {
 // [ListDatabasesResult] does: an agent that hands one to execute_query as its
 // alias is told the alias is unknown.
 type SchemaSearchTable struct {
-	Schema  string               `json:"schema" jsonschema:"the namespace to qualify this table with inside the database the alias is bound to: on mysql that database's own name, on postgresql and sqlserver a schema within it; a name here is not an alias"`
-	Table   string               `json:"table" jsonschema:"the matching table's name"`
-	Columns []SchemaSearchColumn `json:"columns" jsonschema:"the columns whose names match the substring; empty when only the table name matched"`
+	Schema           string               `json:"schema" jsonschema:"the namespace to qualify this table with inside the database the alias is bound to: on mysql that database's own name, on postgresql and sqlserver a schema within it; a name here is not an alias"`
+	Table            string               `json:"table" jsonschema:"the matching table's name"`
+	Columns          []SchemaSearchColumn `json:"columns" jsonschema:"the columns whose names match the substring; empty when only the table name matched, unless columns_truncated is true"`
+	ColumnsTruncated bool                 `json:"columns_truncated" jsonschema:"true when the byte budget stopped inside this table, so the columns listed here are only the beginning of the ones that matched and an empty list says nothing about this table's columns; search this table again with a longer or more specific substring to see the rest. When false, the columns listed are all of them and an empty list means the table name matched and no column did"`
 }
 
 // SearchSchemaResult is the grouped catalog answer. Truncated needs particular
 // care: two bounds can set it — the row cap on the flat catalog rows before
 // internal/db groups them, and the byte budget on the grouped result — and under
 // either one a returned table can hold only part of its matching columns and must
-// not be treated as a complete table description.
+// not be treated as a complete table description. Which table that was is on the
+// table itself, in [SchemaSearchTable.ColumnsTruncated], where the byte budget was
+// the bound that bit.
 //
 // ByteBudget is reported for the reason RowCap is. It is the bound a short
 // pattern actually runs into, and an agent told only that its answer was cut off
@@ -230,7 +238,8 @@ func (s *Server) registerTools(srv *sdk.Server) {
 		Name: ToolSearchSchema,
 		Description: "Find tables and columns in the one database an alias is bound to, by a plain case-insensitive substring; aliases not bound to one database are refused. " +
 			"Pass an alias from list_connections and ordinary text such as archive or measure; do not write LIKE wildcards, because % and _ are searched literally. " +
-			"Results are grouped by table, capped under the same server-configured row limit reported by list_connections, and bounded again by a byte budget so that no pattern can return the whole schema. If truncated is true, the tables listed are only the beginning of what matched and a listed table can have only part of its matching columns: search again with a longer or more specific substring rather than treating the answer as complete.",
+			"Results are grouped by table, capped under the same server-configured row limit reported by list_connections, and bounded again by a byte budget so that no pattern can return the whole schema. If truncated is true, the tables listed are only the beginning of what matched and a listed table can have only part of its matching columns: search again with a longer or more specific substring rather than treating the answer as complete. " +
+			"A table's own columns_truncated tells you which one that was, and an empty column list means no column matched only on a table where it is false.",
 		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true},
 	}, s.searchSchema)
 }
@@ -437,6 +446,9 @@ func (s *Server) searchSchema(ctx context.Context, _ *sdk.CallToolRequest, in Se
 			Schema:  jsonValue(table.Schema).(string),
 			Table:   jsonValue(table.Table).(string),
 			Columns: columns,
+			// Not a driver value, so not something jsonValue has anything to say about:
+			// internal/db computed it about its own budget, as it did Truncated below.
+			ColumnsTruncated: table.ColumnsTruncated,
 		}
 	}
 
