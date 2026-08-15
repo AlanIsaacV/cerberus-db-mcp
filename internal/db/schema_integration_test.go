@@ -159,7 +159,15 @@ func TestSearchSchemaUsesConfiguredSessionBounds(t *testing.T) {
 
 			switch engine {
 			case gate.PostgreSQL:
-				for _, statement := range []string{"SHOW statement_timeout", "SHOW lock_timeout"} {
+				// The settings are read with current_setting rather than with
+				// SHOW because the gate's read-show rule is scoped to MySQL, and
+				// this surface's rule is that the statement changes while the
+				// ruleset never does. current_setting is on the safe-function
+				// allowlist and reports the same text SHOW would.
+				for _, statement := range []string{
+					"SELECT current_setting('statement_timeout')",
+					"SELECT current_setting('lock_timeout')",
+				} {
 					result, err := h.Execute(context.Background(), h.alias, statement, nil)
 					if err != nil {
 						t.Fatalf("Execute(%q) = %v", statement, err)
@@ -326,15 +334,27 @@ func schemaFixtureTableIDs(engine gate.Engine, database string) []string {
 		return nil
 	}
 
-	out := make([]string, 0, len(schemas)*len(wideFixtureTableNames))
+	// SearchSchema returns rows ordered by schema then table name, and
+	// assertSchemaTableIDs compares position by position, so both loops have to
+	// run in that order. wideFixtureTableNames is in the fixture's thematic
+	// order, which is not name order, and it is copied rather than sorted in
+	// place because wideFixtureTables derives each table's shape from a name's
+	// ordinal in it.
+	slices.Sort(schemas)
+	names := slices.Clone(wideFixtureTableNames)
+	slices.Sort(names)
+
+	out := make([]string, 0, len(schemas)*len(names))
 	for _, schema := range schemas {
-		for _, table := range wideFixtureTableNames {
+		for _, table := range names {
 			out = append(out, schema+"."+table)
 		}
 	}
 	return out
 }
 
+// schemaArchiveTableIDs is written already in the schema-then-table order the
+// comparison needs; a schema added here has to keep it that way.
 func schemaArchiveTableIDs(engine gate.Engine, database string) []string {
 	if engine == gate.PostgreSQL {
 		return []string{"atelier.archive", "harbor.archive"}
