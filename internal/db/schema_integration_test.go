@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 )
@@ -62,6 +64,17 @@ func TestSearchSchemaRejectsShortPatterns(t *testing.T) {
 	}
 }
 
+// TestSearchSchemaGroupsOnlyMatchingColumns is acceptance criterion 6: one entry
+// per matching table, carrying only the columns that matched, and an empty list
+// where the table name alone matched.
+//
+// Every expectation below is derived from the fixture's checked-in declaration and
+// then trimmed by [schemaWithinBudget], because two of these three searches now
+// overrun [SchemaResultBudget] — the 250-column measure search always, and the
+// title search on PostgreSQL, where one matching column in each of 100 tables costs
+// more than the budget allows. What the derivation buys is that the expectation
+// still names which columns of which tables, in order, rather than degrading into
+// "some prefix".
 func TestSearchSchemaGroupsOnlyMatchingColumns(t *testing.T) {
 	for _, engine := range containerEngines {
 		t.Run(string(engine), func(t *testing.T) {
@@ -82,32 +95,38 @@ func TestSearchSchemaGroupsOnlyMatchingColumns(t *testing.T) {
 					t.Errorf("name-matched %s.%s columns = %#v, want an empty non-nil list", table.Schema, table.Table, table.Columns)
 				}
 			}
+			if byTableName.Truncated {
+				t.Errorf("a two-table name match reports truncation under a %d-byte budget and a row cap of %d", byTableName.ByteBudget, byTableName.RowCap)
+			}
 
 			byColumn, err := h.SearchSchema(context.Background(), h.alias, "title")
 			if err != nil {
 				t.Fatalf("SearchSchema(title) = %v", err)
 			}
-			assertSchemaTableIDs(t, byColumn.Tables, schemaFixtureTableIDs(engine, database))
-			archive, ok := findSchemaTable(byColumn.Tables, schemaWideTableSchema(engine, database), "archive")
-			if !ok {
-				t.Fatalf("column search returned no archive table: %v", schemaTableIDs(byColumn.Tables))
+			wantColumn, columnTruncated := schemaWithinBudget(schemaFixtureMatches(engine, database, "title"))
+			// The expectation covers the 256-column archive as well, whose entry must
+			// carry its one matching column and no other.
+			assertSchemaTables(t, byColumn.Tables, wantColumn)
+			if byColumn.Truncated != columnTruncated {
+				t.Errorf("SearchSchema(title) truncated = %v over %d tables, want %v", byColumn.Truncated, len(byColumn.Tables), columnTruncated)
 			}
-			assertSchemaColumns(t, archive.Columns, []SchemaColumn{{
-				Name:     "title",
-				DataType: fixtureType(engine, "character varying", "varchar"),
-				Nullable: false,
-			}})
 
 			byMeasure, err := h.SearchSchema(context.Background(), h.alias, "measure")
 			if err != nil {
 				t.Fatalf("SearchSchema(measure) = %v", err)
 			}
-			assertSchemaTableIDs(t, byMeasure.Tables, []string{schemaWideTableID(engine, database)})
-			wide, ok := findSchemaTable(byMeasure.Tables, schemaWideTableSchema(engine, database), "archive")
-			if !ok {
-				t.Fatalf("measure search returned no wide archive table: %v", schemaTableIDs(byMeasure.Tables))
+			wantMeasure, measureTruncated := schemaWithinBudget(schemaFixtureMatches(engine, database, "measure"))
+			if !measureTruncated {
+				t.Fatal("the 250-column measure search no longer overruns the budget, so this case has stopped grading the truncation it was written for")
 			}
-			assertSchemaColumns(t, wide.Columns, schemaMeasureColumns(engine))
+			// The budget stops inside the wide table rather than at its boundary, so
+			// the entry survives with part of its column list. An empty list here would
+			// be the shape that means "matched by table name alone", and the budget must
+			// never produce it.
+			assertSchemaTables(t, byMeasure.Tables, wantMeasure)
+			if !byMeasure.Truncated {
+				t.Errorf("SearchSchema(measure) returned %d of 250 columns without reporting truncation", schemaColumnCount(byMeasure.Tables))
+			}
 			assertSchemaOrder(t, byColumn.Tables)
 			assertSchemaOrder(t, byMeasure.Tables)
 		})
@@ -123,17 +142,17 @@ func TestSearchSchemaDoesNotCrossMySQLDatabases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchSchema(%s, title) = %v", ledgerAlias, err)
 	}
-	assertSchemaTableIDs(t, ledger.Tables, schemaFixtureTableIDs(gate.MySQL, fixtureSecondDatabase))
+	wantTitle, _ := schemaWithinBudget(schemaFixtureMatches(gate.MySQL, fixtureSecondDatabase, "title"))
+	assertSchemaTables(t, ledger.Tables, wantTitle)
 	wide, err := ledgerExecutor.SearchSchema(context.Background(), ledgerAlias, "measure")
 	if err != nil {
 		t.Fatalf("SearchSchema(%s, measure) = %v", ledgerAlias, err)
 	}
-	assertSchemaTableIDs(t, wide.Tables, []string{schemaWideTableID(gate.MySQL, fixtureSecondDatabase)})
-	archive, ok := findSchemaTable(wide.Tables, fixtureSecondDatabase, "archive")
-	if !ok {
-		t.Fatalf("ledger measure search returned no wide archive table: %v", schemaTableIDs(wide.Tables))
-	}
-	assertSchemaColumns(t, archive.Columns, schemaMeasureColumns(gate.MySQL))
+	// The measure search is stopped by the byte budget partway through the wide
+	// table's 250 columns; what this test is about is that those columns are
+	// ledger's and are reachable only through an alias bound to ledger.
+	wantMeasure, _ := schemaWithinBudget(schemaFixtureMatches(gate.MySQL, fixtureSecondDatabase, "measure"))
+	assertSchemaTables(t, wide.Tables, wantMeasure)
 
 	result, err := h.SearchSchema(context.Background(), h.alias, "measure")
 	if err != nil {
@@ -164,19 +183,28 @@ func TestSearchSchemaUsesConfiguredSessionBounds(t *testing.T) {
 				// this surface's rule is that the statement changes while the
 				// ruleset never does. current_setting is on the safe-function
 				// allowlist and reports the same text SHOW would.
-				for _, statement := range []string{
-					"SELECT current_setting('statement_timeout')",
-					"SELECT current_setting('lock_timeout')",
+				//
+				// Each value is compared to this alias's own configured bound, the
+				// way the MySQL branch below does. "not empty and not 0" would stay
+				// green if the mapping at internal/db/postgres.go's RuntimeParams
+				// broke and left the server's own default in force, which is the one
+				// failure this half exists to catch.
+				for _, tt := range []struct {
+					statement string
+					want      string
+				}{
+					{"SELECT current_setting('statement_timeout')", postgresDurationSetting(h.Settings().QueryTimeout)},
+					{"SELECT current_setting('lock_timeout')", postgresDurationSetting(h.Settings().LockTimeout)},
 				} {
-					result, err := h.Execute(context.Background(), h.alias, statement, nil)
+					result, err := h.Execute(context.Background(), h.alias, tt.statement, nil)
 					if err != nil {
-						t.Fatalf("Execute(%q) = %v", statement, err)
+						t.Fatalf("Execute(%q) = %v", tt.statement, err)
 					}
 					if len(result.Rows) != 1 || len(result.Rows[0]) != 1 {
-						t.Fatalf("Execute(%q) rows = %#v, want one setting", statement, result.Rows)
+						t.Fatalf("Execute(%q) rows = %#v, want one setting", tt.statement, result.Rows)
 					}
-					if value := fixtureCatalogValue(result.Rows[0][0]); value == "" || value == "0" {
-						t.Errorf("%s = %q, so the schema-search session has no bound", statement, value)
+					if value := fixtureCatalogValue(result.Rows[0][0]); value != tt.want {
+						t.Errorf("%s = %q, want %q: the schema-search session does not carry this alias's configured bound", tt.statement, value, tt.want)
 					}
 				}
 			case gate.MySQL:
@@ -223,11 +251,94 @@ func TestSearchSchemaReportsTruncation(t *testing.T) {
 			if !result.Truncated || result.RowCap != 2 {
 				t.Errorf("SearchSchema(archive) truncation = %v at row cap %d, want true at 2", result.Truncated, result.RowCap)
 			}
+			// Both bounds are reported whichever one bit, so an agent that reads a
+			// truncated answer can tell what to calibrate a narrower pattern against.
+			if result.ByteBudget != SchemaResultBudget {
+				t.Errorf("SearchSchema(archive) reports byte budget %d, want %d", result.ByteBudget, SchemaResultBudget)
+			}
 		})
 	}
 }
 
-func TestSearchSchemaSerializedSizeStaysBounded(t *testing.T) {
+// TestSearchSchemaSharedColumnPatternCannotReturnTheCatalog is acceptance
+// criterion 4's absolute half — no value of pattern returns the whole catalog —
+// against the case that broke it. Every fixture table carries recorded_at, so the
+// legal two-character pattern "re" matches a column in every one of them: nothing
+// is near the row cap, every table qualifies, and before [SchemaResultBudget]
+// existed the answer was the catalog reached from the column side.
+//
+// It runs at the bounds this package ships with rather than the deliberately small
+// ones a test run configures, and says so if the cap could not deliver every
+// matching row: a cap that stopped the read first would hide the hole this grades
+// behind a truncation that means something else.
+func TestSearchSchemaSharedColumnPatternCannotReturnTheCatalog(t *testing.T) {
+	const pattern = "re"
+	for _, engine := range containerEngines {
+		t.Run(string(engine), func(t *testing.T) {
+			database := fixtureDatabase
+			if engine == gate.MySQL {
+				// ledger, because MySQL's 256-column archive is there and PostgreSQL's
+				// is in testbed: the shared column matches in every table either way,
+				// and the wide table is what makes the overrun unmissable.
+				database = fixtureSecondDatabase
+			}
+			h := schemaShippedBoundsHarness(t, engine, database)
+			if rows := schemaFixtureMatchedRows(engine, database, pattern); h.Settings().RowCap < rows {
+				t.Fatalf("the shipped row cap of %d cannot deliver the %d catalog rows %q matches, so this would grade the cap and not the byte budget", h.Settings().RowCap, rows, pattern)
+			}
+
+			result, err := h.SearchSchema(context.Background(), h.alias, pattern)
+			if err != nil {
+				t.Fatalf("SearchSchema(%q) = %v", pattern, err)
+			}
+			if !result.Truncated {
+				t.Errorf("SearchSchema(%q) returned %d tables and %d columns without reporting truncation", pattern, len(result.Tables), schemaColumnCount(result.Tables))
+			}
+			if result.ByteBudget != SchemaResultBudget {
+				t.Errorf("SearchSchema(%q) reports byte budget %d, want %d", pattern, result.ByteBudget, SchemaResultBudget)
+			}
+
+			want, truncated := schemaWithinBudget(schemaFixtureMatches(engine, database, pattern))
+			if !truncated {
+				t.Fatalf("%q no longer overruns the budget over this fixture, so this test has stopped grading criterion 4's hole", pattern)
+			}
+			assertSchemaTables(t, result.Tables, want)
+			assertSchemaOrder(t, result.Tables)
+
+			// The three properties the budget is spent to keep true.
+			every := schemaFixtureTableIDs(engine, database)
+			if len(result.Tables) >= len(every) {
+				t.Errorf("SearchSchema(%q) returned %d of this database's %d tables: a pattern the tool accepts returns the catalog", pattern, len(result.Tables), len(every))
+			}
+			for _, table := range result.Tables {
+				if len(table.Columns) == 0 {
+					t.Errorf("%s.%s came back with no columns, which is the shape that means the table name matched; the budget dropped its columns instead", table.Schema, table.Table)
+				}
+			}
+			if cost := schemaBudgetCost(result.Tables); cost > SchemaResultBudget {
+				t.Errorf("the answer spends %d bytes of the %d-byte budget", cost, SchemaResultBudget)
+			}
+			t.Logf("%q over %d fixture tables: %d tables, %d columns, %d bytes of budget, %d bytes assembled",
+				pattern, len(every), len(result.Tables), schemaColumnCount(result.Tables), schemaBudgetCost(result.Tables), schemaJSONSize(t, result))
+		})
+	}
+}
+
+// TestSearchSchemaAssembledTablesStayWithinTheBudget is a cheap guard that what
+// this package assembles is no larger than the budget it charged itself for. It is
+// deliberately NOT acceptance criterion 9's measurement: an agent never receives
+// this value. internal/mcp maps it into its own field names and the SDK emits it
+// both as structured content and as a duplicate JSON text block, so the wire form
+// is roughly twice what is measured here — which is why criterion 9's 4 KB and
+// 20 KB bounds are graded in internal/mcp/mcp_integration_test.go, over this same
+// fixture, on the form the agent actually gets.
+//
+// What it does establish is the accounting in internal/db/schema.go: the per-entry
+// costs there over-estimate the JSON they stand for, so a result that spent its
+// whole budget must still serialise to less than the budget. If that ever inverts,
+// the ceiling internal/mcp asserts is being derived from a number that no longer
+// bounds anything.
+func TestSearchSchemaAssembledTablesStayWithinTheBudget(t *testing.T) {
 	for _, engine := range containerEngines {
 		t.Run(string(engine), func(t *testing.T) {
 			database := fixtureDatabase
@@ -236,7 +347,8 @@ func TestSearchSchemaSerializedSizeStaysBounded(t *testing.T) {
 			}
 			h := schemaFixtureHarness(t, engine, database)
 			// The configured test-suite cap is deliberately low. Raise it only for
-			// this measurement so the full 250-column worst case is serialised.
+			// this measurement, so that what stops the worst case is the byte budget
+			// rather than a cap no deployment runs.
 			h.settings.RowCap = 300
 
 			one, err := h.SearchSchema(context.Background(), h.alias, "archive")
@@ -244,28 +356,27 @@ func TestSearchSchemaSerializedSizeStaysBounded(t *testing.T) {
 				t.Fatalf("SearchSchema(archive) = %v", err)
 			}
 			assertSchemaTableIDs(t, one.Tables, schemaArchiveTableIDs(engine, database))
-			oneSize := schemaJSONSize(t, one)
-			if oneSize >= 4*1024 {
-				t.Errorf("one-table search serialises to %d bytes, want under 4096", oneSize)
+			oneSize := schemaJSONSize(t, one.Tables)
+			// A proportionality guard on the call this surface exists for, not
+			// criterion 9's 4 KB: a search naming one table costs a couple of hundred
+			// bytes here, and anything approaching a kilobyte means an entry grew a
+			// field nobody accounted for.
+			if oneSize >= 1024 {
+				t.Errorf("a table-name search assembles %d bytes of tables for %d entries, want well under 1024", oneSize, len(one.Tables))
 			}
 
 			worst, err := h.SearchSchema(context.Background(), h.alias, "measure")
 			if err != nil {
 				t.Fatalf("SearchSchema(measure) = %v", err)
 			}
-			assertSchemaTableIDs(t, worst.Tables, []string{schemaWideTableID(engine, database)})
-			wide, ok := findSchemaTable(worst.Tables, schemaWideTableSchema(engine, database), "archive")
-			if !ok {
-				t.Fatalf("worst-case measure search returned no wide archive table: %v", schemaTableIDs(worst.Tables))
+			if !worst.Truncated {
+				t.Fatal("the 250-column measure search is not truncated, so it is no longer the worst case the budget produces")
 			}
-			assertSchemaColumns(t, wide.Columns, schemaMeasureColumns(engine))
-			if worst.Truncated {
-				t.Fatal("the 300-row cap truncated the 250-column measurement")
-			}
-			worstSize := schemaJSONSize(t, worst)
-			t.Logf("worst schema-search result: %d bytes for %d tables and %d matching columns", worstSize, len(worst.Tables), schemaColumnCount(worst.Tables))
-			if worstSize >= 20*1024 {
-				t.Errorf("worst schema search serialises to %d bytes, want under 20480", worstSize)
+			worstSize := schemaJSONSize(t, worst.Tables)
+			t.Logf("worst assembled schema-search result on %s: %d bytes of tables (%d with the execution facts) for %d tables and %d matching columns, against a %d-byte budget it charged %d bytes to",
+				engine, worstSize, schemaJSONSize(t, worst), len(worst.Tables), schemaColumnCount(worst.Tables), worst.ByteBudget, schemaBudgetCost(worst.Tables))
+			if worstSize > SchemaResultBudget {
+				t.Errorf("a result the budget stopped assembles to %d bytes of tables, more than the %d-byte budget that stopped it", worstSize, SchemaResultBudget)
 			}
 		})
 	}
@@ -315,6 +426,171 @@ func schemaFixtureHarness(t *testing.T, engine gate.Engine, database string) har
 	return harness{}
 }
 
+// schemaShippedBoundsHarness reaches the same fixture database over a connection
+// declared with no setting variable at all, so the bounds that apply are the ones
+// this package ships with rather than the small ones a test run configures.
+//
+// A test about the byte budget needs that. The budget is only what stops an answer
+// once the row cap is large enough to deliver every matching row; under CI's cap of
+// 50 a shared-column pattern is stopped by the cap long before, and a result that
+// is truncated for the wrong reason grades nothing.
+func schemaShippedBoundsHarness(t *testing.T, engine gate.Engine, database string) harness {
+	t.Helper()
+	base := schemaFixtureHarness(t, engine, database)
+	e := executorForEnvironment(t, aliasEnvironment("schemabudget", base.spec, database))
+	for _, alias := range e.engineAliases(engine) {
+		c, _ := e.connFor(alias)
+		if c.spec().Database == database {
+			return harness{Executor: e, alias: alias, spec: c.spec()}
+		}
+	}
+	t.Fatalf("no %s alias is bound to fixture database %q", engine, database)
+	return harness{}
+}
+
+// schemaFixtureMatches is the answer a search for pattern would return over the
+// wide fixture if no bound applied: the fixture's checked-in declaration, filtered
+// the way the three catalog statements filter it and ordered the way they order it.
+//
+// Deriving the expectation from the declaration rather than from the result is what
+// lets a truncated case still be graded exactly — which columns of which tables, in
+// which order — instead of degrading into an assertion about a count.
+func schemaFixtureMatches(engine gate.Engine, database, pattern string) []SchemaTable {
+	pattern = strings.ToLower(pattern)
+	out := make([]SchemaTable, 0)
+	for _, table := range wideFixtureTables(engine) {
+		// On MySQL a schema is a database and a search never leaves the one the alias
+		// is bound to; on PostgreSQL both fixture schemas live in fixtureDatabase.
+		if engine == gate.MySQL && table.schema != database {
+			continue
+		}
+		matched := make([]SchemaColumn, 0)
+		for _, column := range table.columns {
+			if strings.Contains(strings.ToLower(column.name), pattern) {
+				matched = append(matched, SchemaColumn{Name: column.name, DataType: column.dataType, Nullable: column.nullable})
+			}
+		}
+		if len(matched) == 0 && !strings.Contains(strings.ToLower(table.name), pattern) {
+			continue
+		}
+		slices.SortFunc(matched, func(a, b SchemaColumn) int { return strings.Compare(a.Name, b.Name) })
+		out = append(out, SchemaTable{Schema: table.schema, Table: table.name, Columns: matched})
+	}
+	slices.SortStableFunc(out, func(a, b SchemaTable) int {
+		if a.Schema != b.Schema {
+			return strings.Compare(a.Schema, b.Schema)
+		}
+		return strings.Compare(a.Table, b.Table)
+	})
+	return out
+}
+
+// schemaFixtureMatchedRows is how many flat catalog rows a pattern produces before
+// grouping: every column of a table whose name matched, and the matching columns of
+// the rest. It is what a test compares the row cap against when it needs the byte
+// budget, and not the cap, to be what stopped the answer.
+func schemaFixtureMatchedRows(engine gate.Engine, database, pattern string) int {
+	pattern = strings.ToLower(pattern)
+	rows := 0
+	for _, table := range wideFixtureTables(engine) {
+		if engine == gate.MySQL && table.schema != database {
+			continue
+		}
+		if strings.Contains(strings.ToLower(table.name), pattern) {
+			rows += len(table.columns)
+			continue
+		}
+		for _, column := range table.columns {
+			if strings.Contains(strings.ToLower(column.name), pattern) {
+				rows++
+			}
+		}
+	}
+	return rows
+}
+
+// schemaWithinBudget trims an unbounded expectation the way schemaTables spends
+// [SchemaResultBudget] over it, using that function's own per-entry costs so an
+// expectation follows the budget rather than restating a column count a changed
+// budget would silently invalidate.
+//
+// It models the two shapes these searches produce: a table matched by name alone,
+// charged on its own, and a table's matching columns, the first of which is charged
+// together with the entry that holds it — which is why a table never appears here
+// with an empty column list unless that is what it means. A table matched by name
+// *and* by column would open its entry on whichever of its columns the catalog
+// returns first; no pattern these tests use does both at once, so that ordering is
+// not modelled.
+func schemaWithinBudget(want []SchemaTable) ([]SchemaTable, bool) {
+	out := make([]SchemaTable, 0, len(want))
+	spent := 0
+	for _, table := range want {
+		entry := schemaTableBytes + len(table.Schema) + len(table.Table)
+		if len(table.Columns) == 0 {
+			if spent+entry > SchemaResultBudget {
+				return out, true
+			}
+			spent += entry
+			out = append(out, SchemaTable{Schema: table.Schema, Table: table.Table, Columns: make([]SchemaColumn, 0)})
+			continue
+		}
+		for i, column := range table.Columns {
+			cost := schemaColumnBytes + len(column.Name) + len(column.DataType)
+			if i == 0 {
+				cost += entry
+			}
+			if spent+cost > SchemaResultBudget {
+				return out, true
+			}
+			spent += cost
+			if i == 0 {
+				out = append(out, SchemaTable{Schema: table.Schema, Table: table.Table, Columns: make([]SchemaColumn, 0, len(table.Columns))})
+			}
+			last := len(out) - 1
+			out[last].Columns = append(out[last].Columns, column)
+		}
+	}
+	return out, false
+}
+
+// schemaBudgetCost is what a returned result charged against the budget, computed
+// with the package's own per-entry constants.
+func schemaBudgetCost(tables []SchemaTable) int {
+	cost := 0
+	for _, table := range tables {
+		cost += schemaTableBytes + len(table.Schema) + len(table.Table)
+		for _, column := range table.Columns {
+			cost += schemaColumnBytes + len(column.Name) + len(column.DataType)
+		}
+	}
+	return cost
+}
+
+// postgresDurationSetting renders a duration the way current_setting reports one of
+// PostgreSQL's millisecond-unit parameters back.
+//
+// internal/db/postgres.go puts statement_timeout and lock_timeout into the startup
+// packet as a plain integer count of milliseconds, and the server prints such a
+// value in the largest unit that divides it exactly (guc.c's
+// convert_int_from_base_unit): 4000 comes back as "4s", 4500 as "4500ms".
+func postgresDurationSetting(d time.Duration) string {
+	ms := milliseconds(d)
+	for _, unit := range []struct {
+		suffix string
+		size   int64
+	}{
+		{"d", 24 * 60 * 60 * 1000},
+		{"h", 60 * 60 * 1000},
+		{"min", 60 * 1000},
+		{"s", 1000},
+	} {
+		if ms%unit.size == 0 {
+			return strconv.FormatInt(ms/unit.size, 10) + unit.suffix
+		}
+	}
+	return strconv.FormatInt(ms, 10) + "ms"
+}
+
 func schemaTableIDs(tables []SchemaTable) []string {
 	out := make([]string, len(tables))
 	for i, table := range tables {
@@ -362,36 +638,17 @@ func schemaArchiveTableIDs(engine gate.Engine, database string) []string {
 	return []string{database + ".archive"}
 }
 
-func schemaWideTableSchema(engine gate.Engine, database string) string {
-	if engine == gate.PostgreSQL {
-		return "harbor"
+// assertSchemaTables compares a result against a whole expected answer: the same
+// tables in the same order, each carrying the same columns with the same types and
+// nullability. It replaces the per-table lookups this file used before the byte
+// budget existed, which could only name one table at a time and had no way to say
+// where a truncated answer should stop.
+func assertSchemaTables(t *testing.T, got, want []SchemaTable) {
+	t.Helper()
+	assertSchemaTableIDs(t, got, schemaTableIDs(want))
+	for i := range want {
+		assertSchemaColumns(t, got[i].Columns, want[i].Columns)
 	}
-	return database
-}
-
-func schemaWideTableID(engine gate.Engine, database string) string {
-	return schemaWideTableSchema(engine, database) + ".archive"
-}
-
-func schemaMeasureColumns(engine gate.Engine) []SchemaColumn {
-	columns := make([]SchemaColumn, 0, 250)
-	for i := 1; i <= 250; i++ {
-		columns = append(columns, SchemaColumn{
-			Name:     fmt.Sprintf("measure_%03d", i),
-			DataType: fixtureMeasureType(engine, i),
-			Nullable: i%3 != 0,
-		})
-	}
-	return columns
-}
-
-func findSchemaTable(tables []SchemaTable, schema, name string) (SchemaTable, bool) {
-	for _, table := range tables {
-		if table.Schema == schema && table.Table == name {
-			return table, true
-		}
-	}
-	return SchemaTable{}, false
 }
 
 func assertSchemaTableIDs(t *testing.T, tables []SchemaTable, want []string) {

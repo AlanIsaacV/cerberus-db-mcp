@@ -210,11 +210,11 @@
       "source": "hand-written catalog search"
     },
     {
-      "statement": "SELECT s.name AS schema_name, t.name AS table_name, c.name AS column_name FROM sys.tables AS t JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.columns AS c ON c.object_id = t.object_id WHERE LOWER(t.name) LIKE @p1",
+      "statement": "WITH pattern AS (SELECT LOWER(@p1) AS value) SELECT s.name, t.name, c.name, ty.name, c.is_nullable, CASE WHEN LOWER(t.name) LIKE pattern.value ESCAPE '!' THEN 1 ELSE 0 END AS table_name_matched, CASE WHEN LOWER(c.name) LIKE pattern.value ESCAPE '!' THEN 1 ELSE 0 END AS column_name_matched FROM sys.tables AS t JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.columns AS c ON c.object_id = t.object_id JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id JOIN pattern ON 1 = 1 WHERE LOWER(t.name) LIKE pattern.value ESCAPE '!' OR LOWER(c.name) LIKE pattern.value ESCAPE '!' ORDER BY s.name, t.name, c.name",
       "engine": "sqlserver",
       "verdict": "allow",
-      "reason": "read-select over sys.tables and sys.columns: the @p1 placeholder remains in the constant catalog search while its name pattern is bound separately",
-      "source": "hand-written catalog search"
+      "reason": "the statement search_schema actually sends on this engine: the @p1 placeholder stays in the constant while its name pattern is bound separately, the WITH is explained by the close of its own CTE body, and the CASE WHEN that T-SQL forces around each LIKE match reason is ordinary syntax to the gate",
+      "source": "internal/db/mssql.go, sqlServerSchemaSearch, verbatim"
     },
     {
       "statement": "SELECT $1$ ; DROP TABLE t $1$",

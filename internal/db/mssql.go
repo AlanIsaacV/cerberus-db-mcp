@@ -180,7 +180,16 @@ const sqlServerDatabases = "SELECT name FROM sys.databases ORDER BY name"
 // database-qualified name here, so the query cannot reach a second database on
 // the same login. @p1 is reusable in T-SQL; the CTE still keeps the pattern
 // transformation and both match reasons visibly in one place.
-const sqlServerSchemaSearch = "WITH pattern AS (SELECT LOWER(@p1) AS value) SELECT s.name, t.name, c.name, ty.name, c.is_nullable, LOWER(t.name) LIKE pattern.value ESCAPE '!' AS table_name_matched, LOWER(c.name) LIKE pattern.value ESCAPE '!' AS column_name_matched FROM sys.tables AS t JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.columns AS c ON c.object_id = t.object_id JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id JOIN pattern ON 1 = 1 WHERE LOWER(t.name) LIKE pattern.value ESCAPE '!' OR LOWER(c.name) LIKE pattern.value ESCAPE '!' ORDER BY s.name, t.name, c.name"
+//
+// The two match reasons are CASE WHEN … THEN 1 ELSE 0 END and not the bare LIKE
+// the other two engines use, because T-SQL has no boolean data type a column can
+// carry: LIKE there is a predicate, legal in WHERE and in CASE, and a syntax
+// error in a select list. PostgreSQL returns a real boolean and MySQL an integer,
+// so only this engine needs the wrapping — and only this engine has no fixture
+// and no CI to catch it, which is why it is written down here. The integer 1/0
+// this produces is decoded by the same schemaBool that takes the other two
+// engines' representations.
+const sqlServerSchemaSearch = "WITH pattern AS (SELECT LOWER(@p1) AS value) SELECT s.name, t.name, c.name, ty.name, c.is_nullable, CASE WHEN LOWER(t.name) LIKE pattern.value ESCAPE '!' THEN 1 ELSE 0 END AS table_name_matched, CASE WHEN LOWER(c.name) LIKE pattern.value ESCAPE '!' THEN 1 ELSE 0 END AS column_name_matched FROM sys.tables AS t JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.columns AS c ON c.object_id = t.object_id JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id JOIN pattern ON 1 = 1 WHERE LOWER(t.name) LIKE pattern.value ESCAPE '!' OR LOWER(c.name) LIKE pattern.value ESCAPE '!' ORDER BY s.name, t.name, c.name"
 
 // sqlServerSystemDatabases are the four databases every instance has and nobody
 // asks an agent to explore.

@@ -2,8 +2,10 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -182,7 +184,10 @@ func TestSchemaTablesKeepsANameMatchedTableWithoutItsOtherColumns(t *testing.T) 
 		{"atelier", "archive", "title", "character varying", false, true, false},
 		{"harbor", "beacon", "measure", "numeric", true, false, true},
 	}
-	got := schemaTables(rows)
+	got, truncated := schemaTables(rows, SchemaResultBudget)
+	if truncated {
+		t.Error("three rows exhausted the byte budget")
+	}
 	want := []SchemaTable{
 		{Schema: "atelier", Table: "archive", Columns: []SchemaColumn{}},
 		{Schema: "harbor", Table: "beacon", Columns: []SchemaColumn{{Name: "measure", DataType: "numeric", Nullable: true}}},
@@ -192,6 +197,207 @@ func TestSchemaTablesKeepsANameMatchedTableWithoutItsOtherColumns(t *testing.T) 
 	}) {
 		t.Errorf("schemaTables() = %#v, want %#v", got, want)
 	}
+}
+
+// TestASharedColumnNameCannotReturnTheWholeCatalog is the defect this budget
+// exists for, at the scale live verification found it: every table in the wide
+// fixture carries one audit column, so a two-character pattern matches a few
+// hundred flat rows — far under the row cap, which therefore never fires — and
+// groups into an entry for every table in the database.
+func TestASharedColumnNameCannotReturnTheWholeCatalog(t *testing.T) {
+	const tables = 100
+	rows := sharedColumnCatalogRows(tables)
+	if cap := shippedRowCap(t); len(rows) >= cap {
+		t.Fatalf("the fixture has %d rows and the shipped row cap is %d, so the row cap would truncate this and the budget would not be what is measured",
+			len(rows), cap)
+	}
+
+	got, truncated := schemaTables(rows, SchemaResultBudget)
+	if !truncated {
+		t.Error("the budget did not report the answer as partial")
+	}
+	if len(got) >= tables {
+		t.Errorf("the search returned %d of %d tables, which is the catalog", len(got), tables)
+	}
+	if len(got) == 0 {
+		t.Error("the search returned no table at all, so the budget is too small to answer anything")
+	}
+	if size := wireBytes(t, got); size > SchemaResultBudget {
+		t.Errorf("the result serialises to %d bytes, over the %d-byte budget the accounting is supposed to over-estimate", size, SchemaResultBudget)
+	}
+}
+
+// TestTheByteBudgetLeavesTheWireFormUnderTheCeiling states the arithmetic the
+// budget's value was chosen from, so that moving either number without the other
+// fails here. The agent receives the result twice — as structured content and as
+// the SDK's duplicate JSON text block — and 20 KB is what criterion 9 allows it.
+func TestTheByteBudgetLeavesTheWireFormUnderTheCeiling(t *testing.T) {
+	const (
+		ceiling  = 20 << 10
+		envelope = 1 << 10 // JSON-RPC framing, the result's own scalar fields, and margin
+	)
+	if worst := 2*SchemaResultBudget + envelope; worst > ceiling {
+		t.Errorf("a full result reaches %d bytes on the wire, over the %d-byte ceiling", worst, ceiling)
+	}
+}
+
+// TestTheByteBudgetStopsInsideAWideTable pins where truncation lands. The
+// 256-column table is the case this surface exists for, so stopping at the table
+// boundary would answer a search that matched it with nothing at all.
+func TestTheByteBudgetStopsInsideAWideTable(t *testing.T) {
+	rows := make([][]any, 0, 256)
+	for i := range 256 {
+		rows = append(rows, []any{"harbor", "archive", "measure_" + strconv.Itoa(i), "numeric", true, false, true})
+	}
+
+	// A budget that fits four columns and the table entry, and not the fifth.
+	budget := schemaTableBytes + len("harbor") + len("archive") + 4*(schemaColumnBytes+len("measure_000")+len("numeric"))
+	got, truncated := schemaTables(rows, budget)
+	if !truncated {
+		t.Fatal("256 columns fitted a four-column budget")
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d tables, want the one table the rows describe", len(got))
+	}
+	if len(got[0].Columns) != 4 {
+		t.Errorf("got %d columns, want the 4 the budget covers", len(got[0].Columns))
+	}
+}
+
+// TestTheByteBudgetNeverOpensATableItCannotPutAColumnIn keeps the budget from
+// manufacturing the one shape that means something else: an entry with no columns
+// is how a table that matched by name alone is reported.
+func TestTheByteBudgetNeverOpensATableItCannotPutAColumnIn(t *testing.T) {
+	rows := [][]any{
+		{"atelier", "beacon", "recorded_at", "timestamp", true, false, true},
+		{"atelier", "canvas", "recorded_at", "timestamp", true, false, true},
+	}
+	budget := schemaTableBytes + len("atelier") + len("beacon") + schemaColumnBytes + len("recorded_at") + len("timestamp")
+	got, truncated := schemaTables(rows, budget)
+	if !truncated {
+		t.Fatal("two tables fitted a one-table budget")
+	}
+	if len(got) != 1 || len(got[0].Columns) != 1 {
+		t.Fatalf("got %#v, want only beacon with its one matching column", got)
+	}
+}
+
+func TestSearchSchemaReportsTheBudgetItApplied(t *testing.T) {
+	g, err := gate.New("")
+	if err != nil {
+		t.Fatalf("gate.New: %v", err)
+	}
+	c := &catalogTestConn{
+		schemaTestConn: schemaTestConn{alias: AliasSpec{Alias: "warehouse", Engine: gate.PostgreSQL, Database: "testbed"}},
+		rows:           sharedColumnCatalogRows(100),
+	}
+	e := &Executor{gate: g, settings: pgSettings(), conns: map[string]conn{"warehouse": c}}
+
+	search, err := e.SearchSchema(context.Background(), "warehouse", "re")
+	if err != nil {
+		t.Fatalf("SearchSchema() = %v", err)
+	}
+	if !search.Truncated {
+		t.Error("SearchSchema reported a complete answer for a search the budget cut off")
+	}
+	if search.ByteBudget != SchemaResultBudget {
+		t.Errorf("ByteBudget = %d, want %d", search.ByteBudget, SchemaResultBudget)
+	}
+	if len(search.Tables) >= 100 {
+		t.Errorf("SearchSchema returned %d tables, which is the whole catalog", len(search.Tables))
+	}
+}
+
+func TestSearchSchemaLeavesASmallAnswerWhole(t *testing.T) {
+	g, err := gate.New("")
+	if err != nil {
+		t.Fatalf("gate.New: %v", err)
+	}
+	c := &catalogTestConn{
+		schemaTestConn: schemaTestConn{alias: AliasSpec{Alias: "warehouse", Engine: gate.PostgreSQL, Database: "testbed"}},
+		rows: [][]any{
+			{"atelier", "archive", "id", "bigint", false, true, false},
+			{"atelier", "archive", "archived_at", "timestamp", true, true, true},
+		},
+	}
+	e := &Executor{gate: g, settings: pgSettings(), conns: map[string]conn{"warehouse": c}}
+
+	search, err := e.SearchSchema(context.Background(), "warehouse", "archive")
+	if err != nil {
+		t.Fatalf("SearchSchema() = %v", err)
+	}
+	if search.Truncated {
+		t.Error("SearchSchema reported one table as partial")
+	}
+	if len(search.Tables) != 1 || len(search.Tables[0].Columns) != 1 {
+		t.Errorf("Tables = %#v, want atelier.archive with its one matching column", search.Tables)
+	}
+}
+
+// shippedRowCap is the cap a deployment that configures nothing runs under. The
+// tests in this package use a much lower one, and the defect the budget closes is
+// specifically that the shipped cap never fires on a search like this.
+func shippedRowCap(t *testing.T) int {
+	t.Helper()
+	cfg, err := LoadConfigFrom(map[string]string{
+		"CERBERUS_DB_ALIASES":             "warehouse",
+		"CERBERUS_DB_WAREHOUSE_ENGINE":    "postgresql",
+		"CERBERUS_DB_WAREHOUSE_HOST":      "db.internal.example",
+		"CERBERUS_DB_WAREHOUSE_PORT":      "5432",
+		"CERBERUS_DB_WAREHOUSE_DATABASES": "testbed",
+		"CERBERUS_DB_WAREHOUSE_USER":      "reader",
+		"CERBERUS_DB_WAREHOUSE_PASSWORD":  "not-in-any-error",
+	})
+	if err != nil {
+		t.Fatalf("LoadConfigFrom() = %v", err)
+	}
+	return cfg.Settings.RowCap
+}
+
+// sharedColumnCatalogRows reproduces the wide fixture's shape: many narrow tables
+// that all carry one audit column, which is what a two-character pattern matches
+// in every one of them.
+func sharedColumnCatalogRows(tables int) [][]any {
+	rows := make([][]any, 0, tables*4)
+	for i := range tables {
+		table := "series_" + strconv.Itoa(i)
+		rows = append(rows,
+			[]any{"atelier", table, "recorded_at", "timestamp with time zone", true, false, true},
+			[]any{"atelier", table, "released_at", "timestamp with time zone", true, false, true},
+			[]any{"atelier", table, "region", "character varying", false, false, true},
+		)
+	}
+	return rows
+}
+
+// wireBytes renders grouped tables the way internal/mcp does, so a test in this
+// package can measure what the agent would receive without importing the package
+// that imports this one.
+func wireBytes(t *testing.T, tables []SchemaTable) int {
+	t.Helper()
+	type column struct {
+		Name     string `json:"name"`
+		DataType string `json:"data_type"`
+		Nullable bool   `json:"nullable"`
+	}
+	type table struct {
+		Schema  string   `json:"schema"`
+		Table   string   `json:"table"`
+		Columns []column `json:"columns"`
+	}
+	out := make([]table, 0, len(tables))
+	for _, source := range tables {
+		entry := table{Schema: source.Schema, Table: source.Table, Columns: make([]column, 0, len(source.Columns))}
+		for _, c := range source.Columns {
+			entry.Columns = append(entry.Columns, column{Name: c.Name, DataType: c.DataType, Nullable: c.Nullable})
+		}
+		out = append(out, entry)
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal tables: %v", err)
+	}
+	return len(encoded)
 }
 
 type schemaTestConn struct {
@@ -204,6 +410,19 @@ func (c *schemaTestConn) spec() AliasSpec { return c.alias }
 func (c *schemaTestConn) query(_ context.Context, _ string, _ int, _ ...any) (*rowSet, error) {
 	c.queries++
 	return &rowSet{}, nil
+}
+
+// catalogTestConn answers with catalog rows a real statement would have returned,
+// so that the budget can be exercised through the executor rather than only over
+// the grouping function.
+type catalogTestConn struct {
+	schemaTestConn
+	rows [][]any
+}
+
+func (c *catalogTestConn) query(_ context.Context, _ string, _ int, _ ...any) (*rowSet, error) {
+	c.queries++
+	return &rowSet{rows: c.rows}, nil
 }
 
 func (*schemaTestConn) close() {}

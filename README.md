@@ -7,8 +7,12 @@ no statement it cannot establish is a read, and each query is audited with the
 calling identity.
 
 SQL Server has no reproducible grading for the schema-search surface: there is
-no arm64 SQL Server image, so there is no CI container or fixture. Its fixed
-statement is gate-validated and exercised only by hand against the real instance.
+no arm64 SQL Server image, so there is no CI container and no fixture. Its
+fixed statement is gate-validated by a unit test and has not been run against a
+SQL Server at all — not in CI, not against the third-party deployment target,
+not by hand. The gate test proves only that the gate allows the text, so the
+statement's validity as T-SQL is itself ungraded: the first execution of it
+will be the first test of it.
 
 ## Configuration
 
@@ -169,6 +173,45 @@ discovery statement is not a startup failure. It surfaces on the first
 `list_databases` call, as the same agent-facing error any other failed call
 returns — naming no credential, host, port or username — and it is audited like
 any other tool call.
+
+### Searching one database's schema
+
+`list_databases` says what exists on a server; `search_schema` says what is inside
+the one database an alias is bound to. It takes that alias and a plain
+case-insensitive substring — not a `LIKE` expression, because `%` and `_` are
+searched literally — binds that substring to a fixed per-engine catalog statement,
+and returns one entry per matching table with the matching columns inside it, each
+carrying its type and whether it accepts NULL. A pattern shorter than two
+characters is refused before a connection is borrowed. The search never crosses a
+database boundary: a call answers about the alias's own database and nothing else.
+
+Its results are bounded by bytes as well as by rows. `CERBERUS_DB_ROW_CAP` bounds
+the flat catalog rows before they are grouped, and a byte budget then bounds the
+grouped answer; either bound sets `truncated`, and the budget in force is reported
+as `byte_budget` beside `row_cap`. A truncated result is the beginning of what
+matched, and a table listed in one can hold only part of its matching columns, so
+the remedy is to search again with a longer or more specific substring rather than
+to page. The row cap alone would not make "no pattern returns the whole schema"
+true: every table in a schema may carry one column name in common — an audit
+timestamp, a tenant id — so a two-character substring can match a few hundred
+catalog rows, far below the default cap of 1000, and still group into an entry for
+every table in the database.
+
+The byte budget is a constant in the code and deliberately not a `CERBERUS_DB_*`
+setting. The row cap is configurable because it trades completeness against load
+on somebody else's server, and that trade belongs to the operator who runs against
+it. The byte budget trades completeness against the agent's context, which is a
+property of this surface rather than of a deployment — and a bound an operator can
+raise is a bound that can be raised back past the point where a whole catalog fits
+inside it again.
+
+What one call costs is measured rather than derived from the row cap. The
+integration job in `.github/workflows/ci.yml` runs the measurement over the wide
+test fixture on PostgreSQL and MySQL and prints it under "search_schema result
+size" in the job summary: the bytes of the whole MCP result, including the
+duplicate JSON text block the SDK sends beside the structured content, both for a
+search narrow enough to name one table and for the broadest pattern the tool
+accepts. The same test fails if the first exceeds 4 KB or the second 20 KB.
 
 ## Raspberry Pi deployment
 

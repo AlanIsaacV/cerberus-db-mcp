@@ -266,3 +266,35 @@ jobs:
       # flaky; the two are the same change.
       - name: go test -tags integration
         run: go test -tags integration -race -timeout 20m -p 1 ./...
+
+      # The schema-search surface is graded on a byte ceiling, and the ceiling is
+      # only half of what is required: the measured worst case has to be readable
+      # by a person, so that the figure this project quotes for one call is a
+      # measurement rather than a derivation from the row cap. The step above
+      # asserts it and cannot report it — `go test` discards a passing test's log
+      # output unless -v is given, and putting -v on a twenty-minute suite buries
+      # the one line it was for. So that single test runs again, verbosely, and
+      # its measurement goes to the job summary where nobody has to open a log.
+      # It re-runs in seconds against the engines that are already up.
+      #
+      # It is deliberately not run when the step above failed. Go prints a failed
+      # test's log output whatever the flags, so a run that breached the ceiling
+      # already carries the number that breached it.
+      #
+      # -count=1 because the flags a run is cached under include -run and -v: two
+      # invocations that differ only in those can otherwise be answered from the
+      # cache, and a cached run prints no log output at all.
+      - name: report the schema-search worst case
+        shell: bash
+        run: |
+          go test -tags integration -count=1 -timeout 5m \
+            -run '^TestSearchSchemaWireSizeStaysUnderItsBounds$' -v ./internal/mcp/ \
+            | tee "$RUNNER_TEMP/schema-search-size.log"
+          {
+            echo '### search_schema result size'
+            echo
+            echo '```'
+            grep -F 'search_schema wire size' "$RUNNER_TEMP/schema-search-size.log" \
+              || echo 'the measurement did not run'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

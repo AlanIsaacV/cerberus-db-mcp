@@ -302,6 +302,11 @@ func (e *Executor) ListDatabases(ctx context.Context, alias string) (*DatabaseLi
 // LIKE expression. It is trimmed and must contain at least two characters; the
 // bound pattern is then constructed in schemaPattern, which escapes LIKE's
 // metacharacters before adding the two wildcards this package owns.
+//
+// The answer is bounded twice: by the row cap on the flat catalog rows, as every
+// other statement is, and by [SchemaResultBudget] on the grouped result. The
+// second bound is what a short pattern actually runs into — see the constant —
+// and either of them sets Truncated.
 func (e *Executor) SearchSchema(ctx context.Context, alias, pattern string) (*SchemaSearch, error) {
 	c, ok := e.conns[alias]
 	if !ok {
@@ -343,13 +348,18 @@ func (e *Executor) SearchSchema(ctx context.Context, alias, pattern string) (*Sc
 	if err != nil {
 		return nil, executionError(ctx, "search-schema", spec, err)
 	}
+	tables, overBudget := schemaTables(rows.rows, SchemaResultBudget)
 	return &SchemaSearch{
-		Alias:     alias,
-		Engine:    spec.Engine,
-		Decision:  decision,
-		Tables:    schemaTables(rows.rows),
-		Truncated: rows.truncated,
-		RowCap:    e.settings.RowCap,
-		Elapsed:   time.Since(started),
+		Alias:    alias,
+		Engine:   spec.Engine,
+		Decision: decision,
+		Tables:   tables,
+		// The two bounds report as one fact, because they are one fact to the caller:
+		// the answer is a prefix of what matched. Which of them bit is an operator's
+		// question, and the row cap is already reported beside this.
+		Truncated:  rows.truncated || overBudget,
+		RowCap:     e.settings.RowCap,
+		ByteBudget: SchemaResultBudget,
+		Elapsed:    time.Since(started),
 	}, nil
 }

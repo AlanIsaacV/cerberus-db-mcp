@@ -139,8 +139,6 @@ var agentMessages = map[Kind]string{
 	KindInternal:            "the database call failed",
 }
 
-type agentMessage string
-
 // Error is the only failure this package hands to a caller, and it is two-sided
 // on purpose.
 //
@@ -173,10 +171,6 @@ type Error struct {
 	// Detail is the operator-facing text: whatever the engine or the driver
 	// actually said, with the password removed. It is never shown to the agent.
 	Detail string
-	// agentMessage is a package-owned, allowlisted explanation for a local
-	// preflight refusal. It is distinct from Detail so configuration is never
-	// disclosed through [Error.Agent].
-	agentMessage agentMessage
 
 	// cause is the driver's own error, kept so that this package's tests can
 	// assert on an engine's SQLSTATE or error number rather than on its message
@@ -218,16 +212,13 @@ func (e *Error) Unwrap() error {
 }
 
 // Agent is the agent-facing rendering: a sentence chosen from [agentMessages] by
-// [Error.Kind], or a package-owned preflight explanation, plus the gate's own
-// reason when the gate is what refused.
+// [Error.Kind], plus the gate's own reason when the gate is what refused.
 //
-// It never consults [Error.Detail]. That is the whole mechanism, and it is why
+// It never consults [Error.Detail], and there is deliberately no field that
+// could override the chosen sentence. That is the whole mechanism, and it is why
 // there is no list of patterns to keep up to date: a host name cannot appear in
 // this string because no code path puts one there.
 func (e *Error) Agent() string {
-	if e.agentMessage != "" {
-		return string(e.agentMessage)
-	}
 	msg, ok := agentMessages[e.Kind]
 	if !ok {
 		msg = agentMessages[KindInternal]

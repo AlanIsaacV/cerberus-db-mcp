@@ -660,6 +660,7 @@ func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
 			}
 			assertSearchSchemaDoesNotLeakConnection(t, h, jsonOf(t, out))
 			assertSearchSchemaDoesNotLeakConnection(t, h, resultText(t, res))
+			assertTheSchemaFieldSaysItIsNotAnAlias(t, h)
 			for _, forbidden := range []string{"alias", "database", "host", "port", "user", "password"} {
 				if _, found := out[forbidden]; found {
 					t.Errorf("search_schema result has a %q field: %s", forbidden, jsonOf(t, out))
@@ -778,31 +779,257 @@ func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
 	}
 }
 
+// TestSearchSchemaWireSizeStaysUnderItsBounds is acceptance criterion 9, measured
+// where the agent actually pays for it.
+//
+// internal/db has a size test of its own and it is not this one: it marshals
+// db.SchemaSearch, whose field names are not the ones that cross the wire and
+// whose single copy is not what is sent. The SDK emits a typed result twice —
+// once as structured content, once as the duplicate JSON text block the MCP spec
+// asks for — so the cost of one call is the whole CallToolResult, which is what
+// is marshalled here. Everything but the JSON-RPC envelope around it is in that
+// number.
+//
+// The row cap is raised to the shipped default rather than left at the low one
+// this job configures, because the bound under test is the byte budget and the
+// whole reason it exists is that it holds where the row cap does not fire. A cap
+// of 50 truncates the catalog rows long before the budget is reached, and the
+// measurement would then be of the cap.
+//
+// The worst case is a claim about every pattern the tool accepts, and what makes
+// it measurable from two calls is that internal/db's budget bounds the grouped
+// tables whatever the pattern was: a pattern that exhausts the budget produces
+// the largest answer this surface can produce, and truncated is how each call
+// below reports that it did. The two exhaust it from opposite directions — "re"
+// reaches recorded_at in every fixture table, many tables holding one column
+// each; "measure" reaches 250 columns of the one wide table — and the larger of
+// the two is the figure reported.
+func TestSearchSchemaWireSizeStaysUnderItsBounds(t *testing.T) {
+	const (
+		namedTableCeiling = 4 << 10
+		worstCaseCeiling  = 20 << 10
+	)
+	identity := testIdentity()
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			rowCap := shippedRowCap(t)
+			h := wideSchemaSearchHarness(t, engine, identity, func(s *db.Settings) { s.RowCap = rowCap })
+
+			// A pattern that approximately names one table. A column-naming pattern
+			// such as "measure" is not a counter-example to this bound: it answers with
+			// a table's whole matching column list, which is the worst case below and
+			// is what this surface is for.
+			named := h.searchSchema(t, "archive")
+			namedOut, ok := structured(t, named).(map[string]any)
+			if !ok {
+				t.Fatalf("search_schema(archive) returned no structured content: %+v", named)
+			}
+			namedTables, ok := namedOut["tables"].([]any)
+			if !ok || len(namedTables) == 0 {
+				t.Fatalf("search_schema(archive) tables = %s, want the fixture's archive tables; a bound measured over an empty answer is not measured", jsonOf(t, namedOut["tables"]))
+			}
+			namedSize := wireBytes(t, named)
+			if namedSize >= namedTableCeiling {
+				t.Errorf("a search naming one table costs %d bytes on the wire, want under %d", namedSize, namedTableCeiling)
+			}
+
+			worstSize, worstPattern, worstTables, worstColumns := 0, "", 0, 0
+			for _, pattern := range []string{"re", "measure"} {
+				res := h.searchSchema(t, pattern)
+				out, ok := structured(t, res).(map[string]any)
+				if !ok {
+					t.Fatalf("search_schema(%q) returned no structured content: %+v", pattern, res)
+				}
+				if out["truncated"] != true {
+					t.Errorf("search_schema(%q) reports a complete answer at row cap %d, so the byte budget did not bind and this call does not measure the worst case: %s",
+						pattern, rowCap, jsonOf(t, out))
+				}
+				if size := wireBytes(t, res); size > worstSize {
+					worstSize, worstPattern = size, pattern
+					worstTables, worstColumns = countSearchSchemaTables(t, out)
+				}
+			}
+
+			// Read in CI from the job summary of the integration job, which runs this
+			// one test again with -v; `go test` without it discards a passing test's
+			// output, and a number nobody can read does not report anything.
+			t.Logf("search_schema wire size on %s: %d bytes for a search naming one table, worst case %d bytes for pattern %q over %d tables and %d columns at row cap %d",
+				engine, namedSize, worstSize, worstPattern, worstTables, worstColumns, rowCap)
+			if worstSize >= worstCaseCeiling {
+				t.Errorf("the worst schema search costs %d bytes on the wire for pattern %q, want under %d", worstSize, worstPattern, worstCaseCeiling)
+			}
+		})
+	}
+}
+
+// wireBytes is what one tool call cost the agent: the result object the SDK sent,
+// both copies of the payload included.
+func wireBytes(t *testing.T, res *sdk.CallToolResult) int {
+	t.Helper()
+	encoded, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal the tool result: %v", err)
+	}
+	return len(encoded)
+}
+
+// shippedRowCap is the cap a deployment that configures nothing runs under. This
+// job deliberately configures a much lower one, and a test about the bound that
+// applies when the row cap does not fire has to ask for the shipped value rather
+// than assume the environment it is running in.
+//
+// The alias it declares is MySQL because a PostgreSQL one would make internal/db
+// consult the process's own PGSERVICE, and a value there would turn reading a
+// default into a failure that has nothing to do with this measurement.
+func shippedRowCap(t *testing.T) int {
+	t.Helper()
+	cfg, err := db.LoadConfigFrom(map[string]string{
+		"CERBERUS_DB_ALIASES":             "warehouse",
+		"CERBERUS_DB_WAREHOUSE_ENGINE":    "mysql",
+		"CERBERUS_DB_WAREHOUSE_HOST":      "db.internal.example",
+		"CERBERUS_DB_WAREHOUSE_PORT":      "3306",
+		"CERBERUS_DB_WAREHOUSE_DATABASES": "testbed",
+		"CERBERUS_DB_WAREHOUSE_USER":      "reader",
+		"CERBERUS_DB_WAREHOUSE_PASSWORD":  "not-in-any-error",
+	})
+	if err != nil {
+		t.Fatalf("db.LoadConfigFrom() = %v", err)
+	}
+	return cfg.Settings.RowCap
+}
+
+func countSearchSchemaTables(t *testing.T, out map[string]any) (tables, columns int) {
+	t.Helper()
+	raw, ok := out["tables"].([]any)
+	if !ok {
+		t.Fatalf("tables = %s, want an array", jsonOf(t, out["tables"]))
+	}
+	for i, entry := range raw {
+		table, ok := entry.(map[string]any)
+		if !ok {
+			t.Fatalf("tables[%d] = %s, want an object", i, jsonOf(t, entry))
+		}
+		list, ok := table["columns"].([]any)
+		if !ok {
+			t.Fatalf("tables[%d].columns = %s, want an array", i, jsonOf(t, table["columns"]))
+		}
+		columns += len(list)
+	}
+	return len(raw), columns
+}
+
 // assertSearchSchemaDoesNotLeakConnection checks the values an MCP result has no
-// reason to contain. PostgreSQL's configured database is distinct from returned
-// schemas, so it is checked too. MySQL's schema is its database by definition
-// and is a required result field, so treating that one expected schema value as a
-// credential leak would make the required grouped result impossible; the absence
-// of a database or alias field above is the boundary in that dialect.
+// reason to contain.
+//
+// The host, the port, the username and the password are checked against the text
+// as it stands: none of them has any place in a schema search on any engine.
+//
+// The database name is different and is checked differently, because on MySQL it
+// is a value the result legitimately carries — tables[].schema is the database
+// the alias is bound to, since internal/db's statement filters on DATABASE().
+// Asserting its absence there would fail on the correct answer; exempting the
+// engine, which is what this did before, is not grading the criterion on the one
+// engine where the value appears at all. So the schema fields are redacted and
+// the name is asserted absent from everything that is left: it may appear as a
+// table's namespace and nowhere else. What that leaves — that a namespace is not
+// something to pass back as an alias — is not a property of a value and cannot be
+// asserted over one, so it is graded over the tool's advertised schema by
+// assertTheSchemaFieldSaysItIsNotAnAlias.
 func assertSearchSchemaDoesNotLeakConnection(t *testing.T, h engineHarness, text string) {
 	t.Helper()
-	values := map[string]string{
+	for label, value := range map[string]string{
 		"the host":     h.spec.Host,
 		"the port":     strconv.Itoa(h.spec.Port),
 		"the username": h.spec.User,
 		"the password": string(h.spec.Password),
-	}
-	if h.spec.Engine != gate.MySQL {
-		values["the database name"] = h.spec.Database
-	}
-	for label, value := range values {
+	} {
 		if value != "" && strings.Contains(text, value) {
 			t.Errorf("the client-visible schema-search result contains %s (%q): %q", label, value, text)
 		}
 	}
+	if h.spec.Database == "" {
+		return
+	}
+	if remainder := withoutTableNamespaces(t, text); strings.Contains(remainder, h.spec.Database) {
+		t.Errorf("the client-visible schema-search result names the database (%q) somewhere other than a table's schema field: %q", h.spec.Database, remainder)
+	}
 }
 
-func wideSchemaSearchHarness(t *testing.T, engine gate.Engine, identity auth.Identity) engineHarness {
+// withoutTableNamespaces is the result with every tables[].schema value removed,
+// so that what remains can be searched for a name the field is allowed to hold.
+func withoutTableNamespaces(t *testing.T, text string) string {
+	t.Helper()
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(text), &decoded); err != nil {
+		t.Fatalf("the client-visible schema-search result is not a JSON object (%v): %q", err, text)
+	}
+	tables, ok := decoded["tables"].([]any)
+	if !ok {
+		t.Fatalf("the schema-search result carries no tables array: %q", text)
+	}
+	for i, raw := range tables {
+		table, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("tables[%d] = %s, want an object", i, jsonOf(t, raw))
+		}
+		delete(table, "schema")
+	}
+	return jsonOf(t, decoded)
+}
+
+// assertTheSchemaFieldSaysItIsNotAnAlias grades the half of criterion 10 that a
+// value cannot carry. On MySQL a returned schema is the alias's own database
+// name, and the thing that must not happen is that an agent reads it as an alias
+// and hands it to execute_query. Nothing in the payload can say so — the tool's
+// advertised output schema is where the agent is told, so that is what is
+// asserted, on every engine because it is one description for all three.
+func assertTheSchemaFieldSaysItIsNotAnAlias(t *testing.T, h engineHarness) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	list, err := h.session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+
+	var tool *sdk.Tool
+	for _, candidate := range list.Tools {
+		if candidate.Name == ToolSearchSchema {
+			tool = candidate
+		}
+	}
+	if tool == nil {
+		t.Fatalf("tools/list carries no %s", ToolSearchSchema)
+	}
+
+	node, ok := tool.OutputSchema.(map[string]any)
+	if !ok {
+		t.Fatalf("%s output schema = %s, want an object", ToolSearchSchema, jsonOf(t, tool.OutputSchema))
+	}
+	for _, step := range []string{"properties", "tables", "items", "properties", "schema"} {
+		next, ok := node[step].(map[string]any)
+		if !ok {
+			t.Fatalf("%s output schema has no %q on the way to a table's schema field: %s", ToolSearchSchema, step, jsonOf(t, tool.OutputSchema))
+		}
+		node = next
+	}
+	description, _ := node["description"].(string)
+
+	// Both halves are required. "not an alias" is the refusal the agent needs; the
+	// engine's name is what makes it actionable on MySQL, where the value is the
+	// database's own name and the agent would otherwise have to guess what it is.
+	for _, want := range []string{"not an alias", string(gate.MySQL)} {
+		if !strings.Contains(description, want) {
+			t.Errorf("the advertised description of a table's schema field does not mention %q, so an agent reading a database name there is told nothing: %q", want, description)
+		}
+	}
+}
+
+// wideSchemaSearchHarness is the whole stack over the database that holds the
+// wide fixture. adjust changes the settings both the executor and the returned
+// harness run under, so a test that needs bounds other than the job's own
+// configuration cannot end up asserting against the ones it did not get.
+func wideSchemaSearchHarness(t *testing.T, engine gate.Engine, identity auth.Identity, adjust ...func(*db.Settings)) engineHarness {
 	t.Helper()
 	cfg, spec := liveConfig(t, engine)
 	if engine == gate.MySQL {
@@ -811,13 +1038,27 @@ func wideSchemaSearchHarness(t *testing.T, engine gate.Engine, identity auth.Ide
 		spec.Alias = "schema-search-ledger"
 		spec.Database = "ledger"
 	}
-	executor := executorFor(t, &db.Config{Settings: cfg.Settings, Aliases: []db.AliasSpec{spec}}, engine, spec.Alias)
+	settings := cfg.Settings
+	for _, a := range adjust {
+		a(&settings)
+	}
+	executor := executorFor(t, &db.Config{Settings: settings, Aliases: []db.AliasSpec{spec}}, engine, spec.Alias)
 	return engineHarness{
 		harness:  connect(t, executor, admittingEveryRequestAs(identity)),
 		spec:     spec,
 		alias:    spec.Alias,
-		settings: cfg.Settings,
+		settings: settings,
 	}
+}
+
+// searchSchema calls the tool and fails the test if the call did not answer.
+func (h engineHarness) searchSchema(t *testing.T, pattern string) *sdk.CallToolResult {
+	t.Helper()
+	res := h.call(t, ToolSearchSchema, map[string]any{"alias": h.alias, "pattern": pattern})
+	if res.IsError {
+		t.Fatalf("search_schema(%q) failed: %s", pattern, resultText(t, res))
+	}
+	return res
 }
 
 // TestListDatabasesTellsTheAgentNothingWhenItCannotConnect is the no-leak half of

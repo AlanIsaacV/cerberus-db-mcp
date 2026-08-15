@@ -127,20 +127,33 @@ type SchemaSearchColumn struct {
 
 // SchemaSearchTable is one matching table. A table matched only by its own name
 // has an empty Columns list, because no column name matched the substring.
+// The schema description states what the value is on each engine rather than one
+// word that is true on two of them. On MySQL a table's schema is the database the
+// alias is bound to, so the field carries a database name there; on PostgreSQL
+// and SQL Server it is a namespace inside that database. It carries the same
+// "not an alias" marker as every other name this surface returns, for the reason
+// [ListDatabasesResult] does: an agent that hands one to execute_query as its
+// alias is told the alias is unknown.
 type SchemaSearchTable struct {
-	Schema  string               `json:"schema" jsonschema:"the table's schema or namespace within the configured database"`
+	Schema  string               `json:"schema" jsonschema:"the namespace to qualify this table with inside the database the alias is bound to: on mysql that database's own name, on postgresql and sqlserver a schema within it; a name here is not an alias"`
 	Table   string               `json:"table" jsonschema:"the matching table's name"`
 	Columns []SchemaSearchColumn `json:"columns" jsonschema:"the columns whose names match the substring; empty when only the table name matched"`
 }
 
 // SearchSchemaResult is the grouped catalog answer. Truncated needs particular
-// care: the row cap applies to flat catalog rows before internal/db groups them,
-// so a true value can mean a returned table has only part of its matching columns
-// and must not be treated as a complete table description.
+// care: two bounds can set it — the row cap on the flat catalog rows before
+// internal/db groups them, and the byte budget on the grouped result — and under
+// either one a returned table can hold only part of its matching columns and must
+// not be treated as a complete table description.
+//
+// ByteBudget is reported for the reason RowCap is. It is the bound a short
+// pattern actually runs into, and an agent told only that its answer was cut off
+// cannot tell whether to narrow the pattern or to page.
 type SearchSchemaResult struct {
-	Tables    []SchemaSearchTable `json:"tables" jsonschema:"one entry per matching table, each with its matching columns"`
-	Truncated bool                `json:"truncated" jsonschema:"true when the row cap stopped flat catalog rows before grouping; a returned table can then have only part of its matching column list and is incomplete"`
-	RowCap    int                 `json:"row_cap" jsonschema:"the row cap that applied to the flat catalog rows before grouping"`
+	Tables     []SchemaSearchTable `json:"tables" jsonschema:"one entry per matching table, each with its matching columns"`
+	Truncated  bool                `json:"truncated" jsonschema:"true when the answer was cut short, by the row cap on the catalog rows or by the byte budget on this result; the tables listed are then the beginning of what matched, a listed table can have only part of its matching column list, and a narrower pattern is what returns a complete answer"`
+	RowCap     int                 `json:"row_cap" jsonschema:"the row cap that applied to the flat catalog rows before grouping"`
+	ByteBudget int                 `json:"byte_budget" jsonschema:"the most bytes this result's tables may occupy; a broad pattern reaches this bound long before the row cap"`
 }
 
 // internalFailure is what the agent is told when this layer produced an error
@@ -217,7 +230,7 @@ func (s *Server) registerTools(srv *sdk.Server) {
 		Name: ToolSearchSchema,
 		Description: "Find tables and columns in the one database an alias is bound to, by a plain case-insensitive substring; aliases not bound to one database are refused. " +
 			"Pass an alias from list_connections and ordinary text such as archive or measure; do not write LIKE wildcards, because % and _ are searched literally. " +
-			"Results are grouped by table and capped under the same server-configured row limit reported by list_connections. If truncated is true, the cap applied before grouping, so a returned table can have only part of its matching columns and is incomplete.",
+			"Results are grouped by table, capped under the same server-configured row limit reported by list_connections, and bounded again by a byte budget so that no pattern can return the whole schema. If truncated is true, the tables listed are only the beginning of what matched and a listed table can have only part of its matching columns: search again with a longer or more specific substring rather than treating the answer as complete.",
 		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true},
 	}, s.searchSchema)
 }
@@ -427,10 +440,17 @@ func (s *Server) searchSchema(ctx context.Context, _ *sdk.CallToolRequest, in Se
 		}
 	}
 
+	// A nil *CallToolResult with a typed value makes the SDK emit the value twice:
+	// once as structured content and once as a duplicate JSON text block. That
+	// doubling is deliberate here — it is what the MCP spec asks of a tool with
+	// structured output, and a client that ignores structuredContent would
+	// otherwise receive an empty result — and internal/db's byte budget is set at
+	// half the ceiling this surface is graded against because of it.
 	return nil, &SearchSchemaResult{
-		Tables:    tables,
-		Truncated: search.Truncated,
-		RowCap:    search.RowCap,
+		Tables:     tables,
+		Truncated:  search.Truncated,
+		RowCap:     search.RowCap,
+		ByteBudget: search.ByteBudget,
 	}, nil
 }
 
