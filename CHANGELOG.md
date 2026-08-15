@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.2.2 - 2026-08-15
+
+
+### Fixes
+
+- Say which table's column list the budget cut
+
+
 ## v0.2.1 - 2026-08-15
 
 
