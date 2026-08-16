@@ -415,8 +415,8 @@ func TestSearchSchemaReportsTheBudgetItApplied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchSchema() = %v", err)
 	}
-	if !search.Truncated {
-		t.Error("SearchSchema reported a complete answer for a search the budget cut off")
+	if search.Truncation != ByteBudgetTruncation {
+		t.Errorf("SearchSchema truncation = %q, want %q for a search the budget cut off", search.Truncation, ByteBudgetTruncation)
 	}
 	if search.ByteBudget != SchemaResultBudget {
 		t.Errorf("ByteBudget = %d, want %d", search.ByteBudget, SchemaResultBudget)
@@ -444,11 +444,41 @@ func TestSearchSchemaLeavesASmallAnswerWhole(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchSchema() = %v", err)
 	}
-	if search.Truncated {
-		t.Error("SearchSchema reported one table as partial")
+	if search.Truncation != NoTruncation {
+		t.Errorf("SearchSchema truncation = %q, want %q for one complete table", search.Truncation, NoTruncation)
 	}
 	if len(search.Tables) != 1 || len(search.Tables[0].Columns) != 1 {
 		t.Errorf("Tables = %#v, want atelier.archive with its one matching column", search.Tables)
+	}
+}
+
+// TestSearchSchemaNamesTheRowCap keeps the other half of the empty-column-list
+// ambiguity visible without a container. A row cap cuts before schemaTables sees
+// every flat row, so it cannot set ColumnsTruncated on the name-matched table it
+// leaves behind; the top-level cause is the only truthful signal in that shape.
+func TestSearchSchemaNamesTheRowCap(t *testing.T) {
+	g, err := gate.New("")
+	if err != nil {
+		t.Fatalf("gate.New: %v", err)
+	}
+	c := &catalogTestConn{
+		schemaTestConn: schemaTestConn{alias: AliasSpec{Alias: "warehouse", Engine: gate.PostgreSQL, Database: "testbed"}},
+		rows: [][]any{
+			{"atelier", "archive", "id", "bigint", false, true, false},
+		},
+		truncated: true,
+	}
+	e := &Executor{gate: g, settings: pgSettings(), conns: map[string]conn{"warehouse": c}}
+
+	search, err := e.SearchSchema(context.Background(), "warehouse", "archive")
+	if err != nil {
+		t.Fatalf("SearchSchema() = %v", err)
+	}
+	if search.Truncation != RowCapTruncation {
+		t.Errorf("SearchSchema truncation = %q, want %q", search.Truncation, RowCapTruncation)
+	}
+	if len(search.Tables) != 1 || len(search.Tables[0].Columns) != 0 || search.Tables[0].ColumnsTruncated {
+		t.Errorf("Tables = %#v, want a row-cap-cut name match with no byte-budget marker", search.Tables)
 	}
 }
 
@@ -536,12 +566,13 @@ func (c *schemaTestConn) query(_ context.Context, _ string, _ int, _ ...any) (*r
 // the grouping function.
 type catalogTestConn struct {
 	schemaTestConn
-	rows [][]any
+	rows      [][]any
+	truncated bool
 }
 
 func (c *catalogTestConn) query(_ context.Context, _ string, _ int, _ ...any) (*rowSet, error) {
 	c.queries++
-	return &rowSet{rows: c.rows}, nil
+	return &rowSet{rows: c.rows, truncated: c.truncated}, nil
 }
 
 func (*schemaTestConn) close() {}

@@ -205,6 +205,20 @@ const postgresDatabases = "SELECT datname FROM pg_database WHERE NOT datistempla
 // even though both table and column names are compared to it.
 const postgresSchemaSearch = "WITH pattern AS (SELECT $1 AS value) SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable = 'YES' AS is_nullable, c.table_name ILIKE pattern.value ESCAPE '!' AS table_name_matched, c.column_name ILIKE pattern.value ESCAPE '!' AS column_name_matched FROM information_schema.columns AS c JOIN information_schema.tables AS t ON t.table_schema = c.table_schema AND t.table_name = c.table_name JOIN pattern ON true WHERE t.table_type = 'BASE TABLE' AND c.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND c.table_schema NOT LIKE 'pg_temp_%' AND c.table_schema NOT LIKE 'pg_toast_temp_%' AND (c.table_name ILIKE pattern.value ESCAPE '!' OR c.column_name ILIKE pattern.value ESCAPE '!') ORDER BY c.table_schema, c.table_name, c.column_name"
 
+// postgresDescribeColumns reads pg_catalog rather than information_schema. The
+// latter filters columns by privilege and can therefore return a short, silent
+// answer a caller would incorrectly treat as a complete table description.
+const postgresDescribeColumns = "WITH target AS (SELECT $1 AS table_name, $2 AS schema_name) SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid JOIN target ON true WHERE c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped AND c.relname = target.table_name AND (target.schema_name = '' OR n.nspname = target.schema_name) ORDER BY n.nspname, c.relname, a.attnum"
+
+// postgresDescribePrimaryKey orders catalog key columns with array_position.
+// unnest(... WITH ORDINALITY) is more idiomatic but the gate reads its ORDINALITY
+// form as a second statement, so this is the gate-legal equivalent.
+const postgresDescribePrimaryKey = "WITH target AS (SELECT $1 AS table_name, $2 AS schema_name) SELECT n.nspname, c.relname, a.attname FROM pg_catalog.pg_index AS i JOIN pg_catalog.pg_class AS c ON c.oid = i.indrelid JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) JOIN target ON true WHERE i.indisprimary AND c.relname = target.table_name AND (target.schema_name = '' OR n.nspname = target.schema_name) ORDER BY n.nspname, c.relname, array_position(i.indkey::smallint[], a.attnum)"
+
+// postgresDescribeIndexes uses the same catalog ordering rule as primary keys;
+// it is deliberately not WITH ORDINALITY because the gate refuses that syntax.
+const postgresDescribeIndexes = "WITH target AS (SELECT $1 AS table_name, $2 AS schema_name) SELECT n.nspname, c.relname, ic.relname, a.attname, i.indisunique FROM pg_catalog.pg_index AS i JOIN pg_catalog.pg_class AS c ON c.oid = i.indrelid JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace JOIN pg_catalog.pg_class AS ic ON ic.oid = i.indexrelid JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) JOIN target ON true WHERE NOT i.indisprimary AND c.relname = target.table_name AND (target.schema_name = '' OR n.nspname = target.schema_name) ORDER BY n.nspname, c.relname, ic.relname, array_position(i.indkey::smallint[], a.attnum)"
+
 // postgresSystemDatabases are the databases a cluster creates for itself.
 //
 // The two templates are named as well as being excluded by datistemplate above,

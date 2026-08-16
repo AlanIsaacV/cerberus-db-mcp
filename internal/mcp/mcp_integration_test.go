@@ -69,12 +69,99 @@ func engineIsRequired(t *testing.T, engine gate.Engine) bool {
 	return false
 }
 
+// skipOrFail is internal/db's helper, duplicated here with its rule intact. It
+// fails outright only for an engine requireEnginesVar insists on. The other half
+// of the rule cannot be decided per test: a run that reached none of the servers
+// its CERBERUS_DB_* block declares graded nothing, and Go's exit code does not
+// distinguish a suite that skipped everything from one that passed everything —
+// but whether this engine's silence leaves the run empty is a property of the
+// whole run, so the skip is recorded and [TestMain] passes the verdict.
+//
+// An environment that declares no alias for this engine still skips quietly, and
+// so does one whose other engines answered. That is what keeps the suite runnable
+// with no containers at all, what keeps CI — which declares no SQL Server — green
+// over the SQL Server tests, and what keeps a declared server behind a VPN that is
+// down from reddening a run over the containers that are up.
 func skipOrFail(t *testing.T, required bool, engine gate.Engine, reason string) {
 	t.Helper()
 	if required {
 		t.Fatalf("%s names %s, so this is a failure and not a skip: %s", requireEnginesVar, engine, reason)
 	}
+	if engineIsConfigured(engine) {
+		enginesThatDidNotAnswer[engine] = reason
+	}
 	t.Skip(reason)
+}
+
+// The engines this run asked and what came of asking them, accumulated across
+// every test in the package for [TestMain] to read. internal/db keeps its own
+// copy of this, for the reason skipOrFail is duplicated.
+//
+// Neither map is synchronised: this package runs no test in parallel with
+// another, which several tests here already depend on — TestSignalShutsDownAndClosesEveryPool
+// sends the process a real SIGTERM.
+var (
+	enginesThatAnswered     = map[gate.Engine]bool{}
+	enginesThatDidNotAnswer = map[gate.Engine]string{}
+)
+
+// noteEngineAnswered records that a declared server was reached and read from.
+// One of these is what entitles every other engine to a skip. It is called from
+// [executorFor], which every harness in this package goes through.
+func noteEngineAnswered(engine gate.Engine) { enginesThatAnswered[engine] = true }
+
+// TestMain adds the verdict Go's exit code cannot carry. `go test` reports a
+// package where every test skipped exactly as it reports one where every test
+// passed, so a CERBERUS_DB_* block whose servers are all down produced a green
+// run that had established nothing.
+//
+// The rule is the narrow one: the run fails only when it asked at least one
+// declared engine and no engine answered at all. Demanding a particular engine is
+// requireEnginesVar's job, which is what CI uses.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if code == 0 {
+		if reason, nothing := nothingWasGraded(); nothing {
+			fmt.Fprintln(os.Stderr, reason)
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
+
+// nothingWasGraded reports whether the run has to fail and what to say, naming
+// every engine that was asked and did not answer: the run is only readable if it
+// says which server the block declared and could not reach.
+func nothingWasGraded() (string, bool) {
+	if len(enginesThatAnswered) > 0 || len(enginesThatDidNotAnswer) == 0 {
+		return "", false
+	}
+	var names, lines []string
+	for _, engine := range gate.Engines() {
+		if reason, asked := enginesThatDidNotAnswer[engine]; asked {
+			names = append(names, string(engine))
+			lines = append(lines, fmt.Sprintf("\t%s: %s", engine, reason))
+		}
+	}
+	return fmt.Sprintf("FAIL: nothing was graded. The environment declares a server for %s, this run asked and none of them answered, so every fixture assertion skipped:\n%s",
+		strings.Join(names, ", "), strings.Join(lines, "\n")), true
+}
+
+// engineIsConfigured reports whether the environment declares an alias for this
+// engine. It reads the environment itself rather than taking a caller's
+// configuration, because one of the paths into [skipOrFail] is there precisely
+// because loading one failed.
+func engineIsConfigured(engine gate.Engine) bool {
+	cfg, err := db.LoadConfig()
+	if err != nil {
+		return false
+	}
+	for _, spec := range cfg.Aliases {
+		if spec.Engine == engine {
+			return true
+		}
+	}
+	return false
 }
 
 // engineHarness is one engine's alias reached through the whole stack: real
@@ -121,8 +208,9 @@ func executorFor(t *testing.T, cfg *db.Config, engine gate.Engine, alias string)
 	}
 	t.Cleanup(e.Close)
 
-	// A configured alias that cannot be reached is a skip and not a failure,
-	// unless the run insisted on this engine.
+	// A configured alias that cannot be reached goes through skipOrFail, which
+	// records it: the environment declared this engine, and a run that reached none
+	// of the engines it declares graded nothing.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if _, err := e.Execute(ctx, alias, "SELECT 1", nil); err != nil {
@@ -131,6 +219,7 @@ func executorFor(t *testing.T, cfg *db.Config, engine gate.Engine, alias string)
 		}
 		t.Fatalf("the configured %s alias %q rejected SELECT 1: %v", engine, alias, err)
 	}
+	noteEngineAnswered(engine)
 	return e
 }
 
@@ -795,6 +884,270 @@ func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
 	}
 }
 
+// TestSearchSchemaNamesTheBoundAcrossTheWire exercises the three values through
+// the real MCP handler and both live catalogs. The row-cap case deliberately
+// leaves a table-name match with an empty column list and columns_truncated false:
+// without the top-level cause, that shape falsely claims no column matched.
+func TestSearchSchemaNamesTheBoundAcrossTheWire(t *testing.T) {
+	identity := testIdentity()
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			for _, tt := range []struct {
+				name       string
+				pattern    string
+				adjust     func(*db.Settings)
+				truncation db.Truncation
+			}{
+				{
+					name:       "complete",
+					pattern:    "archive",
+					adjust:     func(s *db.Settings) { s.RowCap = 300 },
+					truncation: db.NoTruncation,
+				},
+				{
+					name:       "row cap",
+					pattern:    "archive",
+					adjust:     func(s *db.Settings) { s.RowCap = 2 },
+					truncation: db.RowCapTruncation,
+				},
+				{
+					name:       "byte budget",
+					pattern:    "measure",
+					adjust:     func(s *db.Settings) { s.RowCap = shippedRowCap(t) },
+					truncation: db.ByteBudgetTruncation,
+				},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					h := wideSchemaSearchHarness(t, engine, identity, tt.adjust)
+					out, ok := structured(t, h.searchSchema(t, tt.pattern)).(map[string]any)
+					if !ok {
+						t.Fatalf("search_schema(%q) returned no structured content", tt.pattern)
+					}
+					if got := out["truncation"]; got != string(tt.truncation) {
+						t.Errorf("search_schema(%q) truncation = %#v, want %q", tt.pattern, got, tt.truncation)
+					}
+					if tt.truncation == db.RowCapTruncation {
+						tables, ok := out["tables"].([]any)
+						if !ok || len(tables) != 1 {
+							t.Fatalf("row-cap tables = %s, want one partial archive entry", jsonOf(t, out["tables"]))
+						}
+						table, ok := tables[0].(map[string]any)
+						if !ok || table["columns_truncated"] != false {
+							t.Errorf("row-cap table = %s, want no byte-budget marker", jsonOf(t, tables[0]))
+						}
+						columns, ok := table["columns"].([]any)
+						if !ok || len(columns) != 0 {
+							t.Errorf("row-cap columns = %s, want the ambiguous empty list the top-level cause resolves", jsonOf(t, table["columns"]))
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestDescribeTableReachesTheAgentFromTheWideFixture checks the catalog answer
+// after it has crossed the MCP boundary. internal/db has already established the
+// per-engine reads; this test guards the field-by-field mapping, the descriptions
+// which stop a returned namespace being mistaken for an alias, and the audit
+// record the handler adds around that answer.
+func TestDescribeTableReachesTheAgentFromTheWideFixture(t *testing.T) {
+	wantIdentity := testIdentity()
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			h := wideSchemaSearchHarness(t, engine, wantIdentity)
+			schema := describeFixtureSchema(engine)
+
+			res := h.describeTable(t, "multi_index_probe", schema)
+			out, ok := structured(t, res).(map[string]any)
+			if !ok {
+				t.Fatalf("describe_table returned no structured content: %+v", res)
+			}
+			assertDescribeTableDoesNotLeakConnection(t, h, jsonOf(t, out))
+			assertDescribeTableDoesNotLeakConnection(t, h, resultText(t, res))
+			assertDescribeTableSchemaFieldSaysItIsNotAnAlias(t, h)
+			for _, forbidden := range []string{"alias", "database", "host", "port", "user", "password"} {
+				if _, found := out[forbidden]; found {
+					t.Errorf("describe_table result has a %q field: %s", forbidden, jsonOf(t, out))
+				}
+			}
+
+			table := oneDescribedTable(t, out, schema, "multi_index_probe")
+			assertMultiIndexProbeColumns(t, table)
+			if table["columns_truncated"] != false {
+				t.Errorf("complete describe columns_truncated = %#v, want false", table["columns_truncated"])
+			}
+			if got := jsonOf(t, table["primary_key"]); got != `["id"]` {
+				t.Errorf("primary_key = %s, want [\"id\"]", got)
+			}
+			if got := jsonOf(t, table["indexes"]); got != `[{"columns":["title"],"name":"ix_multi_index_probe_title","unique":false},{"columns":["batch_code"],"name":"uq_multi_index_probe_batch_code","unique":true},{"columns":["serial_code"],"name":"ux_multi_index_probe_serial_code","unique":true}]` {
+				t.Errorf("indexes = %s, want every named secondary index with its key order and uniqueness", got)
+			}
+			if got := out["truncation"]; got != string(db.NoTruncation) {
+				t.Errorf("truncation = %#v, want %q", got, db.NoTruncation)
+			}
+			if got, want := out["row_cap"], float64(h.settings.RowCap); got != want {
+				t.Errorf("row_cap = %v, want %v", got, want)
+			}
+
+			// The fixture chose this index specifically because alphabetical order and
+			// reverse order both produce a plausible but wrong answer. It verifies the
+			// positional order reaches an agent, rather than merely that an index exists.
+			ordered := h.describeTable(t, "multi_column_index_probe", schema)
+			orderedOut, ok := structured(t, ordered).(map[string]any)
+			if !ok {
+				t.Fatalf("describe_table(multi_column_index_probe) returned no structured content: %+v", ordered)
+			}
+			orderedTable := oneDescribedTable(t, orderedOut, schema, "multi_column_index_probe")
+			if got := jsonOf(t, orderedTable["indexes"]); got != `[{"columns":["recorded_at","title","amount"],"name":"ix_multi_column_index_probe_recorded_at_title_amount","unique":false}]` {
+				t.Errorf("multi-column indexes = %s, want the catalog key order", got)
+			}
+
+			// The invalid argument exits after the fixed catalog statements have passed
+			// the gate. It must still become the same safe agent message and an audit
+			// event, rather than becoming a second handler-specific error path.
+			invalid := h.call(t, ToolDescribeTable, map[string]any{"alias": h.alias, "table": "", "schema": schema})
+			if !invalid.IsError {
+				t.Fatal("describe_table accepted an empty table name")
+			}
+			if got, want := resultText(t, invalid), (&db.Error{Kind: db.KindInvalidArgument}).Agent(); got != want {
+				t.Errorf("the client was told %q, want the invalid-argument message %q", got, want)
+			}
+
+			events := h.auditEventsFor(t, ToolDescribeTable)
+			if len(events) != 3 {
+				t.Fatalf("got %d audit events for three calls:\n%s", len(events), h.audit.String())
+			}
+			for i, want := range []struct {
+				outcome   Outcome
+				errorKind db.Kind
+			}{
+				{OutcomeAllowed, ""},
+				{OutcomeAllowed, ""},
+				{OutcomeFailed, db.KindInvalidArgument},
+			} {
+				event := events[i]
+				for field, wantValue := range map[string]any{
+					"tool":       ToolDescribeTable,
+					"identity":   wantIdentity.Email,
+					"subject":    wantIdentity.Subject,
+					"alias":      h.alias,
+					"engine":     string(engine),
+					"outcome":    string(want.outcome),
+					"verdict":    string(gate.Allow),
+					"error_kind": string(want.errorKind),
+					// The statements are owned by internal/db and have no agent-facing
+					// spelling to put in the audit stream.
+					"statement": "",
+				} {
+					if got := event[field]; got != wantValue {
+						t.Errorf("event %d: %s = %#v, want %#v", i, field, got, wantValue)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestDescribeTableKeepsKeyAndIndexesWhenTheColumnReadIsCapped tests the shape
+// the tool is built to preserve. CI runs with a row cap of 50, well below this
+// fixture's 257 columns, but the independent key and index reads still fit and
+// must survive whole rather than being silently shortened with the column list.
+func TestDescribeTableKeepsKeyAndIndexesWhenTheColumnReadIsCapped(t *testing.T) {
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			// Set the CI cap explicitly: this is a test of the promise at that
+			// operational bound, not a coincidence of whichever environment invokes it.
+			h := wideSchemaSearchHarness(t, engine, testIdentity(), func(s *db.Settings) { s.RowCap = 50 })
+			out, ok := structured(t, h.describeTable(t, "wide_composite_key_probe", describeFixtureSchema(engine))).(map[string]any)
+			if !ok {
+				t.Fatal("describe_table(wide_composite_key_probe) returned no structured content")
+			}
+			table := oneDescribedTable(t, out, describeFixtureSchema(engine), "wide_composite_key_probe")
+			columns, ok := table["columns"].([]any)
+			if !ok || len(columns) == 0 || len(columns) >= 257 {
+				t.Errorf("wide columns = %s, want the short non-empty prefix at the CI row cap", jsonOf(t, table["columns"]))
+			}
+			if got := out["truncation"]; got != string(db.RowCapTruncation) {
+				t.Errorf("wide truncation = %#v, want %q at row cap %d", got, db.RowCapTruncation, h.settings.RowCap)
+			}
+			if got := jsonOf(t, table["primary_key"]); got != `["series_no","area_code"]` {
+				t.Errorf("wide primary_key = %s, want [\"series_no\",\"area_code\"]", got)
+			}
+			if got := jsonOf(t, table["indexes"]); got != `[{"columns":["title"],"name":"ix_wide_composite_key_probe_title","unique":false}]` {
+				t.Errorf("wide indexes = %s, want its complete secondary index list", got)
+			}
+		})
+	}
+}
+
+// TestDescribeTableWireSizeStaysUnderItsBounds measures the whole MCP result,
+// including the SDK's duplicate JSON text block. The wide probe's gauge_NNN
+// columns are deliberately the shortest filler family in the fixture, so more
+// of them fit under internal/db's byte budget than the longer measure_NNN names.
+// PostgreSQL additionally measures the unqualified two-schema call, because its
+// table-entry prefix is the largest shape describe_table can return.
+func TestDescribeTableWireSizeStaysUnderItsBounds(t *testing.T) {
+	const (
+		namedTableCeiling = 4 << 10
+		worstCaseCeiling  = 20 << 10
+	)
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			rowCap := shippedRowCap(t)
+			h := wideSchemaSearchHarness(t, engine, testIdentity(), func(s *db.Settings) { s.RowCap = rowCap })
+			schema := describeFixtureSchema(engine)
+
+			named := h.describeTable(t, "multi_index_probe", schema)
+			namedOut, ok := structured(t, named).(map[string]any)
+			namedTables, tablesOK := namedOut["tables"].([]any)
+			if !ok || !tablesOK || len(namedTables) == 0 {
+				t.Fatalf("describe_table(multi_index_probe) = %s, want the fixture table", jsonOf(t, namedOut))
+			}
+			namedSize := wireBytes(t, named)
+			if namedSize >= namedTableCeiling {
+				t.Errorf("a describe of one small table costs %d bytes on the wire, want under %d", namedSize, namedTableCeiling)
+			}
+
+			wideSchema := schema
+			wideScope := "qualified"
+			if engine == gate.PostgreSQL {
+				// The two schemas both hold this table. Leaving schema absent is the
+				// real worst case: it exercises the shared result budget across table
+				// entries rather than measuring only one entry in isolation.
+				wideSchema = ""
+				wideScope = "unqualified two-schema"
+			}
+			wide := h.describeTable(t, "wide_composite_key_probe", wideSchema)
+			wideOut, ok := structured(t, wide).(map[string]any)
+			if !ok {
+				t.Fatalf("describe_table(wide_composite_key_probe) returned no structured content: %+v", wide)
+			}
+			wideTable := oneDescribedTable(t, wideOut, schema, "wide_composite_key_probe")
+			if got := wideOut["truncation"]; got != string(db.ByteBudgetTruncation) {
+				t.Errorf("wide truncation = %#v at row cap %d, want %q so the byte budget binds: %s", got, rowCap, db.ByteBudgetTruncation, jsonOf(t, wideOut))
+			}
+			if got := jsonOf(t, wideTable["primary_key"]); got != `["series_no","area_code"]` {
+				t.Errorf("wide primary_key = %s, want its complete ordered key", got)
+			}
+			if got := jsonOf(t, wideTable["indexes"]); got != `[{"columns":["title"],"name":"ix_wide_composite_key_probe_title","unique":false}]` {
+				t.Errorf("wide indexes = %s, want its complete index list", got)
+			}
+			if wideTable["columns_truncated"] != true {
+				t.Errorf("wide columns_truncated = %#v, want true because the byte budget cut this entry", wideTable["columns_truncated"])
+			}
+			wideSize := wireBytes(t, wide)
+			// CI has a separate verbose invocation for this test: passing t.Logf output
+			// is not printed by ordinary go test, so the figure would otherwise not be
+			// reported where the acceptance criterion says it must be visible.
+			t.Logf("describe_table wire size on %s: %d bytes for multi_index_probe and %d bytes for %s wide_composite_key_probe at row cap %d", engine, namedSize, wideSize, wideScope, rowCap)
+			if wideSize >= worstCaseCeiling {
+				t.Errorf("the widest describe_table result costs %d bytes on the wire, want under %d", wideSize, worstCaseCeiling)
+			}
+		})
+	}
+}
+
 // TestSearchSchemaWireSizeStaysUnderItsBounds is acceptance criterion 9, measured
 // where the agent actually pays for it.
 //
@@ -812,11 +1165,18 @@ func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
 // of 50 truncates the catalog rows long before the budget is reached, and the
 // measurement would then be of the cap.
 //
+// Three shapes are measured, and the third is the point of the tool. A pattern
+// that matches by table name alone comes back with an empty column list, and the
+// worst case comes back with as much as the budget buys; between them is the call
+// an agent makes when it knows roughly what it wants — one table named, a few of
+// that table's columns with it — which no figure in this repository covered until
+// namesake_probe was added to the fixture to make it producible at all.
+//
 // The worst case is a claim about every pattern the tool accepts, and what makes
 // it approachable from a handful of calls is that internal/db's budget bounds the
 // grouped tables whatever the pattern was: no pattern can be answered with more
-// than the budget's worth of entries, and truncated is how each call below reports
-// that its answer was cut there. What that argument gives is the order of the
+// than the budget's worth of entries, and truncation is how each call below names
+// the bound that cut its answer. What that argument gives is the order of the
 // figure, not the figure — the budget is spent in an accounting of its own, and
 // how many wire bytes a spent budget buys depends on the shape of what it bought.
 // So what is reported here is the largest of three patterns hand-picked to exhaust
@@ -828,6 +1188,14 @@ func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
 // three and would need a pattern of its own added to the loop below — the fixture
 // is grown by hand, so noticing that is a person's job and this sentence is the
 // only thing that asks them to.
+//
+// That job has been done once since it was written, for namesake_probe: it is not
+// such a family. Its four matching columns are named longer than gauge_NNN and
+// there are four of them in one table rather than 250, so no pattern reaching them
+// can approach the budget, and the winning patterns are unchanged — "gauge" on
+// PostgreSQL, "re" on MySQL. What it did add is one more table for "re" to reach
+// through recorded_at, in both schemas on PostgreSQL and in the one database this
+// harness binds on MySQL.
 //
 // "gauge" is not redundant with "measure" even though both cut inside one wide
 // table. The budget is charged in bytes, so a shorter column name lets more
@@ -877,6 +1245,33 @@ func TestSearchSchemaWireSizeStaysUnderItsBounds(t *testing.T) {
 				t.Errorf("a search naming one table costs %d bytes on the wire, want under %d", namedSize, namedTableCeiling)
 			}
 
+			// The call this tool exists for, measured here for the first time. Both
+			// figures around it are extremes: "archive" matches by table name alone,
+			// which internal/db answers with an empty column list, and the loop below
+			// exhausts the budget. What an agent actually does — name the one table it
+			// means and get back the few columns of it it cares about — sits between
+			// them and was never a number.
+			//
+			// What the answer must contain is asserted by the shared namesake helper
+			// rather than restated here, so that this measurement and the sequence test
+			// that begins with the same call cannot come to disagree about the fixture.
+			cheap := h.searchSchema(t, namesakePattern)
+			cheapOut, ok := structured(t, cheap).(map[string]any)
+			if !ok {
+				t.Fatalf("search_schema(%q) returned no structured content: %+v", namesakePattern, cheap)
+			}
+			assertNamesakeSearchFoundTheTableAndItsColumns(t, engine, cheapOut, describeFixtureSchema(engine))
+			cheapEntries, cheapColumns := countSearchSchemaTables(t, cheapOut)
+			cheapSize := wireBytes(t, cheap)
+			if cheapSize >= namedTableCeiling {
+				t.Errorf("a search naming one table and %d of its columns costs %d bytes on the wire, want under %d", len(namesakeMatchedColumns), cheapSize, namedTableCeiling)
+			}
+			// Read in CI from the job summary, like the worst-case line below: the
+			// wording carries "search_schema wire size" because that is what the
+			// workflow's grep selects.
+			t.Logf("search_schema wire size on %s: %d bytes for the call the tool exists for, pattern %q over %d entries and %d matching columns at row cap %d",
+				engine, cheapSize, namesakePattern, cheapEntries, cheapColumns, rowCap)
+
 			worstSize, worstPattern, worstTables, worstColumns := 0, "", 0, 0
 			for _, pattern := range []string{"re", "measure", "gauge"} {
 				res := h.searchSchema(t, pattern)
@@ -884,9 +1279,9 @@ func TestSearchSchemaWireSizeStaysUnderItsBounds(t *testing.T) {
 				if !ok {
 					t.Fatalf("search_schema(%q) returned no structured content: %+v", pattern, res)
 				}
-				if out["truncated"] != true {
-					t.Errorf("search_schema(%q) reports a complete answer at row cap %d, so the byte budget did not bind and this call does not measure the worst case: %s",
-						pattern, rowCap, jsonOf(t, out))
+				if out["truncation"] != string(db.ByteBudgetTruncation) {
+					t.Errorf("search_schema(%q) truncation = %#v at row cap %d, want %q so the byte budget binds and this call measures the worst case: %s",
+						pattern, out["truncation"], rowCap, db.ByteBudgetTruncation, jsonOf(t, out))
 				}
 				if pattern == "measure" || pattern == "gauge" {
 					// The budget binds here, and it binds inside one wide table: 250 matching
@@ -925,6 +1320,298 @@ func wireBytes(t *testing.T, res *sdk.CallToolResult) int {
 		t.Fatalf("marshal the tool result: %v", err)
 	}
 	return len(encoded)
+}
+
+// agentSequenceCeiling is the whole promise the sequence tests measure — that an
+// agent can find a table and its columns in a schema it has never seen for less
+// than this much of its context — expressed as the serialised bytes of one
+// four-call sequence.
+const agentSequenceCeiling = 25 << 10
+
+// sequenceMeter sums what a sequence of tool calls cost the agent's context.
+//
+// Two tests walk that sequence: TestAgentSequenceCostOnTheWire against the
+// compose fixture on every push, and TestSQLServerAgentSequenceCostOnTheWire by
+// hand against an instance no job can reach. The entire reason the pair exists is
+// that their two figures are directly comparable, and a second copy of this
+// arithmetic is how they would stop being.
+type sequenceMeter struct {
+	t     *testing.T
+	total int
+}
+
+// measure adds one call's whole CallToolResult to the total and hands back its
+// structured content.
+//
+// The figure is the whole result rather than internal/db's: the SDK sends a typed
+// result twice, once as structured content and once as the duplicate JSON text
+// block the MCP spec asks for, so measuring the payload alone would report about
+// half of what the agent actually pays.
+func (m *sequenceMeter) measure(label string, res *sdk.CallToolResult) map[string]any {
+	m.t.Helper()
+	size := wireBytes(m.t, res)
+	m.total += size
+	// The text block is one copy of the payload, logged beside the whole result so
+	// the gap between them is a figure in the output rather than an inference: the
+	// difference is the second copy plus the envelope, and it is why this
+	// measurement cannot be taken over an internal/db result.
+	m.t.Logf("wire size: %s cost %d bytes, carrying a %d-byte payload the SDK sends twice", label, size, len(resultText(m.t, res)))
+	out, ok := structured(m.t, res).(map[string]any)
+	if !ok {
+		m.t.Fatalf("%s returned no structured content: %+v", label, res)
+	}
+	return out
+}
+
+// reportAgainstTheCeiling states the total and fails when it breaches
+// agentSequenceCeiling. where says which run produced the figure, since one
+// binary reports this line once per engine.
+//
+// The wording carries "agent sequence" because .github/workflows/ci.yml greps for
+// it to build the job summary, and "wire size" in [sequenceMeter.measure] is
+// selected the same way. Both are coupled to that workflow by string agreement
+// and nothing else.
+func (m *sequenceMeter) reportAgainstTheCeiling(where string) {
+	m.t.Helper()
+	verdict := "under"
+	if m.total > agentSequenceCeiling {
+		verdict = "over"
+	}
+	m.t.Logf("the whole agent sequence %s cost %d bytes on the wire, %s the %d-byte ceiling", where, m.total, verdict, agentSequenceCeiling)
+	if m.total > agentSequenceCeiling {
+		m.t.Errorf("the agent sequence cost %d bytes on the wire, want at most %d", m.total, agentSequenceCeiling)
+	}
+}
+
+// describedSelect is the statement a sequence's fourth call runs, together with
+// the parts of it a later assertion has to name: what it restricts on and where.
+//
+// Callers populate what their own assertions read. The SQL Server sequence needs
+// all four, because it reads a window of key values back out of the table it just
+// described and has to spell both names the way T-SQL wants them; the fixture
+// sequence writes bare identifiers into one statement and reads only the key
+// column back.
+type describedSelect struct {
+	statement string
+	qualified string
+	key       string
+	keyColumn string
+}
+
+// namesTable reports whether a catalog answer contains one exact schema-qualified
+// table.
+func namesTable(t *testing.T, out map[string]any, schema, table string) bool {
+	t.Helper()
+	tables, ok := out["tables"].([]any)
+	if !ok {
+		t.Fatalf("the answer carries no tables array: %s", jsonOf(t, out))
+	}
+	for _, raw := range tables {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("a table entry is %s, want an object", jsonOf(t, raw))
+		}
+		if entry["schema"] == schema && entry["table"] == table {
+			return true
+		}
+	}
+	return false
+}
+
+// assertRowBoundIsOnTheWire checks the half of the reporting rule that applies to
+// a flat result: whether the row cap cut it, and the cap's own value beside the
+// answer so the agent can tell a full page from a coincidence.
+func assertRowBoundIsOnTheWire(t *testing.T, h engineHarness, out map[string]any, label string) {
+	t.Helper()
+	if _, ok := out["truncated"].(bool); !ok {
+		t.Errorf("%s does not say whether the row cap cut it: %s", label, jsonOf(t, out))
+	}
+	if got, want := out["row_cap"], float64(h.settings.RowCap); got != want {
+		t.Errorf("%s row_cap = %#v, want the cap that applied (%v)", label, got, want)
+	}
+}
+
+// assertCatalogBoundsAreOnTheWire is the same rule over a catalog answer, which
+// has two bounds rather than one and names which of them cut it.
+//
+// When the byte budget is what cut it, the answer also has to be a strict prefix:
+// the entry the cut fell in is the last one and it is the only one that may say
+// its column list is partial.
+func assertCatalogBoundsAreOnTheWire(t *testing.T, h engineHarness, out map[string]any, label string) {
+	t.Helper()
+	truncation, _ := out["truncation"].(string)
+	switch db.Truncation(truncation) {
+	case db.NoTruncation, db.RowCapTruncation, db.ByteBudgetTruncation:
+	default:
+		t.Errorf("%s truncation = %#v, want one of %v", label, out["truncation"],
+			[]db.Truncation{db.NoTruncation, db.RowCapTruncation, db.ByteBudgetTruncation})
+	}
+	if got, want := out["row_cap"], float64(h.settings.RowCap); got != want {
+		t.Errorf("%s row_cap = %#v, want the cap that applied (%v)", label, got, want)
+	}
+	if budget, ok := out["byte_budget"].(float64); !ok || budget <= 0 {
+		t.Errorf("%s does not report the byte budget it was assembled under: %s", label, jsonOf(t, out))
+	}
+	if db.Truncation(truncation) == db.ByteBudgetTruncation {
+		assertTheCutTableSaysSo(t, out)
+	}
+	t.Logf("%s reports truncation %q under row cap %v and byte budget %v", label, truncation, out["row_cap"], out["byte_budget"])
+}
+
+// keyColumnIndex locates the restricted column in the answer's own column list,
+// which is the only thing that says where its values sit: the projection order is
+// the statement's, and the result reports it rather than the caller assuming it.
+func keyColumnIndex(t *testing.T, query map[string]any, name string) int {
+	t.Helper()
+	columns, ok := query["columns"].([]any)
+	if !ok {
+		t.Fatalf("the result carries no columns array: %s", jsonOf(t, query))
+	}
+	for i, raw := range columns {
+		if column, ok := raw.(string); ok && column == name {
+			return i
+		}
+	}
+	t.Fatalf("the result names %s, none of them the column the statement restricts on", jsonOf(t, columns))
+	return -1
+}
+
+// leadingKeyColumn is the first column of the described primary key, or of the
+// first described index when the table has no primary key.
+func leadingKeyColumn(t *testing.T, table map[string]any) string {
+	t.Helper()
+	if key, ok := table["primary_key"].([]any); ok && len(key) > 0 {
+		if name, ok := key[0].(string); ok {
+			return name
+		}
+	}
+	indexes, ok := table["indexes"].([]any)
+	if !ok {
+		return ""
+	}
+	for _, raw := range indexes {
+		index, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		columns, ok := index["columns"].([]any)
+		if !ok || len(columns) == 0 {
+			continue
+		}
+		if name, ok := columns[0].(string); ok {
+			return name
+		}
+	}
+	return ""
+}
+
+// stringField reads one required string out of a decoded result.
+func stringField(t *testing.T, out map[string]any, field string) string {
+	t.Helper()
+	value, ok := out[field].(string)
+	if !ok || value == "" {
+		t.Fatalf("the result has no %s: %s", field, jsonOf(t, out))
+	}
+	return value
+}
+
+// The namesake fixture contract, stated once for the two tests that turn on it:
+// TestSearchSchemaWireSizeStaysUnderItsBounds, which measures what that call
+// costs, and TestAgentSequenceCostOnTheWire, which walks the sequence it begins.
+//
+// tools/wide-schema emits namesake_probe into every schema and database of the
+// wide fixture, and it is the only table there whose own name and several of its
+// column names share a substring — which is what lets one pattern reach a table
+// *and* a handful of its columns, and therefore what makes this the call the tool
+// exists for rather than a name-only match that comes back with no columns at all.
+const (
+	namesakeTable     = "namesake_probe"
+	namesakePattern   = "namesake"
+	namesakeKeyColumn = "id"
+	// The seeded rows are id = 1..5 consecutive, and the sequence's restriction
+	// keeps those above namesakeKeyFloor. Both numbers are named rather than
+	// inlined because the assertion that the restriction dropped rows is arithmetic
+	// over the pair: it is only a claim about restricting if fewer rows come back
+	// than the table holds, and that comparison needs to know both.
+	namesakeSeededRows = 5
+	namesakeKeyFloor   = 2
+)
+
+// namesakeMatchedColumns are the columns namesakePattern reaches, in the order a
+// search answers with: alphabetical, because search_schema's catalog statements
+// end in ORDER BY column_name while describe_table's order by ordinal position.
+// The two tools answer about the same table in different orders on purpose — a
+// search result is a set of matches, a description is the table — so writing the
+// fixture's DDL order here would fail. The table's other six columns do not carry
+// the substring, which is what makes the answer a handful of columns rather than
+// the whole table.
+var namesakeMatchedColumns = []string{"namesake_code", "namesake_label", "namesake_rank", "namesake_state"}
+
+// assertNamesakeSearchFoundTheTableAndItsColumns grades the narrow question the
+// namesake fixture exists to make askable: the pattern reached the table by its
+// own name, and the answer carries only the columns sharing that substring, each
+// with a type an agent can pick its columns off.
+//
+// The expected number of entries is per engine because the two aliases reach
+// different amounts of schema, not because the tool behaves differently. The
+// PostgreSQL alias is bound to testbed, whose atelier and harbor schemas both hold
+// this table; the MySQL one is bound to ledger alone, since MySQL has no schema
+// below the database. Both are the same one-table answer repeated as many times as
+// the alias can see it.
+func assertNamesakeSearchFoundTheTableAndItsColumns(t *testing.T, engine gate.Engine, search map[string]any, schema string) {
+	t.Helper()
+	wantEntries := 1
+	if engine == gate.PostgreSQL {
+		wantEntries = 2
+	}
+	entries, columns := countSearchSchemaTables(t, search)
+	t.Logf("search_schema(%q) matched %d tables and %d columns", namesakePattern, entries, columns)
+	if entries != wantEntries || columns != wantEntries*len(namesakeMatchedColumns) {
+		t.Errorf("search_schema(%q) matched %d tables and %d columns, want %d and %d: %s",
+			namesakePattern, entries, columns, wantEntries, wantEntries*len(namesakeMatchedColumns), jsonOf(t, search["tables"]))
+	}
+	if !namesTable(t, search, schema, namesakeTable) {
+		t.Errorf("search_schema(%q) did not find %s.%s, the table the pattern is the name of: %s", namesakePattern, schema, namesakeTable, jsonOf(t, search))
+	}
+	// A truncated answer would make the column count above a statement about the
+	// budget rather than about the table, and both callers would then be measuring a
+	// cut result on a fixture that is supposed to fit.
+	if got := search["truncation"]; got != string(db.NoTruncation) {
+		t.Errorf("search_schema(%q) truncation = %#v, want %q: this pattern reaches one small table and nothing here should be cut", namesakePattern, got, db.NoTruncation)
+	}
+
+	tables, _ := search["tables"].([]any)
+	for i, raw := range tables {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("tables[%d] = %s, want an object", i, jsonOf(t, raw))
+		}
+		if entry["table"] != namesakeTable {
+			t.Errorf("tables[%d] = %s, want %s", i, jsonOf(t, entry), namesakeTable)
+		}
+		if entry["columns_truncated"] != false {
+			t.Errorf("tables[%d] columns_truncated = %#v, want false: this answer is complete", i, entry["columns_truncated"])
+		}
+		list, ok := entry["columns"].([]any)
+		if !ok || len(list) == 0 {
+			t.Fatalf("tables[%d] columns = %s, want the columns the pattern names; an empty list is the table-name-only shape and not the call this is about", i, jsonOf(t, entry["columns"]))
+		}
+		names := make([]string, 0, len(list))
+		for j, rawColumn := range list {
+			column, ok := rawColumn.(map[string]any)
+			if !ok {
+				t.Fatalf("tables[%d] columns[%d] = %s, want an object", i, j, jsonOf(t, rawColumn))
+			}
+			name, _ := column["name"].(string)
+			names = append(names, name)
+			if dataType, _ := column["data_type"].(string); dataType == "" {
+				t.Errorf("tables[%d] columns[%d] = %s, want a data type: an agent picks its columns off these", i, j, jsonOf(t, column))
+			}
+		}
+		if !slices.Equal(names, namesakeMatchedColumns) {
+			t.Errorf("tables[%d] columns = %v, want exactly %v", i, names, namesakeMatchedColumns)
+		}
+	}
 }
 
 // shippedRowCap is the cap a deployment that configures nothing runs under. This
@@ -1054,6 +1741,167 @@ func withoutTableNamespaces(t *testing.T, text string) string {
 	return jsonOf(t, decoded)
 }
 
+// assertDescribeTableDoesNotLeakConnection is the describe_table counterpart of
+// assertSearchSchemaDoesNotLeakConnection. A MySQL table schema is its database
+// name, so that one legitimate field is removed before the remaining result is
+// searched; every other connection value has no place in this response at all.
+func assertDescribeTableDoesNotLeakConnection(t *testing.T, h engineHarness, text string) {
+	t.Helper()
+	for label, value := range map[string]string{
+		"the host":     h.spec.Host,
+		"the port":     strconv.Itoa(h.spec.Port),
+		"the username": h.spec.User,
+		"the password": string(h.spec.Password),
+	} {
+		if value != "" && strings.Contains(text, value) {
+			t.Errorf("the client-visible describe-table result contains %s (%q): %q", label, value, text)
+		}
+	}
+	if h.spec.Database == "" {
+		return
+	}
+	if remainder := withoutDescribedTableNamespaces(t, text); strings.Contains(remainder, h.spec.Database) {
+		t.Errorf("the client-visible describe-table result names the database (%q) somewhere other than a table's schema field: %q", h.spec.Database, remainder)
+	}
+}
+
+// withoutDescribedTableNamespaces removes every tables[].schema value from a
+// describe_table result before a MySQL database name is treated as a leak.
+func withoutDescribedTableNamespaces(t *testing.T, text string) string {
+	t.Helper()
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(text), &decoded); err != nil {
+		t.Fatalf("the client-visible describe-table result is not a JSON object (%v): %q", err, text)
+	}
+	tables, ok := decoded["tables"].([]any)
+	if !ok {
+		t.Fatalf("the describe-table result carries no tables array: %q", text)
+	}
+	for i, raw := range tables {
+		table, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("tables[%d] = %s, want an object", i, jsonOf(t, raw))
+		}
+		delete(table, "schema")
+	}
+	return jsonOf(t, decoded)
+}
+
+// assertDescribeTableSchemaFieldSaysItIsNotAnAlias checks the advertised
+// metadata rather than a payload value. The sentence is what keeps a MySQL
+// database name in tables[].schema from being passed back as an alias.
+func assertDescribeTableSchemaFieldSaysItIsNotAnAlias(t *testing.T, h engineHarness) {
+	t.Helper()
+	description := describeTableFieldDescription(t, h, "schema")
+	for _, want := range []string{"not an alias", string(gate.MySQL)} {
+		if !strings.Contains(description, want) {
+			t.Errorf("the advertised description of a described table's schema field does not mention %q: %q", want, description)
+		}
+	}
+}
+
+// describeTableFieldDescription reads one field of describe_table's advertised
+// result schema through tools/list, the same view an MCP client receives.
+func describeTableFieldDescription(t *testing.T, h engineHarness, field string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	list, err := h.session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var tool *sdk.Tool
+	for _, candidate := range list.Tools {
+		if candidate.Name == ToolDescribeTable {
+			tool = candidate
+		}
+	}
+	if tool == nil {
+		t.Fatalf("tools/list carries no %s", ToolDescribeTable)
+	}
+	node, ok := tool.OutputSchema.(map[string]any)
+	if !ok {
+		t.Fatalf("%s output schema = %s, want an object", ToolDescribeTable, jsonOf(t, tool.OutputSchema))
+	}
+	for _, step := range []string{"properties", "tables", "items", "properties", field} {
+		next, ok := node[step].(map[string]any)
+		if !ok {
+			t.Fatalf("%s output schema has no %q on the way to a table's %s field: %s", ToolDescribeTable, step, field, jsonOf(t, tool.OutputSchema))
+		}
+		node = next
+	}
+	description, _ := node["description"].(string)
+	return description
+}
+
+func describeFixtureSchema(engine gate.Engine) string {
+	if engine == gate.MySQL {
+		return "ledger"
+	}
+	return "atelier"
+}
+
+// oneDescribedTable returns the qualified fixture table, keeping every caller's
+// cardinality assertion explicit: a table absent from the wire is not an empty
+// description of it, and an unqualified duplicate must not silently satisfy a
+// test intended to read one table.
+func oneDescribedTable(t *testing.T, out map[string]any, schema, name string) map[string]any {
+	t.Helper()
+	tables, ok := out["tables"].([]any)
+	if !ok || len(tables) != 1 {
+		t.Fatalf("tables = %s, want exactly %s.%s", jsonOf(t, out["tables"]), schema, name)
+	}
+	table, ok := tables[0].(map[string]any)
+	if !ok {
+		t.Fatalf("tables[0] = %s, want an object", jsonOf(t, tables[0]))
+	}
+	if table["schema"] != schema || table["table"] != name {
+		t.Fatalf("table = %s, want %s.%s", jsonOf(t, table), schema, name)
+	}
+	return table
+}
+
+func assertMultiIndexProbeColumns(t *testing.T, table map[string]any) {
+	t.Helper()
+	columns, ok := table["columns"].([]any)
+	if !ok || len(columns) != 8 {
+		t.Fatalf("columns = %s, want all eight multi_index_probe columns", jsonOf(t, table["columns"]))
+	}
+	wantNames := map[string]bool{
+		"id": false, "title": false, "note": false, "amount": false,
+		"active": false, "recorded_at": false, "serial_code": false, "batch_code": false,
+	}
+	for i, raw := range columns {
+		column, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("columns[%d] = %s, want an object", i, jsonOf(t, raw))
+		}
+		name, nameOK := column["name"].(string)
+		dataType, typeOK := column["data_type"].(string)
+		nullable, nullableOK := column["nullable"].(bool)
+		if !nameOK || !typeOK || dataType == "" || !nullableOK {
+			t.Errorf("columns[%d] = %s, want a name, type and nullability boolean", i, jsonOf(t, column))
+			continue
+		}
+		if _, found := wantNames[name]; !found {
+			t.Errorf("columns[%d].name = %q, want one of the fixture's eight columns", i, name)
+			continue
+		}
+		if wantNames[name] {
+			t.Errorf("columns repeats %q: %s", name, jsonOf(t, columns))
+		}
+		wantNames[name] = true
+		if wantNullable := name == "note"; nullable != wantNullable {
+			t.Errorf("columns[%d] %q nullable = %v, want %v", i, name, nullable, wantNullable)
+		}
+	}
+	for name, found := range wantNames {
+		if !found {
+			t.Errorf("columns = %s, missing %q", jsonOf(t, columns), name)
+		}
+	}
+}
+
 // assertTheSchemaFieldSaysItIsNotAnAlias grades the half of criterion 10 that a
 // value cannot carry. On MySQL a returned schema is the alias's own database
 // name, and the thing that must not happen is that an agent reads it as an alias
@@ -1153,6 +2001,16 @@ func wideSchemaSearchHarness(t *testing.T, engine gate.Engine, identity auth.Ide
 	}
 }
 
+// listDatabases calls the tool and fails the test if it did not answer.
+func (h engineHarness) listDatabases(t *testing.T) *sdk.CallToolResult {
+	t.Helper()
+	res := h.call(t, ToolListDatabases, map[string]any{"alias": h.alias})
+	if res.IsError {
+		t.Fatalf("list_databases failed: %s", resultText(t, res))
+	}
+	return res
+}
+
 // searchSchema calls the tool and fails the test if the call did not answer.
 func (h engineHarness) searchSchema(t *testing.T, pattern string) *sdk.CallToolResult {
 	t.Helper()
@@ -1161,6 +2019,61 @@ func (h engineHarness) searchSchema(t *testing.T, pattern string) *sdk.CallToolR
 		t.Fatalf("search_schema(%q) failed: %s", pattern, resultText(t, res))
 	}
 	return res
+}
+
+// describeTable calls the fixed metadata tool and keeps its success check with
+// the other live-fixture helpers, so the individual assertions stay about the
+// answer that crossed the transport rather than about protocol mechanics.
+func (h engineHarness) describeTable(t *testing.T, table, schema string) *sdk.CallToolResult {
+	t.Helper()
+	args := map[string]any{"alias": h.alias, "table": table}
+	if schema != "" {
+		args["schema"] = schema
+	}
+	res := h.call(t, ToolDescribeTable, args)
+	if res.IsError {
+		t.Fatalf("describe_table(%q, %q) failed: %s", table, schema, resultText(t, res))
+	}
+	return res
+}
+
+// TestDescribeTableTellsTheAgentNothingWhenItCannotConnect ensures the handler
+// sends failures through refuseOrFail rather than exposing a catalog, driver or
+// configured connection detail. The wrong credential provokes a real driver
+// failure while leaving the working fixture untouched.
+func TestDescribeTableTellsTheAgentNothingWhenItCannotConnect(t *testing.T) {
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			h := setUpEngine(t, engine)
+			broken := h.spec
+			broken.Password = db.Secret("definitely-not-the-password")
+			wrong := brokenAliasHarness(t, broken, h.settings)
+
+			res := wrong.call(t, ToolDescribeTable, map[string]any{"alias": broken.Alias, "table": "multi_index_probe"})
+			wrong.assertAgentMessage(t, res, db.KindUnavailable)
+			// The working alias differs only in the credential, and checking it as
+			// well proves a replacement error path did not expose the original config.
+			h.assertNothingAboutTheConnection(t, resultText(t, res))
+
+			events := wrong.auditEventsFor(t, ToolDescribeTable)
+			if len(events) != 1 {
+				t.Fatalf("got %d audit events for one failed call:\n%s", len(events), wrong.audit.String())
+			}
+			for field, wantValue := range map[string]any{
+				"tool":       ToolDescribeTable,
+				"alias":      broken.Alias,
+				"engine":     string(engine),
+				"outcome":    string(OutcomeFailed),
+				"verdict":    string(gate.Allow),
+				"error_kind": string(db.KindUnavailable),
+				"statement":  "",
+			} {
+				if got := events[0][field]; got != wantValue {
+					t.Errorf("%s = %#v, want %#v", field, got, wantValue)
+				}
+			}
+		})
+	}
 }
 
 // TestListDatabasesTellsTheAgentNothingWhenItCannotConnect is the no-leak half of

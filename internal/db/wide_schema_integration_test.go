@@ -28,7 +28,26 @@ const (
 	fixtureMultiColumnIndexTable = "multi_column_index_probe"
 	fixtureMultiIndexTable       = "multi_index_probe"
 	fixtureWideCompositeTable    = "wide_composite_key_probe"
+
+	// The table whose own name recurs in four of its ten column names, so that one
+	// search pattern reaches a table and a handful of that table's columns at once.
+	// It is also the fixture's only table with rows.
+	fixtureNamesakePrefix = "namesake"
+	fixtureNamesakeTable  = fixtureNamesakePrefix + "_probe"
 )
+
+// What tools/wide-schema seeds into fixtureNamesakeTable, stated here as literals
+// the way every other fixture shape in this file is: the keys are consecutive and
+// not one repeated value, which is what lets a strict restriction on the key drop
+// rows instead of being a tautology.
+const fixtureNamesakeSeededRows = 5
+
+var fixtureNamesakeSeededKeys = []string{"1", "2", "3", "4", "5"}
+
+// How many of fixtureNamesakeTable's columns carry the prefix. The search call this
+// table exists for is graded on getting exactly these back for a pattern that also
+// names the table.
+const fixtureNamesakePrefixedColumns = 4
 
 // wideFixtureTableNames is in the generator's order, which is thematic and not
 // sorted: wideFixtureShape derives a table's default key from its ordinal here, so
@@ -40,7 +59,7 @@ var wideFixtureTableNames = []string{
 	"uplink", "vessel", "waypoint", "yearbook", "zenith", "alcove", "bastion", "cairn", "drift", "estuary",
 	"foundry", "gallery", "horizon", "inlet", "journey", "kiosk", "lookout", "mosaic", "notion", "outpost",
 	"pier", "quiver", "roost", "summit", "thicket", "union_hall", "veranda", "workshop", "yonder", "zephyr",
-	fixtureMultiColumnIndexTable, fixtureMultiIndexTable, fixtureWideCompositeTable,
+	fixtureMultiColumnIndexTable, fixtureMultiIndexTable, fixtureWideCompositeTable, fixtureNamesakeTable,
 }
 
 type wideFixtureColumn struct {
@@ -74,8 +93,8 @@ func TestWideSchemaFixture(t *testing.T) {
 		t.Run(string(engine), func(t *testing.T) {
 			h := wideFixtureHarness(t, engine)
 			tables := wideFixtureTables(engine)
-			if len(tables) != 106 {
-				t.Fatalf("fixture declaration has %d tables, want 106", len(tables))
+			if len(tables) != 108 {
+				t.Fatalf("fixture declaration has %d tables, want 108", len(tables))
 			}
 			assertWideFixtureTableCounts(t, h, engine)
 
@@ -275,9 +294,130 @@ func assertFixtureWideCompositeKey(t *testing.T, h harness, engine gate.Engine, 
 	}
 }
 
+// TestNamesakeSubstringNamesOneTable grades what the cheap search call rests on:
+// across every schema and database of the fixture, the prefix reaches one table name
+// and that table's four prefixed columns, and nothing else at all.
+//
+// It is not a restatement of the generator. The generator can only promise that it
+// writes the prefix where it means to; whether some other table or filler family has
+// since taken the word is a question about the whole fixture, and the catalog is the
+// only place it can be asked. If one ever does, the pattern quietly starts naming two
+// tables and the call it was chosen for stops being that call — with every assertion
+// about it still green.
+func TestNamesakeSubstringNamesOneTable(t *testing.T) {
+	for _, engine := range containerEngines {
+		t.Run(string(engine), func(t *testing.T) {
+			h := wideFixtureHarness(t, engine)
+			schemas := wideFixtureSchemas(engine)
+			statement := fmt.Sprintf("SELECT table_schema, table_name, column_name FROM information_schema.columns WHERE table_schema IN ('%s') AND (table_name LIKE '%%%s%%' OR column_name LIKE '%%%s%%') ORDER BY table_schema, table_name, column_name",
+				strings.Join(schemas, "', '"), fixtureNamesakePrefix, fixtureNamesakePrefix)
+			result, err := h.Execute(context.Background(), h.alias, statement, nil)
+			if err != nil {
+				t.Fatalf("catalog search for %q = %v", fixtureNamesakePrefix, err)
+			}
+
+			prefixedColumns := map[string]int{}
+			for _, row := range result.Rows {
+				if len(row) != 3 {
+					t.Fatalf("catalog row = %v, want three values", row)
+				}
+				schema, table, column := fixtureCatalogValue(row[0]), fixtureCatalogValue(row[1]), fixtureCatalogValue(row[2])
+				if table != fixtureNamesakeTable {
+					t.Errorf("%s.%s matches %q as well, so the pattern no longer names one table", schema, table, fixtureNamesakePrefix)
+					continue
+				}
+				if strings.Contains(column, fixtureNamesakePrefix) {
+					prefixedColumns[schema]++
+				}
+			}
+			for _, schema := range schemas {
+				if prefixedColumns[schema] != fixtureNamesakePrefixedColumns {
+					t.Errorf("%s.%s has %d columns matching %q, want %d", schema, fixtureNamesakeTable, prefixedColumns[schema], fixtureNamesakePrefix, fixtureNamesakePrefixedColumns)
+				}
+			}
+		})
+	}
+}
+
+// TestSeededFixtureRowsAreWhereTheGeneratorSaysTheyAre grades the header's claim
+// about rows: the seeded table carries its rows in every schema and database, and
+// every other fixture table is still empty.
+//
+// Both halves matter and the second one more. Tests across two packages read the
+// probe tables for their shapes while asserting nothing about their contents, and
+// rows arriving in one of them would not fail anything here — it would change what
+// some unrelated measurement measures. Counting all of them is cheap precisely
+// because they are empty.
+//
+// The keys are read and compared rather than counted, because a restriction on the
+// key is what a later measurement uses to show rows being dropped: five rows all
+// carrying the same key would satisfy a count and grade nothing.
+func TestSeededFixtureRowsAreWhereTheGeneratorSaysTheyAre(t *testing.T) {
+	for _, engine := range containerEngines {
+		t.Run(string(engine), func(t *testing.T) {
+			h := wideFixtureHarness(t, engine)
+			for _, schema := range wideFixtureSchemas(engine) {
+				t.Run(schema, func(t *testing.T) {
+					for _, name := range wideFixtureTableNames {
+						qualified := schema + "." + name
+						if name != fixtureNamesakeTable {
+							if count := fixtureRowCount(t, h, qualified); count != "0" {
+								t.Errorf("%s holds %s rows; the fixture seeds %s and nothing else", qualified, count, fixtureNamesakeTable)
+							}
+							continue
+						}
+
+						keys := fixtureCatalogStrings(t, h,
+							fmt.Sprintf("SELECT id FROM %s ORDER BY id", qualified),
+							wideFixtureTable{schema: schema, name: name}, "seeded keys")
+						if !sameFixtureStrings(keys, fixtureNamesakeSeededKeys) {
+							t.Errorf("%s holds keys %v, want %v", qualified, keys, fixtureNamesakeSeededKeys)
+						}
+						if len(keys) != fixtureNamesakeSeededRows {
+							t.Errorf("%s holds %d rows, want %d", qualified, len(keys), fixtureNamesakeSeededRows)
+						}
+
+						// The restriction a later measurement writes has to drop rows on both
+						// engines. Against the smallest key it would be a tautology, so it is
+						// made against the second one and the drop is what is asserted.
+						restricted := fixtureCatalogStrings(t, h,
+							fmt.Sprintf("SELECT id FROM %s WHERE id > %s ORDER BY id", qualified, fixtureNamesakeSeededKeys[0]),
+							wideFixtureTable{schema: schema, name: name}, "restricted keys")
+						if len(restricted) == 0 || len(restricted) >= len(keys) {
+							t.Errorf("%s returns %d of its %d rows for a strict restriction on the key, so the restriction drops nothing", qualified, len(restricted), len(keys))
+						}
+
+						// The seeded NULL: without it the nullable columns are nullable only in
+						// the catalog, and nothing that reads these rows ever sees one.
+						if nulls := fixtureCatalogStrings(t, h,
+							fmt.Sprintf("SELECT id FROM %s WHERE note IS NULL ORDER BY id", qualified),
+							wideFixtureTable{schema: schema, name: name}, "null notes"); len(nulls) == 0 {
+							t.Errorf("no seeded row of %s carries a NULL, so a reader of these rows never meets one", qualified)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func fixtureRowCount(t *testing.T, h harness, qualified string) string {
+	t.Helper()
+	statement := "SELECT count(*) FROM " + qualified
+	result, err := h.Execute(context.Background(), h.alias, statement, nil)
+	if err != nil {
+		t.Fatalf("Execute(%q) = %v", statement, err)
+	}
+	if len(result.Rows) != 1 || len(result.Rows[0]) != 1 {
+		t.Fatalf("Execute(%q) rows = %#v, want one count", statement, result.Rows)
+	}
+	return fixtureCatalogValue(result.Rows[0][0])
+}
+
 // TestWideSchemaReadThroughExecutor names a concrete fixture table on each
-// engine and reads it through Execute. The fixture has no rows by design; a
-// successful empty result still proves that the executor can resolve the table.
+// engine and reads it through Execute. The table it names is one of the empty
+// ones by design; a successful empty result still proves that the executor can
+// resolve the table.
 func TestWideSchemaReadThroughExecutor(t *testing.T) {
 	for _, engine := range containerEngines {
 		t.Run(string(engine), func(t *testing.T) {
@@ -334,15 +474,30 @@ func wideFixtureHarness(t *testing.T, engine gate.Engine) harness {
 				}
 				t.Fatalf("the configured %s alias %q rejected SELECT 1: %v", engine, alias, err)
 			}
+			// Recorded here for the same reason setUp records it: this probe is the
+			// only thing that reaches an engine on this path, so a run filtered down
+			// to the wide-fixture tests would otherwise pass against a live server
+			// and still be told by TestMain that nothing was graded.
+			noteEngineAnswered(engine)
 			return harness{Executor: e, alias: alias, spec: c.spec()}
 		}
 	}
-	// Through skipOrFail rather than t.Skipf, because this is the skip most able to
-	// hide something: a configured, reachable PostgreSQL server whose alias list has
-	// simply stopped naming the fixture database silences every wide-fixture
-	// assertion behind a green run. When CERBERUS_TEST_REQUIRE_ENGINES names
-	// PostgreSQL, that is a failure and not an absence.
-	skipOrFail(t, required, engine, fmt.Sprintf("no PostgreSQL alias is configured for the fixture database %q; include it in CERBERUS_DB_*_DATABASES", fixtureDatabase))
+	// This is the skip most able to hide something: a configured, reachable
+	// PostgreSQL server whose alias list has simply stopped naming the fixture
+	// database silences every wide-fixture assertion behind a green run. When
+	// CERBERUS_TEST_REQUIRE_ENGINES names PostgreSQL, that is a failure and not an
+	// absence.
+	//
+	// Which is said here rather than left to skipOrFail, because skipOrFail would
+	// also fail on the mere presence of a declared PostgreSQL alias. Reaching this
+	// line means a declared alias exists and none of them names the fixture
+	// database — a configuration mismatch, not the unanswering engine that rule is
+	// about, and an engine that truly does not answer fails in setUp instead.
+	reason := fmt.Sprintf("no PostgreSQL alias is configured for the fixture database %q; include it in CERBERUS_DB_*_DATABASES", fixtureDatabase)
+	if required {
+		t.Fatalf("%s names %s, so this is a failure and not a skip: %s", requireEnginesVar, engine, reason)
+	}
+	t.Skip(reason)
 	return harness{}
 }
 
@@ -438,6 +593,21 @@ func wideFixtureShape(engine gate.Engine, name string, ordinal int, wide bool) w
 			{name: "uq_" + name + "_batch_code", columns: []string{"batch_code"}, unique: true},
 			{name: "ux_" + name + "_serial_code", columns: []string{"serial_code"}, unique: true},
 		}
+	case fixtureNamesakeTable:
+		table.columns = append([]wideFixtureColumn{id}, shared...)
+		table.columns = append(table.columns,
+			wideFixtureColumn{name: fixtureNamesakePrefix + "_code", dataType: varchar, nullable: false},
+			wideFixtureColumn{name: fixtureNamesakePrefix + "_label", dataType: varchar, nullable: false},
+			wideFixtureColumn{name: fixtureNamesakePrefix + "_state", dataType: varchar, nullable: true},
+			wideFixtureColumn{name: fixtureNamesakePrefix + "_rank", dataType: fixtureType(engine, "integer", "int"), nullable: false},
+		)
+		table.primaryKey = []string{"id"}
+		// On a prefixed column rather than on title, so that the seeded rows sit under
+		// a primary key and one other indexed column.
+		table.indexes = []wideFixtureIndex{{
+			name:    "ix_" + name + "_" + fixtureNamesakePrefix + "_code",
+			columns: []string{fixtureNamesakePrefix + "_code"},
+		}}
 	case fixtureWideCompositeTable:
 		table.columns = filler("gauge", append(append([]wideFixtureColumn{}, composite...), shared...))
 		// Deliberately the reverse of the declaration order of those columns.
@@ -480,10 +650,10 @@ func assertWideFixtureTableCounts(t *testing.T, h harness, engine gate.Engine) {
 	t.Helper()
 	fixtureNames := "'" + strings.Join(wideFixtureTableNames, "', '") + "'"
 	statement := fmt.Sprintf("SELECT table_schema, count(*) FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema IN ('atelier', 'harbor') AND table_name IN (%s) GROUP BY table_schema ORDER BY table_schema", fixtureNames)
-	expected := map[string]string{"atelier": "53", "harbor": "53"}
+	expected := map[string]string{"atelier": "54", "harbor": "54"}
 	if engine == gate.MySQL {
 		statement = fmt.Sprintf("SELECT table_schema, count(*) FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema IN ('testbed', 'ledger') AND table_name IN (%s) GROUP BY table_schema ORDER BY table_schema", fixtureNames)
-		expected = map[string]string{fixtureDatabase: "53", fixtureSecondDatabase: "53"}
+		expected = map[string]string{fixtureDatabase: "54", fixtureSecondDatabase: "54"}
 	}
 	result, err := h.Execute(context.Background(), h.alias, statement, nil)
 	if err != nil {

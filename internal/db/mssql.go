@@ -189,7 +189,33 @@ const sqlServerDatabases = "SELECT name FROM sys.databases ORDER BY name"
 // and no CI to catch it, which is why it is written down here. The integer 1/0
 // this produces is decoded by the same schemaBool that takes the other two
 // engines' representations.
+//
+// This statement and the three describe statements below have executed against a
+// real SQL Server and are valid T-SQL exactly as shipped — but once, by hand, over
+// a VPN, against a single instance holding tens of tables in one schema. Nothing
+// there came near the byte budget, and nothing repeats the run: the tests that did
+// it skip unless CERBERUS_TEST_SQLSERVER_ALIAS names a configured alias, so what
+// grades a change to any of these four by default is still the gate's unit tests.
 const sqlServerSchemaSearch = "WITH pattern AS (SELECT LOWER(@p1) AS value) SELECT s.name, t.name, c.name, ty.name, c.is_nullable, CASE WHEN LOWER(t.name) LIKE pattern.value ESCAPE '!' THEN 1 ELSE 0 END AS table_name_matched, CASE WHEN LOWER(c.name) LIKE pattern.value ESCAPE '!' THEN 1 ELSE 0 END AS column_name_matched FROM sys.tables AS t JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.columns AS c ON c.object_id = t.object_id JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id JOIN pattern ON 1 = 1 WHERE LOWER(t.name) LIKE pattern.value ESCAPE '!' OR LOWER(c.name) LIKE pattern.value ESCAPE '!' ORDER BY s.name, t.name, c.name"
+
+// sqlServerDescribeColumns reads sys.* rather than information_schema for the
+// same privilege-filtering reason as PostgreSQL. It has not executed in CI: the
+// third-party SQL Server is intentionally not part of the fixture matrix.
+//
+// The by-hand run sent only the schema-qualified form. The unqualified one is not
+// a second statement: the schema arrives as @p2 and the target.schema_name = ”
+// branch chooses between them, so what stayed untested there is an argument value
+// rather than any SQL these three describe statements have not already run.
+const sqlServerDescribeColumns = "WITH target AS (SELECT @p1 AS table_name, @p2 AS schema_name) SELECT s.name, t.name, c.name, ty.name, c.is_nullable FROM sys.tables AS t JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.columns AS c ON c.object_id = t.object_id JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id JOIN target ON 1 = 1 WHERE t.name = target.table_name AND (target.schema_name = '' OR s.name = target.schema_name) ORDER BY s.name, t.name, c.column_id"
+
+// sqlServerDescribePrimaryKey orders by key_ordinal rather than by column name
+// because a composite key sorted any other way is a different key. The ordinal
+// itself is not selected; it only has to reach the ORDER BY.
+const sqlServerDescribePrimaryKey = "WITH target AS (SELECT @p1 AS table_name, @p2 AS schema_name) SELECT s.name, t.name, c.name FROM sys.key_constraints AS k JOIN sys.tables AS t ON t.object_id = k.parent_object_id JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.index_columns AS ic ON ic.object_id = t.object_id AND ic.index_id = k.unique_index_id JOIN sys.columns AS c ON c.object_id = t.object_id AND c.column_id = ic.column_id JOIN target ON 1 = 1 WHERE k.type = 'PK' AND ic.key_ordinal > 0 AND t.name = target.table_name AND (target.schema_name = '' OR s.name = target.schema_name) ORDER BY s.name, t.name, ic.key_ordinal"
+
+// sqlServerDescribeIndexes selects the BIT is_unique, which reaches Go unchanged,
+// unlike MySQL's inverted non_unique value.
+const sqlServerDescribeIndexes = "WITH target AS (SELECT @p1 AS table_name, @p2 AS schema_name) SELECT s.name, t.name, i.name, c.name, i.is_unique FROM sys.indexes AS i JOIN sys.tables AS t ON t.object_id = i.object_id JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns AS c ON c.object_id = t.object_id AND c.column_id = ic.column_id JOIN target ON 1 = 1 WHERE i.is_primary_key = 0 AND ic.key_ordinal > 0 AND t.name = target.table_name AND (target.schema_name = '' OR s.name = target.schema_name) ORDER BY s.name, t.name, i.name, ic.key_ordinal"
 
 // sqlServerSystemDatabases are the four databases every instance has and nobody
 // asks an agent to explore.

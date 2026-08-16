@@ -340,8 +340,8 @@ func LoadConfigFrom(environ map[string]string) (*Config, error) {
 // two connections silently sharing a name on the day somebody relaxes it.
 //
 // The comparison is a map lookup, so it is exact and case-sensitive. That is the
-// same rule alias lookup follows in [Executor.Execute], deliberately: KALLPA and
-// kallpa are two names here as they are everywhere else in this package.
+// same rule alias lookup follows in [Executor.Execute], deliberately: REPORTING
+// and reporting are two names here as they are everywhere else in this package.
 func claimAlias(names map[string]string, parent, name, variable string) error {
 	if other, taken := names[name]; taken {
 		return fmt.Errorf("db: alias %q: %s derives the alias %q, which alias %q already uses: %w",

@@ -217,6 +217,27 @@
       "source": "internal/db/mssql.go, sqlServerSchemaSearch, verbatim"
     },
     {
+      "statement": "WITH target AS (SELECT @p1 AS table_name, @p2 AS schema_name) SELECT s.name, t.name, c.name, ty.name, c.is_nullable FROM sys.tables AS t JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.columns AS c ON c.object_id = t.object_id JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id JOIN target ON 1 = 1 WHERE t.name = target.table_name AND (target.schema_name = '' OR s.name = target.schema_name) ORDER BY s.name, t.name, c.column_id",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "the fixed describe_table column statement binds its table and optional schema separately while the CTE keeps both parameters inside the gate-validated statement",
+      "source": "internal/db/mssql.go, sqlServerDescribeColumns, verbatim"
+    },
+    {
+      "statement": "WITH target AS (SELECT @p1 AS table_name, @p2 AS schema_name) SELECT s.name, t.name, c.name FROM sys.key_constraints AS k JOIN sys.tables AS t ON t.object_id = k.parent_object_id JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.index_columns AS ic ON ic.object_id = t.object_id AND ic.index_id = k.unique_index_id JOIN sys.columns AS c ON c.object_id = t.object_id AND c.column_id = ic.column_id JOIN target ON 1 = 1 WHERE k.type = 'PK' AND ic.key_ordinal > 0 AND t.name = target.table_name AND (target.schema_name = '' OR s.name = target.schema_name) ORDER BY s.name, t.name, ic.key_ordinal",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "the fixed describe_table primary-key statement binds its table and optional schema separately and orders composite keys by key_ordinal",
+      "source": "internal/db/mssql.go, sqlServerDescribePrimaryKey, verbatim"
+    },
+    {
+      "statement": "WITH target AS (SELECT @p1 AS table_name, @p2 AS schema_name) SELECT s.name, t.name, i.name, c.name, i.is_unique FROM sys.indexes AS i JOIN sys.tables AS t ON t.object_id = i.object_id JOIN sys.schemas AS s ON s.schema_id = t.schema_id JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns AS c ON c.object_id = t.object_id AND c.column_id = ic.column_id JOIN target ON 1 = 1 WHERE i.is_primary_key = 0 AND ic.key_ordinal > 0 AND t.name = target.table_name AND (target.schema_name = '' OR s.name = target.schema_name) ORDER BY s.name, t.name, i.name, ic.key_ordinal",
+      "engine": "sqlserver",
+      "verdict": "allow",
+      "reason": "the fixed describe_table secondary-index statement binds its table and optional schema separately and orders each index's key columns by key_ordinal",
+      "source": "internal/db/mssql.go, sqlServerDescribeIndexes, verbatim"
+    },
+    {
       "statement": "SELECT $1$ ; DROP TABLE t $1$",
       "engine": "postgresql",
       "verdict": "deny",

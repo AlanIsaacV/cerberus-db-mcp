@@ -6,13 +6,39 @@ deployment's allowlist before it can reach a tool; the statement gate executes
 no statement it cannot establish is a read, and each query is audited with the
 calling identity.
 
-SQL Server has no reproducible grading for the schema-search surface: there is
-no arm64 SQL Server image, so there is no CI container and no fixture. Its
-fixed statement is gate-validated by a unit test and has not been run against a
-SQL Server at all — not in CI, not against the third-party deployment target,
-not by hand. The gate test proves only that the gate allows the text, so the
-statement's validity as T-SQL is itself ungraded: the first execution of it
-will be the first test of it.
+SQL Server has no reproducible grading for this catalog surface: there is no
+arm64 SQL Server image, so there is no CI container and no fixture. Its fixed
+`search_schema` statement and three fixed `describe_table` statements have now
+been run by hand against the real third-party deployment target, over the VPN,
+from two integration tests: `internal/db/mssql_schema_integration_test.go`, which
+drives the four statements straight through the executor — the search over the
+real catalog, the schema-qualified description, and each bound in turn — and
+`internal/mcp/mssql_sequence_integration_test.go`, which drives the whole agent
+sequence over the real MCP transport with the real SDK client: `list_databases`,
+`search_schema`, `describe_table`, and an `execute_query` whose `SELECT` is
+assembled at run time from what `describe_table` had just returned, which is what
+shows a description is enough on its own to query that table without a further
+round trip. All four statements are valid T-SQL as shipped, all four returned
+decoded results, and that login could read every one of the eight `sys.*` views
+they touch. The bounds held there as they do elsewhere: each catalog read ran
+inside a transaction that was rolled back whether it succeeded or failed, under
+`LOCK_TIMEOUT` and the query deadline, every answer reported the byte budget it
+was assembled against, and one cut by the row cap named `row_cap` with the cap's
+own value beside it.
+
+That run establishes the statements execute; it does not establish how they
+behave under the load this surface exists for. The instance reached holds 54
+tables and 528 columns in a single schema, so the byte budget never bound
+anything there, and nothing measured on it says what a search or a description
+costs on a schema large enough for that budget to matter. The measured sequence
+cost 3332 bytes on the wire in total, 13% of the 25600-byte ceiling the sequence
+test enforces — but nothing on that instance was truncated, so that total says
+the bounds were never approached there, not that they hold when they bind. That
+case is graded against the wide fixture on PostgreSQL and MySQL and on no SQL
+Server, because no reachable SQL Server has a schema of that size. Nor is the
+run repeatable by anyone else: those tests skip unless the runner has the VPN,
+the credentials, and `CERBERUS_TEST_SQLSERVER_ALIAS` naming a configured alias,
+and CI grades exactly the engines it graded before.
 
 ## Configuration
 
@@ -187,11 +213,13 @@ database boundary: a call answers about the alias's own database and nothing els
 
 Its results are bounded by bytes as well as by rows. `CERBERUS_DB_ROW_CAP` bounds
 the flat catalog rows before they are grouped, and a byte budget then bounds the
-grouped answer; either bound sets `truncated`, and the budget in force is reported
-as `byte_budget` beside `row_cap`. A truncated result is the beginning of what
-matched, and a table listed in one can hold only part of its matching columns, so
-the remedy is to search again with a longer or more specific substring rather than
-to page. The row cap alone would not make "no pattern returns the whole schema"
+grouped answer. `truncation` says exactly which result the agent holds: `none`
+means neither bound cut it, `row_cap` means the catalog read stopped before
+grouping, and `byte_budget` means the assembled answer ran out of room. A
+non-`none` result is the beginning of what matched, and a table listed in one can
+hold only part of its matching columns, so the remedy is to search again with a
+longer or more specific substring rather than to page. The row cap alone would
+not make "no pattern returns the whole schema"
 true: every table in a schema may carry one column name in common — an audit
 timestamp, a tenant id — so a two-character substring can match a few hundred
 catalog rows, far below the default cap of 1000, and still group into an entry for
@@ -222,6 +250,26 @@ size" in the job summary: the bytes of the whole MCP result, including the
 duplicate JSON text block the SDK sends beside the structured content, both for a
 search narrow enough to name one table and for the broadest pattern the tool
 accepts. The same test fails if the first exceeds 4 KB or the second 20 KB.
+
+### Describing one table
+
+`describe_table` takes an alias and a table name, plus an optional schema. It
+returns every matching table's columns with type and nullability, its ordered
+primary-key columns, and its secondary indexes with their key columns in order
+and their uniqueness. Omitting the schema can return one description per schema
+that holds a table with that name; it does not make a database name into an
+alias, and the call never crosses the selected alias's database.
+
+Like `search_schema`, its answer is bounded by the row cap and by the fixed byte
+budget, and `truncation` names the bound that cut a short answer: `none`,
+`row_cap`, or `byte_budget`. The primary key and index detail are retained ahead
+of columns, so only the tail of the column list can be short; search again with
+`search_schema` for a specific column name when that detail is needed.
+
+The catalog reads are intentionally asymmetric. PostgreSQL reads `pg_catalog`
+and SQL Server reads `sys.*`, neither of which filters the column list by
+privilege. MySQL reads `information_schema`, which does: a MySQL login without
+permission on a column receives a short column list with no error.
 
 ## Raspberry Pi deployment
 
@@ -344,6 +392,39 @@ docker compose -f deploy/compose.test.yaml down -v
 docker compose -f deploy/compose.test.yaml up -d
 ```
 
-SQL Server has no container coverage because no arm64 image is available. That
-engine is exercised only against a real instance; it has not been verified
-against the third-party SQL Server deployment target.
+SQL Server has no container coverage because no arm64 image is available, so it
+has no fixture and CI runs nothing against it. It is exercised only against a
+real instance, by tests that skip when there is no such instance: the SQL Server
+tests under `internal/db`, and `internal/mcp/mssql_sequence_integration_test.go`,
+which runs the four-call agent sequence over the real transport and reports what
+each call cost on the wire. `internal/db/mssql_integration_test.go` takes
+whichever `sqlserver` alias is configured; the catalog tests in
+`internal/db/mssql_schema_integration_test.go` and the sequence test take only
+the alias `CERBERUS_TEST_SQLSERVER_ALIAS` names, because more than one alias is
+normally configured and an assertion about a catalog is an assertion about one
+server specifically. That variable has no default, so those tests skip until
+somebody sets it. `CERBERUS_TEST_REQUIRE_ENGINES` in CI stays `postgresql,mysql`
+and deliberately does not name this engine: no runner can reach an instance, so a
+requirement it cannot satisfy would fail every run.
+
+The catalog statements have been run that way against the third-party deployment
+target and they work there, as the top of this file records. Nothing about that
+run is repeatable from this repository alone — it needs the VPN and the
+credentials — and because there is no fixture, what it asserts is shape rather
+than content: the statements parse and run, rows decode, indexes group, key
+columns keep their ordinal order, a bound that cut an answer says which one, and
+the `SELECT` the sequence test writes out of a `describe_table` answer alone runs
+and returns rows. Every name those assertions need is discovered from the server
+at runtime, so no identifier of that instance is written down here.
+
+Two things that run did not cover. A several-hundred-table schema, which that
+instance is not. And the byte budget under a load that reaches it: on a
+single-schema database the unqualified `describe_table` returns exactly what the
+schema-qualified form returns, so the argument form that would produce the most
+entries is degenerate there, and the only call that would have spent the budget
+is a deliberately broad search against somebody else's production server. What
+the wire measurement does say about that budget is how little room sits above it:
+each of the four calls crossed the wire at 2.4 to 4.4 times its own payload,
+because the SDK sends the payload twice, so one answer that spent the whole byte
+budget would cost some 19 to 20 KB and two of them would pass the 25600-byte
+ceiling between them.
