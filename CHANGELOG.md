@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.4.0 - 2026-08-16
+
+
+### Features
+
+- Describe_table, the SQL Server catalog surface, and the agent sequence measured in CI
+
+
 ## v0.3.0 - 2026-08-16
 
 
