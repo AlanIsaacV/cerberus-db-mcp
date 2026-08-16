@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.3.0 - 2026-08-16
+
+
+### Features
+
+- Index and key variety for a gradeable describe tool
+
+
 ## v0.2.2 - 2026-08-15
 
 
