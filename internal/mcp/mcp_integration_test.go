@@ -813,13 +813,41 @@ func TestSearchSchemaReachesTheAgentFromTheWideFixture(t *testing.T) {
 // measurement would then be of the cap.
 //
 // The worst case is a claim about every pattern the tool accepts, and what makes
-// it measurable from two calls is that internal/db's budget bounds the grouped
-// tables whatever the pattern was: a pattern that exhausts the budget produces
-// the largest answer this surface can produce, and truncated is how each call
-// below reports that it did. The two exhaust it from opposite directions — "re"
-// reaches recorded_at in every fixture table, many tables holding one column
-// each; "measure" reaches 250 columns of the one wide table — and the larger of
-// the two is the figure reported.
+// it approachable from a handful of calls is that internal/db's budget bounds the
+// grouped tables whatever the pattern was: no pattern can be answered with more
+// than the budget's worth of entries, and truncated is how each call below reports
+// that its answer was cut there. What that argument gives is the order of the
+// figure, not the figure — the budget is spent in an accounting of its own, and
+// how many wire bytes a spent budget buys depends on the shape of what it bought.
+// So what is reported here is the largest of three patterns hand-picked to exhaust
+// the budget from different directions, not a proven maximum: "re" reaches
+// recorded_at in every fixture table, many tables holding one column each;
+// "measure" reaches the 250 measure_NNN columns of archive; "gauge" reaches the
+// 250 gauge_NNN columns of wide_composite_key_probe. A filler family named more
+// briefly than gauge_NNN would buy more columns per budget byte than any of the
+// three and would need a pattern of its own added to the loop below — the fixture
+// is grown by hand, so noticing that is a person's job and this sentence is the
+// only thing that asks them to.
+//
+// "gauge" is not redundant with "measure" even though both cut inside one wide
+// table. The budget is charged in bytes, so a shorter column name lets more
+// columns fit under the same charge, and every column that fits costs the wire
+// the JSON object around it as well as its name — twice over, since the SDK sends
+// the payload as structured content and again as an escaped JSON text block.
+// gauge_NNN is two characters shorter than measure_NNN, which is what buys those
+// extra columns and why it is the larger figure on PostgreSQL despite being
+// reached through a much longer table name. A worst case measured only over the
+// longer names understates.
+//
+// The two families are laid out differently as well, and the difference reads
+// backwards to what it costs. measure_NNN exists in exactly one table in the whole
+// fixture — the wide archive of the second schema or database — while gauge_NNN is
+// in wide_composite_key_probe, which every schema and database has. So on
+// PostgreSQL, where this harness reaches both schemas of testbed, "gauge" matches
+// 500 columns across two tables and is still answered with one: the budget is
+// spent inside the first table's column list long before the second table is
+// reached, and it is that first table's own shape, not the number of tables the
+// pattern matches, that sets the figure.
 func TestSearchSchemaWireSizeStaysUnderItsBounds(t *testing.T) {
 	const (
 		namedTableCeiling = 4 << 10
@@ -850,7 +878,7 @@ func TestSearchSchemaWireSizeStaysUnderItsBounds(t *testing.T) {
 			}
 
 			worstSize, worstPattern, worstTables, worstColumns := 0, "", 0, 0
-			for _, pattern := range []string{"re", "measure"} {
+			for _, pattern := range []string{"re", "measure", "gauge"} {
 				res := h.searchSchema(t, pattern)
 				out, ok := structured(t, res).(map[string]any)
 				if !ok {
@@ -860,11 +888,14 @@ func TestSearchSchemaWireSizeStaysUnderItsBounds(t *testing.T) {
 					t.Errorf("search_schema(%q) reports a complete answer at row cap %d, so the byte budget did not bind and this call does not measure the worst case: %s",
 						pattern, rowCap, jsonOf(t, out))
 				}
-				if pattern == "measure" {
-					// The budget binds here, and it binds inside the one wide table: 250
-					// matching columns of a single entry, of which about half fit. The entry
-					// stays — dropping it would answer this search with nothing — so it is
-					// the entry itself that has to say its column list is a prefix.
+				if pattern == "measure" || pattern == "gauge" {
+					// The budget binds here, and it binds inside one wide table: 250 matching
+					// columns in that table, of which about half fit. "gauge" matches such a
+					// table in every schema rather than in one, but the first of them spends
+					// the whole budget on its own, so the cut still lands inside a single
+					// entry. That entry stays — dropping it would answer this search with
+					// nothing — so it is the entry itself that has to say its column list is
+					// a prefix.
 					assertTheCutTableSaysSo(t, out)
 				}
 				if size := wireBytes(t, res); size > worstSize {

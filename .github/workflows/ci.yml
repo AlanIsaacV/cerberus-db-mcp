@@ -34,6 +34,86 @@ jobs:
       - name: go test -race
         run: go test -race ./...
 
+      # deploy/postgres-init/03-wide-schema.sql and deploy/mysql-init/03-wide-schema.sql
+      # are output, not source: tools/wide-schema is the single definition of the
+      # wide fixture and those files carry a DO NOT EDIT header. Until this step
+      # existed nothing gave that header teeth. A hand edit to either file, or a
+      # change to the generator whose author forgot to regenerate, left the two
+      # disagreeing with no signal — and the disagreement matters, because the
+      # integration job feeds the *checked-in* files to the engines, so the tests
+      # would be grading a fixture the generator no longer describes. It also gets
+      # worse with age: the drift is only discovered when the next person
+      # regenerates for an unrelated reason and is handed a 1400-line diff they did
+      # not write and cannot review. Failing here puts it on the commit that caused
+      # it, while its author can still explain it.
+      #
+      # This job and not the integration one: the check needs a checkout and a Go
+      # toolchain and nothing else. No engine reads these files here. Putting it
+      # behind two service containers would make a five-second check wait out a
+      # twenty-minute suite.
+      #
+      # The whole worktree, and deliberately not a list of the generator's output
+      # paths. Naming them here would copy the map in tools/wide-schema's main
+      # function with nothing keeping the two in agreement — so a third generated
+      # file, or a move of either init directory, would fall outside the check
+      # while it went on reporting green. That is the same drift this step exists
+      # to catch, one level up, and a guard that quietly stops guarding is worse
+      # than none because it is trusted. actions/checkout leaves the tree clean and
+      # no step above this one writes into it, so anything git reports here was
+      # written by the generator just now, wherever it chose to write it.
+      #
+      # That premise is load-bearing in one direction: this step must stay above
+      # every step that can dirty the worktree. The fuzz step below writes failing
+      # inputs under internal/gate/testdata/fuzz, and running after it would make
+      # a fuzz find look like fixture drift.
+      #
+      # `git status --porcelain` and not `git diff`, because a diff says nothing
+      # about a file the generator started writing that nobody committed — which
+      # is why this used to need a second, separate untracked check. The report
+      # below still tells the two cases apart: "you hand-edited generated output"
+      # and "the generator emits a file you never added" have different fixes.
+      - name: wide-schema fixture matches its generator
+        run: |
+          go run ./tools/wide-schema
+
+          dirty=$(git status --porcelain)
+          if [ -n "$dirty" ]; then
+            if git diff --quiet HEAD; then
+              tracked=''
+            else
+              tracked=yes
+            fi
+            untracked=$(git ls-files --others --exclude-standard)
+
+            echo "the checked-in fixture DDL is not what tools/wide-schema produces."
+            echo "either a generated file was hand-edited, or the generator changed"
+            echo "and its output was not regenerated. fix it at the source:"
+            echo
+            echo "    go run ./tools/wide-schema"
+            echo "    git add -- $(printf '%s\n' "$dirty" | cut -c4- | tr '\n' ' ')"
+            echo
+            echo "git status --porcelain, which is what this step gates on:"
+            echo "$dirty"
+            echo
+            if [ -n "$tracked" ]; then
+              echo "what regenerating just now changed in committed files:"
+              git --no-pager diff --stat HEAD
+              echo
+            fi
+            if [ -n "$untracked" ]; then
+              echo "files the generator wrote that are not committed at all. no"
+              echo "diff can show these; they need git add:"
+              echo "$untracked"
+              echo
+            fi
+            if [ -n "$tracked" ]; then
+              echo "first 200 lines of the difference (it is generated DDL; the"
+              echo "command above is the fix, not editing these lines):"
+              git --no-pager diff HEAD | head -n 200
+            fi
+            exit 1
+          fi
+
       # The gate's safety argument is that its verdict depends on nothing but
       # its input. This is the whole-closure half of that check; the per-file
       # half is TestPackageImportsNothingItShouldNot.
