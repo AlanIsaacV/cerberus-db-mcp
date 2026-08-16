@@ -306,9 +306,9 @@ func (e *Executor) ListDatabases(ctx context.Context, alias string) (*DatabaseLi
 // The answer is bounded twice: by the row cap on the flat catalog rows, as every
 // other statement is, and by [SchemaResultBudget] on the grouped result. The
 // second bound is what a short pattern actually runs into — see the constant —
-// and either of them sets Truncated. The table the budget cut into carries
-// [SchemaTable.ColumnsTruncated] as well, because an empty column list means
-// "nothing here matched" only on a table the budget left whole.
+// and SearchSchema reports which one cut the answer. The table the budget cut
+// into carries [SchemaTable.ColumnsTruncated] as well, because an empty column
+// list means "nothing here matched" only on a table the budget left whole.
 func (e *Executor) SearchSchema(ctx context.Context, alias, pattern string) (*SchemaSearch, error) {
 	c, ok := e.conns[alias]
 	if !ok {
@@ -351,17 +351,80 @@ func (e *Executor) SearchSchema(ctx context.Context, alias, pattern string) (*Sc
 		return nil, executionError(ctx, "search-schema", spec, err)
 	}
 	tables, overBudget := schemaTables(rows.rows, SchemaResultBudget)
+	truncation := NoTruncation
+	if rows.truncated {
+		truncation = RowCapTruncation
+	}
+	if overBudget {
+		truncation = ByteBudgetTruncation
+	}
 	return &SchemaSearch{
-		Alias:    alias,
-		Engine:   spec.Engine,
-		Decision: decision,
-		Tables:   tables,
-		// The two bounds report as one fact, because they are one fact to the caller:
-		// the answer is a prefix of what matched. Which of them bit is an operator's
-		// question, and the row cap is already reported beside this.
-		Truncated:  rows.truncated || overBudget,
+		Alias:      alias,
+		Engine:     spec.Engine,
+		Decision:   decision,
+		Tables:     tables,
+		Truncation: truncation,
 		RowCap:     e.settings.RowCap,
 		ByteBudget: SchemaResultBudget,
 		Elapsed:    time.Since(started),
 	}, nil
+}
+
+// DescribeTable reads columns, the primary key and secondary indexes separately.
+// Three transactions are intentional: the conn boundary admits one query per
+// transaction, and separate row caps keep a wide column list from consuming the
+// index detail that makes the answer usable.
+func (e *Executor) DescribeTable(ctx context.Context, alias, table, schema string) (*DescribeTable, error) {
+	c, ok := e.conns[alias]
+	if !ok {
+		return nil, &Error{Op: "describe-table", Alias: alias, Kind: KindUnknownAlias}
+	}
+	spec := c.spec()
+	d, ok := describeFor(spec.Engine)
+	if !ok {
+		return nil, &Error{Op: "describe-table", Alias: alias, Engine: spec.Engine, Kind: KindInternal, Detail: "no describe statements are defined for this engine"}
+	}
+	for _, statement := range []string{d.columns, d.primaryKey, d.indexes} {
+		decision := e.gate.Validate(spec.Engine, statement, nil)
+		if decision.Verdict != gate.Allow {
+			return nil, refusalError("describe-table", spec, decision)
+		}
+	}
+	if spec.Database == "" {
+		return nil, &Error{Op: "describe-table", Alias: alias, Engine: spec.Engine, Kind: KindInvalidArgument, Detail: "describe_table requires the alias to be bound to one configured database"}
+	}
+	if table == "" {
+		return nil, &Error{Op: "describe-table", Alias: alias, Engine: spec.Engine, Kind: KindInvalidArgument, Detail: "table must not be empty"}
+	}
+
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, e.settings.statementDeadline(spec.Engine))
+	defer cancel()
+	columns, err := c.query(ctx, d.columns, e.settings.RowCap, table, schema)
+	if err != nil {
+		return nil, executionError(ctx, "describe-table", spec, err)
+	}
+	keys, err := c.query(ctx, d.primaryKey, e.settings.RowCap, table, schema)
+	if err != nil {
+		return nil, executionError(ctx, "describe-table", spec, err)
+	}
+	indexes, err := c.query(ctx, d.indexes, e.settings.RowCap, table, schema)
+	if err != nil {
+		return nil, executionError(ctx, "describe-table", spec, err)
+	}
+	if keys.truncated || indexes.truncated {
+		return nil, &Error{Op: "describe-table", Alias: alias, Engine: spec.Engine, Kind: KindInternal, Detail: "the row cap cut primary key or index detail"}
+	}
+	tables, overBudget, err := describeTables(spec.Engine, columns.rows, keys.rows, indexes.rows, describeResultBudget)
+	if err != nil {
+		return nil, &Error{Op: "describe-table", Alias: alias, Engine: spec.Engine, Kind: KindInternal, Detail: err.Error()}
+	}
+	truncation := NoTruncation
+	if columns.truncated {
+		truncation = RowCapTruncation
+	}
+	if overBudget {
+		truncation = ByteBudgetTruncation
+	}
+	return &DescribeTable{Alias: alias, Engine: spec.Engine, Decision: e.gate.Validate(spec.Engine, d.columns, nil), Tables: tables, Truncation: truncation, RowCap: e.settings.RowCap, ByteBudget: describeResultBudget, Elapsed: time.Since(started)}, nil
 }

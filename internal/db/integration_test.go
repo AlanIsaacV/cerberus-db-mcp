@@ -153,8 +153,13 @@ type harness struct {
 // distinction, so CI names the engines it has containers for and a typo fails the
 // job instead of passing it.
 //
-// Unset, behaviour is exactly as it was: every engine is optional. That default
-// is what keeps the suite runnable by a developer with no containers at all.
+// Unset, an engine the environment says nothing about is optional, and that is
+// what keeps the suite runnable by a developer with no containers at all. This
+// variable is the only way to demand a particular engine, and what [TestMain]
+// adds is deliberately weaker and orthogonal: it refuses a run that reached no
+// engine at all. A declared alias for a server this machine cannot see — a VPN
+// that is down — is still a skip as long as something else answered, so naming
+// the engines a run must grade is still this variable's job and CI's business.
 const requireEnginesVar = "CERBERUS_TEST_REQUIRE_ENGINES"
 
 func engineIsRequired(t *testing.T, engine gate.Engine) bool {
@@ -176,15 +181,119 @@ func engineIsRequired(t *testing.T, engine gate.Engine) bool {
 	return false
 }
 
-// skipOrFail skips, or fails when this engine is one the run insists on. The
+// skipOrFail skips, or fails when the run cannot honestly call this a skip. The
 // reason is reported either way, so a green run can be read for what it actually
 // established.
+//
+// One thing makes it a failure here: the engine is one the run insists on, which
+// is CI's case and what requireEnginesVar is for. The other thing that must fail
+// cannot be decided here. A CERBERUS_DB_* block that names a server is a claim
+// the server is there, and a run that reached none of the servers it declares
+// established nothing — `go test -tags integration ./internal/db/` against a
+// block whose engines are all down exited 0 in half a second with every fixture
+// assertion skipped, and Go's exit code cannot tell that apart from every one of
+// them passing. But "no engine answered" is a property of the whole run and this
+// is called per test, so the skip is recorded and [TestMain] passes the verdict
+// once every test has had its turn. An engine that did not answer while another
+// did is a skip: the run graded something, and a server this machine cannot
+// reach today is not a defect in this package.
+//
+// Declaring nothing at all is recorded as nothing, and that is why the record is
+// conditioned on the environment rather than on the reachability check that led
+// here: somebody with no containers and no configuration must not be forced to
+// start them, and an absent SQL Server alias — which is CI's own situation — must
+// stay the quiet skip it has always been.
 func skipOrFail(t *testing.T, required bool, engine gate.Engine, reason string) {
 	t.Helper()
 	if required {
 		t.Fatalf("%s names %s, so this is a failure and not a skip: %s", requireEnginesVar, engine, reason)
 	}
+	if engineIsConfigured(engine) {
+		enginesThatDidNotAnswer[engine] = reason
+	}
 	t.Skip(reason)
+}
+
+// The engines this run asked and what came of asking them, accumulated across
+// every test in the package so that [TestMain] can answer a question no single
+// test can: whether anything at all was graded.
+//
+// Neither map is synchronised. No test in this package calls t.Parallel — the
+// suite neutralises ambient driver variables with t.Setenv, which panics under it
+// — so every write here happens on one goroutine at a time.
+var (
+	enginesThatAnswered     = map[gate.Engine]bool{}
+	enginesThatDidNotAnswer = map[gate.Engine]string{}
+)
+
+// noteEngineAnswered records that a declared server was reached and read from.
+// One of these is what entitles every other engine to a skip.
+//
+// Every path in this package that reaches an engine calls it: [setUp], the
+// reachability probe most tests share, and the two harnesses that probe on their
+// own — the wide fixture's PostgreSQL path and the named SQL Server one. A
+// harness that reached a server without recording here would not merely make
+// [TestMain] stricter; it would make it wrong, because the sentence TestMain
+// prints says every fixture assertion skipped, and those assertions ran and
+// passed. Any harness added later has to record too.
+func noteEngineAnswered(engine gate.Engine) { enginesThatAnswered[engine] = true }
+
+// TestMain adds the verdict Go's exit code cannot carry. `go test` reports a
+// package where every test skipped exactly as it reports one where every test
+// passed, so a CERBERUS_DB_* block whose servers are all down produced a green
+// run that had established nothing.
+//
+// The rule is deliberately the narrow one: the run fails only when it asked at
+// least one declared engine and no engine answered at all. A run that graded one
+// engine may skip another that did not answer — an operator whose environment
+// declares a production server behind a VPN still gets a green local run over the
+// containers that are up. Demanding a specific engine is CERBERUS_TEST_REQUIRE_ENGINES'
+// job, which is what CI uses.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if code == 0 {
+		if reason, nothing := nothingWasGraded(); nothing {
+			fmt.Fprintln(os.Stderr, reason)
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
+
+// nothingWasGraded reports whether the run has to fail and what to say, naming
+// every engine that was asked and did not answer: the run is only readable if it
+// says which server the block declared and could not reach.
+func nothingWasGraded() (string, bool) {
+	if len(enginesThatAnswered) > 0 || len(enginesThatDidNotAnswer) == 0 {
+		return "", false
+	}
+	var names, lines []string
+	for _, engine := range gate.Engines() {
+		if reason, asked := enginesThatDidNotAnswer[engine]; asked {
+			names = append(names, string(engine))
+			lines = append(lines, fmt.Sprintf("\t%s: %s", engine, reason))
+		}
+	}
+	return fmt.Sprintf("FAIL: nothing was graded. The environment declares a server for %s, this run asked and none of them answered, so every fixture assertion skipped:\n%s",
+		strings.Join(names, ", "), strings.Join(lines, "\n")), true
+}
+
+// engineIsConfigured reports whether the environment declares an alias for this
+// engine. It reads the environment itself rather than taking a caller's
+// configuration, because one of the paths into [skipOrFail] is there precisely
+// because loading one failed — and a configuration that will not load is not a
+// declaration of anything.
+func engineIsConfigured(engine gate.Engine) bool {
+	cfg, err := LoadConfig()
+	if err != nil {
+		return false
+	}
+	for _, spec := range cfg.Aliases {
+		if spec.Engine == engine {
+			return true
+		}
+	}
+	return false
 }
 
 // setUp builds an executor from the process environment and finds an alias for
@@ -225,9 +334,11 @@ func setUp(t *testing.T, engine gate.Engine) harness {
 	alias := aliases[0]
 	c, _ := e.connFor(alias)
 
-	// A configured alias that cannot be reached is a skip and not a failure: for
-	// SQL Server the server is on the far side of a VPN, and "the VPN is down" is
-	// not a defect in this package.
+	// A configured alias that cannot be reached goes through skipOrFail, which
+	// records it: an alias declared in the environment is a claim that a server is
+	// there, and a run that reached none of them graded nothing. "The VPN is down"
+	// is not a defect in this package, so it stops being a skip only when it is the
+	// whole of what this run could reach.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if _, err := e.Execute(ctx, alias, "SELECT 1", nil); err != nil {
@@ -236,6 +347,7 @@ func setUp(t *testing.T, engine gate.Engine) harness {
 		}
 		t.Fatalf("the configured %s alias %q rejected SELECT 1: %v", engine, alias, err)
 	}
+	noteEngineAnswered(engine)
 	return harness{Executor: e, alias: alias, spec: c.spec()}
 }
 

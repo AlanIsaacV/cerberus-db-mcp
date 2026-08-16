@@ -159,6 +159,19 @@ const mysqlDatabases = "SHOW DATABASES"
 // The CTE binds MySQL's positional ? once and reuses it for both match reasons.
 const mysqlSchemaSearch = "WITH pattern AS (SELECT LOWER(?) AS value) SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable = 'YES' AS is_nullable, LOWER(c.table_name) LIKE pattern.value ESCAPE '!' AS table_name_matched, LOWER(c.column_name) LIKE pattern.value ESCAPE '!' AS column_name_matched FROM information_schema.columns AS c JOIN information_schema.tables AS t ON t.table_schema = c.table_schema AND t.table_name = c.table_name JOIN pattern ON 1 = 1 WHERE c.table_schema = DATABASE() AND t.table_type = 'BASE TABLE' AND (LOWER(c.table_name) LIKE pattern.value ESCAPE '!' OR LOWER(c.column_name) LIKE pattern.value ESCAPE '!') ORDER BY c.table_schema, c.table_name, c.column_name"
 
+// mysqlDescribeColumns remains on information_schema because MySQL has no
+// unfiltered catalog equivalent. DATABASE() still confines the answer to the
+// database the alias was explicitly configured to reach.
+const mysqlDescribeColumns = "WITH target AS (SELECT ? AS table_name, ? AS schema_name) SELECT c.table_schema, c.table_name, c.column_name, c.column_type, c.is_nullable = 'YES' AS is_nullable FROM information_schema.columns AS c JOIN target ON 1 = 1 WHERE c.table_schema = DATABASE() AND c.table_name = target.table_name AND (target.schema_name = '' OR c.table_schema = target.schema_name) ORDER BY c.table_schema, c.table_name, c.ordinal_position"
+
+// mysqlDescribePrimaryKey uses ordinal_position because it is the catalog's
+// statement of a composite key's order, not an order the caller may reconstruct.
+const mysqlDescribePrimaryKey = "WITH target AS (SELECT ? AS table_name, ? AS schema_name) SELECT k.table_schema, k.table_name, k.column_name FROM information_schema.key_column_usage AS k JOIN target ON 1 = 1 WHERE k.table_schema = DATABASE() AND k.table_name = target.table_name AND k.constraint_name = 'PRIMARY' AND (target.schema_name = '' OR k.table_schema = target.schema_name) ORDER BY k.table_schema, k.table_name, k.ordinal_position"
+
+// mysqlDescribeIndexes keeps non_unique raw so the Go boundary can invert its
+// MySQL-specific polarity and reject every spelling other than the known 0/1.
+const mysqlDescribeIndexes = "WITH target AS (SELECT ? AS table_name, ? AS schema_name) SELECT s.table_schema, s.table_name, s.index_name, s.column_name, s.non_unique FROM information_schema.statistics AS s JOIN target ON 1 = 1 WHERE s.table_schema = DATABASE() AND s.table_name = target.table_name AND s.index_name <> 'PRIMARY' AND (target.schema_name = '' OR s.table_schema = target.schema_name) ORDER BY s.table_schema, s.table_name, s.index_name, s.seq_in_index"
+
 // mysqlSystemDatabases are the schemas MySQL keeps for itself. They are excluded
 // because an agent asked to understand somebody's data model has no use for the
 // server's own bookkeeping, and four names of noise in a list is four names of

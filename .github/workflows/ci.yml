@@ -347,15 +347,15 @@ jobs:
       - name: go test -tags integration
         run: go test -tags integration -race -timeout 20m -p 1 ./...
 
-      # The schema-search surface is graded on a byte ceiling, and the ceiling is
-      # only half of what is required: the measured worst case has to be readable
-      # by a person, so that the figure this project quotes for one call is a
-      # measurement rather than a derivation from the row cap. The step above
-      # asserts it and cannot report it — `go test` discards a passing test's log
-      # output unless -v is given, and putting -v on a twenty-minute suite buries
-      # the one line it was for. So that single test runs again, verbosely, and
-      # its measurement goes to the job summary where nobody has to open a log.
-      # It re-runs in seconds against the engines that are already up.
+      # The schema surface is graded on byte ceilings, and each ceiling is only
+      # half of what is required: the measured worst cases have to be readable by
+      # a person, so that the figures this project quotes for one call are
+      # measurements rather than derivations from the row cap. The step above
+      # asserts them and cannot report them — `go test` discards a passing test's
+      # log output unless -v is given, and putting -v on a twenty-minute suite
+      # buries the lines they are for. So those two tests run again, verbosely,
+      # and their measurements go to the job summary where nobody has to open a
+      # log. They re-run in seconds against the engines that are already up.
       #
       # It is deliberately not run when the step above failed. Go prints a failed
       # test's log output whatever the flags, so a run that breached the ceiling
@@ -364,17 +364,83 @@ jobs:
       # -count=1 because the flags a run is cached under include -run and -v: two
       # invocations that differ only in those can otherwise be answered from the
       # cache, and a cached run prints no log output at all.
-      - name: report the schema-search worst case
-        shell: bash
+      #
+      # `set -euo pipefail` is declared in the body, and this step carries no
+      # `shell:` key. GitHub resolves an explicit `shell: bash` to
+      # `bash --noprofile --norc -eo pipefail {0}` and a step without one to
+      # `bash -e {0}`, and until the line below was written that key — then the
+      # only `shell:` in this file — was the whole of what kept `go test`'s exit
+      # status from being replaced by `tee`'s, which is always 0. A refactor that
+      # dropped one line nothing commented on would have turned a breached byte
+      # ceiling into a green step, with no test and no linter here to notice. The
+      # guarantee belongs inside the thing it guards, so the key is gone rather
+      # than left beside a body that no longer needs it: two reporting steps
+      # spelling one guarantee two ways is how the next person learns the wrong
+      # convention.
+      - name: report the schema-surface worst cases
         run: |
+          set -euo pipefail
           go test -tags integration -count=1 -timeout 5m \
-            -run '^TestSearchSchemaWireSizeStaysUnderItsBounds$' -v ./internal/mcp/ \
-            | tee "$RUNNER_TEMP/schema-search-size.log"
+            -run '^(TestSearchSchemaWireSizeStaysUnderItsBounds|TestDescribeTableWireSizeStaysUnderItsBounds)$' -v ./internal/mcp/ \
+            | tee "$RUNNER_TEMP/schema-surface-size.log"
           {
-            echo '### search_schema result size'
+            echo '### schema-surface result sizes'
             echo
             echo '```'
-            grep -F 'search_schema wire size' "$RUNNER_TEMP/schema-search-size.log" \
+            grep -E 'search_schema wire size|describe_table wire size' "$RUNNER_TEMP/schema-surface-size.log" \
+              || echo 'the measurement did not run'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Every other figure this job reports is one tool's worst case. This one is
+      # the sum of the four calls an agent actually makes to get from an
+      # approximate table name to rows — list_databases, search_schema,
+      # describe_table, execute_query — because the promise being kept is about
+      # that whole path through a large schema and not about any single call on
+      # it. Until this ran in CI the only sequence figure this project had came
+      # from a SQL Server instance reachable over a VPN, recorded in a transcript;
+      # here it is measured on both engines that have containers, on every push.
+      #
+      # Its own step and not another name in the -run alternation above. Both
+      # steps abort before writing their summary when their `go test` fails, so
+      # folded into one the sequence figure would be lost to a per-tool ceiling
+      # breach and the per-tool figures to a sequence breach — and a run where one
+      # measurement broke is exactly the run where the other one is worth reading.
+      #
+      # Nothing here touches CERBERUS_DB_ROW_CAP, although this job sets it to 50
+      # and a byte budget measured under a cap of 50 measures the cap. The test
+      # raises it to the shipped default itself, through the same shippedRowCap
+      # helper the describe_table wire test uses; setting it on this step would
+      # apply to everything the step runs and would make the published figure a
+      # property of this workflow rather than of what a deployment that configures
+      # nothing runs under.
+      #
+      # No `shell:` key, as on the reporting step above: the `set -euo pipefail` in
+      # the body is the whole of what keeps `tee` from swallowing a failed
+      # `go test`, and this step is written so that nothing outside it has to be
+      # right.
+      #
+      # The grep matches measurement wording and nothing else. It used to match
+      # `=== RUN` too, for attribution — the test runs once per engine and the
+      # summary is unreadable if the figures cannot be told apart — but `=== RUN` is
+      # emitted by any `go test -v` at all, so the `|| echo` beside it could never
+      # fire: a run that reached no engine, or a t.Logf whose wording drifted, filled
+      # the summary with subtest headers and no byte figure and left the step green.
+      # Attribution belongs in the log lines instead, which name their engine; this
+      # grep is coupled to that wording by string agreement and by nothing else, so
+      # a line here that stops matching is a summary that reports the fallback while
+      # the measurement passes, and not a failure anything else will catch.
+      - name: report the agent sequence cost
+        run: |
+          set -euo pipefail
+          go test -tags integration -count=1 -timeout 5m \
+            -run '^TestAgentSequenceCostOnTheWire$' -v ./internal/mcp/ \
+            | tee "$RUNNER_TEMP/agent-sequence-size.log"
+          {
+            echo '### agent sequence cost on the wire'
+            echo
+            echo '```'
+            grep -E 'agent sequence|wire size' "$RUNNER_TEMP/agent-sequence-size.log" \
               || echo 'the measurement did not run'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

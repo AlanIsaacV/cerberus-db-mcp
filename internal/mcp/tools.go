@@ -12,8 +12,9 @@ import (
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 )
 
-// The tool names. There are four: search_schema is the deliberately narrow
-// schema-introspection step below the database level. There is still no dry-run
+// The tool names. There are five: search_schema is the deliberately narrow
+// schema-introspection step below the database level, and describe_table is the
+// bounded detail step once that search has found a table. There is still no dry-run
 // validator and nothing that reads or edits the gate's ruleset — a tool that
 // could relax the rules is a tool an agent could use to relax them.
 const (
@@ -21,6 +22,7 @@ const (
 	ToolExecuteQuery    = "execute_query"
 	ToolListDatabases   = "list_databases"
 	ToolSearchSchema    = "search_schema"
+	ToolDescribeTable   = "describe_table"
 )
 
 // ListConnectionsInput is empty: listing takes no arguments. It exists as a type
@@ -116,6 +118,22 @@ type SearchSchemaInput struct {
 	Pattern string `json:"pattern" jsonschema:"a plain case-insensitive substring of a table or column name; do not use LIKE wildcard syntax because % and _ are literal characters"`
 }
 
+// DescribeTableInput is describe_table's whole argument list. Table names and
+// schemas are data that internal/db binds to its fixed catalog reads, rather than
+// text this layer combines with a statement. Schema stays optional because a table
+// discovered without one must still be describable; an unqualified name can name
+// one table in each schema, and internal/db returns every one that matches.
+//
+// There is no limit, object-type or detail selector. The row and byte bounds are
+// server configuration, and the fixed answer is deliberately the complete set of
+// detail an agent needs to form a useful read without creating a second surface
+// that can move either safety property.
+type DescribeTableInput struct {
+	Alias  string `json:"alias" jsonschema:"which configured connection to describe, named exactly as list_connections gives it; this is an alias and not a database name"`
+	Table  string `json:"table" jsonschema:"the exact table name to describe; it is matched literally"`
+	Schema string `json:"schema,omitempty" jsonschema:"optional namespace that narrows the table: on mysql it is the database the alias is bound to; on postgresql and sqlserver it is a schema within that database; a name here is not an alias"`
+}
+
 // SchemaSearchColumn is the wire form of one matching column. It deliberately
 // carries only metadata needed to recognise a column; connection configuration
 // remains on the server side of this boundary.
@@ -142,26 +160,71 @@ type SchemaSearchColumn struct {
 type SchemaSearchTable struct {
 	Schema           string               `json:"schema" jsonschema:"the namespace to qualify this table with inside the database the alias is bound to: on mysql that database's own name, on postgresql and sqlserver a schema within it; a name here is not an alias"`
 	Table            string               `json:"table" jsonschema:"the matching table's name"`
-	Columns          []SchemaSearchColumn `json:"columns" jsonschema:"the columns whose names match the substring; empty when only the table name matched, unless columns_truncated is true"`
-	ColumnsTruncated bool                 `json:"columns_truncated" jsonschema:"true when the byte budget stopped inside this table, so the columns listed here are only the beginning of the ones that matched and an empty list says nothing about this table's columns; search this table again with a longer or more specific substring to see the rest. When false, the columns listed are all of them and an empty list means the table name matched and no column did"`
+	Columns          []SchemaSearchColumn `json:"columns" jsonschema:"the columns whose names match the substring; when top-level truncation is row_cap, an empty or short list can be incomplete regardless of columns_truncated"`
+	ColumnsTruncated bool                 `json:"columns_truncated" jsonschema:"true when the byte budget stopped inside this table, so the columns listed here are only the beginning of the ones that matched and an empty list says nothing about this table's columns; search this table again with a longer or more specific substring to see the rest. When false, this entry was not cut by the byte budget; if top-level truncation is row_cap, do not treat its columns as complete"`
 }
 
-// SearchSchemaResult is the grouped catalog answer. Truncated needs particular
-// care: two bounds can set it — the row cap on the flat catalog rows before
-// internal/db groups them, and the byte budget on the grouped result — and under
-// either one a returned table can hold only part of its matching columns and must
-// not be treated as a complete table description. Which table that was is on the
-// table itself, in [SchemaSearchTable.ColumnsTruncated], where the byte budget was
-// the bound that bit.
+// SearchSchemaResult is the grouped catalog answer. Truncation names which of the
+// two bounds cut it: the row cap on the flat catalog rows before internal/db
+// groups them, or the byte budget on the grouped result. Under either one a
+// returned table can hold only part of its matching columns and must not be
+// treated as a complete table description. Which table that was is on the table
+// itself, in [SchemaSearchTable.ColumnsTruncated], where the byte budget was the
+// bound that bit.
 //
 // ByteBudget is reported for the reason RowCap is. It is the bound a short
 // pattern actually runs into, and an agent told only that its answer was cut off
 // cannot tell whether to narrow the pattern or to page.
 type SearchSchemaResult struct {
 	Tables     []SchemaSearchTable `json:"tables" jsonschema:"one entry per matching table, each with its matching columns"`
-	Truncated  bool                `json:"truncated" jsonschema:"true when the answer was cut short, by the row cap on the catalog rows or by the byte budget on this result; the tables listed are then the beginning of what matched, a listed table can have only part of its matching column list, and a narrower pattern is what returns a complete answer"`
+	Truncation db.Truncation       `json:"truncation" jsonschema:"which bound cut this answer: none means every matching catalog row and assembled entry fit; row_cap means the flat catalog read stopped before grouping; byte_budget means the assembled grouped answer ran out of room. Under either non-none value the tables listed are the beginning of what matched and a listed table can have only part of its matching column list; search again with a longer or more specific substring rather than paging"`
 	RowCap     int                 `json:"row_cap" jsonschema:"the row cap that applied to the flat catalog rows before grouping"`
 	ByteBudget int                 `json:"byte_budget" jsonschema:"the most bytes this result's tables may occupy; a broad pattern reaches this bound long before the row cap"`
+}
+
+// DescribeTableColumn is the wire form of one table column. As with a schema
+// search result, it has no connection configuration: describing a table needs its
+// shape, not the infrastructure where that shape was read.
+type DescribeTableColumn struct {
+	Name     string `json:"name" jsonschema:"the column's name"`
+	DataType string `json:"data_type" jsonschema:"the database's reported type for this column"`
+	Nullable bool   `json:"nullable" jsonschema:"whether this column accepts NULL values"`
+}
+
+// DescribeTableIndex is the portable part of an index an agent can use when it
+// writes a read. The order of Columns is the catalog's key order: replacing it
+// with a sorted list would turn a composite index into a different claim about
+// which predicates can use it.
+type DescribeTableIndex struct {
+	Name    string   `json:"name" jsonschema:"the index's name"`
+	Columns []string `json:"columns" jsonschema:"the index key columns in catalog key order"`
+	Unique  bool     `json:"unique" jsonschema:"whether the index permits only one row for each complete key"`
+}
+
+// DescribedTable is one table the requested name matched. An unqualified name
+// can match more than one PostgreSQL or SQL Server schema, so Schema remains on
+// every entry rather than being repeated from the request. On MySQL it is the
+// database the alias is bound to; in every engine it is a namespace name, not an
+// alias that can be supplied wherever list_connections asks for one.
+type DescribedTable struct {
+	Schema           string                `json:"schema" jsonschema:"the namespace containing this table: on mysql the database the alias is bound to, on postgresql and sqlserver a schema within that database; a name here is not an alias"`
+	Table            string                `json:"table" jsonschema:"the table's name"`
+	Columns          []DescribeTableColumn `json:"columns" jsonschema:"the table's columns with their types and nullability, in catalog order; when top-level truncation is row_cap, an empty or short list can be incomplete regardless of columns_truncated"`
+	ColumnsTruncated bool                  `json:"columns_truncated" jsonschema:"true when the byte budget stopped inside this table, so columns is only its beginning and an empty list says nothing about this table's visible columns. When false, this entry was not cut by the byte budget; if top-level truncation is row_cap, do not treat its columns as complete"`
+	PrimaryKey       []string              `json:"primary_key" jsonschema:"the primary key columns in catalog key order"`
+	Indexes          []DescribeTableIndex  `json:"indexes" jsonschema:"the table's secondary indexes, each with its key columns in catalog key order and uniqueness"`
+}
+
+// DescribeTableResult is the grouped catalog answer. The primary key and indexes
+// are charged before columns in internal/db, so a bound never leaves an agent
+// with a misleading partial key or index. Truncation still names the bound that
+// cut the column list: row_cap means the catalog read stopped, byte_budget means
+// the assembled answer ran out of room, and none means the description is whole.
+type DescribeTableResult struct {
+	Tables     []DescribedTable `json:"tables" jsonschema:"one entry per table matching the requested name and optional schema"`
+	Truncation db.Truncation    `json:"truncation" jsonschema:"which bound cut this answer: none means the complete description fit; row_cap means the column catalog read stopped; byte_budget means the assembled answer ran out of room. Under either non-none value the returned tables and columns are only the beginning of the catalog result, but every returned primary_key and indexes list remains complete"`
+	RowCap     int              `json:"row_cap" jsonschema:"the row cap that applied to each catalog read"`
+	ByteBudget int              `json:"byte_budget" jsonschema:"the most bytes this result's table descriptions may occupy"`
 }
 
 // internalFailure is what the agent is told when this layer produced an error
@@ -187,7 +250,7 @@ type agentError struct{ message string }
 
 func (e *agentError) Error() string { return e.message }
 
-// registerTools installs the four tools on an SDK server.
+// registerTools installs the five tools on an SDK server.
 //
 // They go through the generic AddTool rather than (*Server).AddTool, and that is
 // load-bearing rather than stylistic. The generic path turns an error returned
@@ -238,10 +301,23 @@ func (s *Server) registerTools(srv *sdk.Server) {
 		Name: ToolSearchSchema,
 		Description: "Find tables and columns in the one database an alias is bound to, by a plain case-insensitive substring; aliases not bound to one database are refused. " +
 			"Pass an alias from list_connections and ordinary text such as archive or measure; do not write LIKE wildcards, because % and _ are searched literally. " +
-			"Results are grouped by table, capped under the same server-configured row limit reported by list_connections, and bounded again by a byte budget so that no pattern can return the whole schema. If truncated is true, the tables listed are only the beginning of what matched and a listed table can have only part of its matching columns: search again with a longer or more specific substring rather than treating the answer as complete. " +
+			"Results are grouped by table, capped under the same server-configured row limit reported by list_connections, and bounded again by a byte budget so that no pattern can return the whole schema. If truncation is non-none, the tables listed are only the beginning of what matched and a listed table can have only part of its matching columns: search again with a longer or more specific substring rather than treating the answer as complete. " +
 			"A table's own columns_truncated tells you which one that was, and an empty column list means no column matched only on a table where it is false.",
 		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true},
 	}, s.searchSchema)
+
+	// The schema name in this tool's answer has the same alias-safety burden as
+	// list_databases: it is useful to qualify a table, but it is not a configured
+	// connection. Saying that here is what keeps a discovered namespace from being
+	// handed back as an alias. The description also says why the short-answer
+	// signal exists: columns may be cut, but the key and index detail never is.
+	sdk.AddTool(srv, &sdk.Tool{
+		Name: ToolDescribeTable,
+		Description: "Describe one table in the database an alias is bound to, including every column's type and nullability, the primary key, and the secondary indexes with their key columns and uniqueness. " +
+			"Pass an alias from list_connections and an exact table name; leave schema out to receive every matching table, or pass a returned schema name to narrow the answer. A schema name is not an alias. " +
+			"The answer is bounded by the server-configured row cap and byte budget, and truncation says which bound cut it. A short answer can contain only the beginning of the column list, while its primary key and indexes remain complete.",
+		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true},
+	}, s.describeTable)
 }
 
 // caller resolves the two identity fields of an audit event from the context the
@@ -425,7 +501,7 @@ func (s *Server) searchSchema(ctx context.Context, _ *sdk.CallToolRequest, in Se
 		Reason:    search.Decision.Reason,
 		RuleID:    search.Decision.RuleID,
 		Rows:      len(search.Tables),
-		Truncated: search.Truncated,
+		Truncated: search.Truncation != db.NoTruncation,
 		Elapsed:   elapsed,
 	})
 
@@ -460,27 +536,108 @@ func (s *Server) searchSchema(ctx context.Context, _ *sdk.CallToolRequest, in Se
 	// half the ceiling this surface is graded against because of it.
 	return nil, &SearchSchemaResult{
 		Tables:     tables,
-		Truncated:  search.Truncated,
+		Truncation: search.Truncation,
 		RowCap:     search.RowCap,
 		ByteBudget: search.ByteBudget,
 	}, nil
 }
 
+func (s *Server) describeTable(ctx context.Context, _ *sdk.CallToolRequest, in DescribeTableInput) (*sdk.CallToolResult, *DescribeTableResult, error) {
+	started := time.Now()
+
+	// As with search_schema, internal/db owns the fixed per-engine catalog reads,
+	// their gate validation and the bounded read-only transactions. This handler
+	// therefore has one execution path and maps the already-bounded answer without
+	// holding a second spelling of a statement or a second error path.
+	description, err := s.executor.DescribeTable(ctx, in.Alias, in.Table, in.Schema)
+	elapsed := time.Since(started)
+	if err != nil {
+		return nil, nil, s.refuseOrFail(ctx, attempt{tool: ToolDescribeTable, alias: in.Alias}, elapsed, err)
+	}
+
+	email, subject := s.caller(ctx, ToolDescribeTable)
+	s.audit.Record(AuditEvent{
+		Tool:      ToolDescribeTable,
+		Identity:  email,
+		Subject:   subject,
+		Alias:     description.Alias,
+		Engine:    description.Engine,
+		Outcome:   OutcomeAllowed,
+		Verdict:   description.Decision.Verdict,
+		Reason:    description.Decision.Reason,
+		RuleID:    description.Decision.RuleID,
+		Rows:      len(description.Tables),
+		Truncated: description.Truncation != db.NoTruncation,
+		Elapsed:   elapsed,
+	})
+
+	tables := make([]DescribedTable, len(description.Tables))
+	for i, table := range description.Tables {
+		columns := make([]DescribeTableColumn, len(table.Columns))
+		for j, column := range table.Columns {
+			// These catalog values use the same conversion boundary as query rows,
+			// even though the current result types make every value primitive. A
+			// driver representation must not get a second path to the wire merely
+			// because it arrived through a metadata read.
+			columns[j] = DescribeTableColumn{
+				Name:     jsonValue(column.Name).(string),
+				DataType: jsonValue(column.DataType).(string),
+				Nullable: jsonValue(column.Nullable).(bool),
+			}
+		}
+		primaryKey := make([]string, len(table.PrimaryKey))
+		for j, column := range table.PrimaryKey {
+			primaryKey[j] = jsonValue(column).(string)
+		}
+		indexes := make([]DescribeTableIndex, len(table.Indexes))
+		for j, index := range table.Indexes {
+			columns := make([]string, len(index.Columns))
+			for k, column := range index.Columns {
+				columns[k] = jsonValue(column).(string)
+			}
+			indexes[j] = DescribeTableIndex{
+				Name:    jsonValue(index.Name).(string),
+				Columns: columns,
+				Unique:  jsonValue(index.Unique).(bool),
+			}
+		}
+		tables[i] = DescribedTable{
+			Schema:           jsonValue(table.Schema).(string),
+			Table:            jsonValue(table.Table).(string),
+			Columns:          columns,
+			ColumnsTruncated: jsonValue(table.ColumnsTruncated).(bool),
+			PrimaryKey:       primaryKey,
+			Indexes:          indexes,
+		}
+	}
+
+	// The SDK emits this typed value both as structured content and as a JSON text
+	// block. Keeping that doubled rendering here, as search_schema does, is why
+	// internal/db charges this result against the same half-wire byte budget.
+	return nil, &DescribeTableResult{
+		Tables:     tables,
+		Truncation: description.Truncation,
+		RowCap:     description.RowCap,
+		ByteBudget: description.ByteBudget,
+	}, nil
+}
+
 // attempt is what [Server.refuseOrFail] has to know about the call that failed.
 //
-// It exists so that the two tools which can fail share one reduction from a
-// *db.Error to what the agent may read, instead of the second one getting a copy.
+// It exists so that list_databases, search_schema and describe_table share one
+// reduction from a *db.Error to what the agent may read, instead of the next tool
+// getting a copy.
 // That reduction is the credential guarantee at this boundary, and two copies of it
 // are two places for the next tool to diverge from — see the ADR behind
 // [agentError].
 type attempt struct {
 	tool  string
 	alias string
-	// statement is the agent's own SQL, and it is empty for list_databases and
-	// search_schema: those tools' statements are internal/db's per-engine
-	// constants, which this package does not hold and must not hold second
-	// spellings of just to fill a field. The tool name says exactly which statement
-	// ran.
+	// statement is the agent's own SQL, and it is empty for list_databases,
+	// search_schema and describe_table: those tools' statements are internal/db's
+	// per-engine constants, which this package does not hold and must not hold
+	// second spellings of just to fill a field. The tool name says exactly which
+	// statement ran.
 	statement string
 }
 

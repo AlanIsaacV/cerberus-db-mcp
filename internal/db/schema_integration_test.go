@@ -101,8 +101,8 @@ func TestSearchSchemaGroupsOnlyMatchingColumns(t *testing.T) {
 					t.Errorf("name-matched %s.%s reports a cut column list under a %d-byte budget it never approached", table.Schema, table.Table, byTableName.ByteBudget)
 				}
 			}
-			if byTableName.Truncated {
-				t.Errorf("a two-table name match reports truncation under a %d-byte budget and a row cap of %d", byTableName.ByteBudget, byTableName.RowCap)
+			if byTableName.Truncation != NoTruncation {
+				t.Errorf("a two-table name match reports truncation %q under a %d-byte budget and a row cap of %d, want %q", byTableName.Truncation, byTableName.ByteBudget, byTableName.RowCap, NoTruncation)
 			}
 
 			byColumn, err := h.SearchSchema(context.Background(), h.alias, "title")
@@ -113,8 +113,12 @@ func TestSearchSchemaGroupsOnlyMatchingColumns(t *testing.T) {
 			// The expectation covers the 256-column archive as well, whose entry must
 			// carry its one matching column and no other.
 			assertSchemaTables(t, byColumn.Tables, wantColumn)
-			if byColumn.Truncated != columnTruncated {
-				t.Errorf("SearchSchema(title) truncated = %v over %d tables, want %v", byColumn.Truncated, len(byColumn.Tables), columnTruncated)
+			wantColumnTruncation := NoTruncation
+			if columnTruncated {
+				wantColumnTruncation = ByteBudgetTruncation
+			}
+			if byColumn.Truncation != wantColumnTruncation {
+				t.Errorf("SearchSchema(title) truncation = %q over %d tables, want %q", byColumn.Truncation, len(byColumn.Tables), wantColumnTruncation)
 			}
 
 			byMeasure, err := h.SearchSchema(context.Background(), h.alias, "measure")
@@ -135,8 +139,8 @@ func TestSearchSchemaGroupsOnlyMatchingColumns(t *testing.T) {
 				t.Errorf("SearchSchema(measure) returned %d of 250 columns and no entry saying its column list was cut: %v",
 					schemaColumnCount(byMeasure.Tables), schemaTableIDs(byMeasure.Tables))
 			}
-			if !byMeasure.Truncated {
-				t.Errorf("SearchSchema(measure) returned %d of 250 columns without reporting truncation", schemaColumnCount(byMeasure.Tables))
+			if byMeasure.Truncation != ByteBudgetTruncation {
+				t.Errorf("SearchSchema(measure) truncation = %q after returning %d of 250 columns, want %q", byMeasure.Truncation, schemaColumnCount(byMeasure.Tables), ByteBudgetTruncation)
 			}
 			assertSchemaOrder(t, byColumn.Tables)
 			assertSchemaOrder(t, byMeasure.Tables)
@@ -261,11 +265,15 @@ func TestSearchSchemaReportsTruncation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SearchSchema(archive) = %v", err)
 			}
-			if !result.Truncated || result.RowCap != 2 {
-				t.Errorf("SearchSchema(archive) truncation = %v at row cap %d, want true at 2", result.Truncated, result.RowCap)
+			if result.Truncation != RowCapTruncation || result.RowCap != 2 {
+				t.Errorf("SearchSchema(archive) truncation = %q at row cap %d, want %q at 2", result.Truncation, result.RowCap, RowCapTruncation)
 			}
-			// Both bounds are reported whichever one bit, so an agent that reads a
-			// truncated answer can tell what to calibrate a narrower pattern against.
+			// The row cap can leave a name-matched table with no matching columns and
+			// no byte-budget marker, which is exactly the ambiguity the named cause
+			// closes.
+			if len(result.Tables) != 1 || len(result.Tables[0].Columns) != 0 || result.Tables[0].ColumnsTruncated {
+				t.Errorf("SearchSchema(archive) tables = %#v, want a row-cap-cut name match with no byte-budget marker", result.Tables)
+			}
 			if result.ByteBudget != SchemaResultBudget {
 				t.Errorf("SearchSchema(archive) reports byte budget %d, want %d", result.ByteBudget, SchemaResultBudget)
 			}
@@ -304,8 +312,8 @@ func TestSearchSchemaSharedColumnPatternCannotReturnTheCatalog(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SearchSchema(%q) = %v", pattern, err)
 			}
-			if !result.Truncated {
-				t.Errorf("SearchSchema(%q) returned %d tables and %d columns without reporting truncation", pattern, len(result.Tables), schemaColumnCount(result.Tables))
+			if result.Truncation != ByteBudgetTruncation {
+				t.Errorf("SearchSchema(%q) truncation = %q after returning %d tables and %d columns, want %q", pattern, result.Truncation, len(result.Tables), schemaColumnCount(result.Tables), ByteBudgetTruncation)
 			}
 			if result.ByteBudget != SchemaResultBudget {
 				t.Errorf("SearchSchema(%q) reports byte budget %d, want %d", pattern, result.ByteBudget, SchemaResultBudget)
@@ -389,8 +397,8 @@ func TestSearchSchemaAssembledTablesStayWithinTheBudget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SearchSchema(measure) = %v", err)
 			}
-			if !worst.Truncated {
-				t.Fatal("the 250-column measure search is not truncated, so it is no longer the worst case the budget produces")
+			if worst.Truncation != ByteBudgetTruncation {
+				t.Fatalf("the 250-column measure search truncation = %q, want %q so this remains the byte-budget worst case", worst.Truncation, ByteBudgetTruncation)
 			}
 			worstSize := schemaJSONSize(t, worst.Tables)
 			t.Logf("worst assembled schema-search result on %s: %d bytes of tables (%d with the execution facts) for %d tables and %d matching columns, against a %d-byte budget it charged %d bytes to",

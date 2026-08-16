@@ -226,11 +226,11 @@ func (h *harness) auditEvents(t *testing.T) []map[string]any {
 	return out
 }
 
-// TestToolsListIsExactlyTheFourToolsWithDerivedSchemas is the explicit tool
+// TestToolsListIsExactlyTheFiveToolsWithDerivedSchemas is the explicit tool
 // contract. The schemas are asserted whole rather than by spot-checking a
 // property, so a new input — especially a limit or object-type argument — fails
 // rather than quietly becoming part of the surface.
-func TestToolsListIsExactlyTheFourToolsWithDerivedSchemas(t *testing.T) {
+func TestToolsListIsExactlyTheFiveToolsWithDerivedSchemas(t *testing.T) {
 	h := connect(t, unreachableExecutor(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -244,7 +244,7 @@ func TestToolsListIsExactlyTheFourToolsWithDerivedSchemas(t *testing.T) {
 	for _, tool := range list.Tools {
 		got[tool.Name] = tool
 	}
-	wantTools := []string{ToolListConnections, ToolExecuteQuery, ToolListDatabases, ToolSearchSchema}
+	wantTools := []string{ToolListConnections, ToolExecuteQuery, ToolListDatabases, ToolSearchSchema, ToolDescribeTable}
 	missing := false
 	for _, name := range wantTools {
 		if got[name] == nil {
@@ -259,7 +259,7 @@ func TestToolsListIsExactlyTheFourToolsWithDerivedSchemas(t *testing.T) {
 		t.Fatalf("tools/list = %v, want exactly %v", names, wantTools)
 	}
 
-	// These are the schemas the SDK derived by reflection from the four input types.
+	// These are the schemas the SDK derived by reflection from the five input types.
 	// Written out rather than recomputed from the same types, because a test that
 	// derives its expectation the same way the code does cannot notice the code
 	// changing.
@@ -284,6 +284,16 @@ func TestToolsListIsExactlyTheFourToolsWithDerivedSchemas(t *testing.T) {
 			`"alias":{"type":"string","description":"which configured connection to search, named exactly as list_connections gives it; this is an alias and not a database name"},` +
 			`"pattern":{"type":"string","description":"a plain case-insensitive substring of a table or column name; do not use LIKE wildcard syntax because % and _ are literal characters"}},` +
 			`"required":["alias","pattern"]}`,
+		// The required alias and table deliberately leave schema as the one optional
+		// narrowing argument. A limit or a key/index selector would move a safety
+		// bound or weaken the fixed useful answer, and the literal assertion catches
+		// either addition as well as a jsonschema tag drifting.
+		ToolDescribeTable: `{"additionalProperties":false,"type":"object",` +
+			`"properties":{` +
+			`"alias":{"type":"string","description":"which configured connection to describe, named exactly as list_connections gives it; this is an alias and not a database name"},` +
+			`"table":{"type":"string","description":"the exact table name to describe; it is matched literally"},` +
+			`"schema":{"type":"string","description":"optional namespace that narrows the table: on mysql it is the database the alias is bound to; on postgresql and sqlserver it is a schema within that database; a name here is not an alias"}},` +
+			`"required":["alias","table"]}`,
 	} {
 		var want any
 		if err := json.Unmarshal([]byte(wantJSON), &want); err != nil {

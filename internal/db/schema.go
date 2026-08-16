@@ -15,20 +15,37 @@ type SchemaSearch struct {
 	Engine   gate.Engine
 	Decision gate.Decision
 	Tables   []SchemaTable
-	// Truncated is true when either bound stopped the answer short: the row cap on
-	// the flat catalog rows before they are grouped, or [SchemaResultBudget] on the
-	// grouped result. Either way a returned table can hold only part of its matching
-	// column list, so callers must report it rather than treating Tables as
-	// complete. Where the byte budget was the bound that bit,
-	// [SchemaTable.ColumnsTruncated] names the one table it cut into.
-	Truncated bool
-	RowCap    int
+	// Truncation names the bound that made Tables incomplete. RowCapTruncation says
+	// the flat catalog read ended before grouping; ByteBudgetTruncation says the
+	// assembled answer ran out of room after grouping began; NoTruncation says the
+	// answer is complete. Those are distinct claims: a name-matched table can have
+	// an empty Columns slice after a row-cap cut without [SchemaTable.ColumnsTruncated],
+	// which is otherwise the same shape as the complete claim that no column matched.
+	//
+	// A byte-budget cut wins if both bounds were reached. The row cap may then have
+	// stopped catalog rows beyond the returned prefix, but the bound that cut the
+	// assembled answer the caller holds is the byte budget.
+	Truncation Truncation
+	RowCap     int
 	// ByteBudget is the budget that applied, reported for the reason RowCap is: a
 	// bound the agent is not told about is a bound it cannot calibrate a narrower
 	// pattern against.
 	ByteBudget int
 	Elapsed    time.Duration
 }
+
+// Truncation names the one bound that made a bounded catalog answer incomplete.
+// It is top-level rather than another field on [SchemaTable] because the row cap
+// cuts the flat read before grouping and therefore has no one table it can mark.
+// That placement also keeps the per-table budget accounting below complete: the
+// wire shape of each entry has not grown.
+type Truncation string
+
+const (
+	NoTruncation         Truncation = "none"
+	RowCapTruncation     Truncation = "row_cap"
+	ByteBudgetTruncation Truncation = "byte_budget"
+)
 
 // SchemaTable is one matching table. Columns contains only columns whose names
 // match the requested substring. A table that matched by its own name alone has
@@ -150,7 +167,8 @@ func schemaPattern(pattern string) (string, bool) {
 //   - Within a table it stops at a column, not at the table boundary. Stopping at
 //     the boundary would return nothing at all for a search whose first matching
 //     table is wide — the 256-column case this surface exists for — and a partial
-//     column list under Truncated is the same contract the row cap already has.
+//     column list under a non-none [Truncation] is the same contract the row cap
+//     already has.
 //   - The entry the cut landed inside stays in the answer and sets ColumnsTruncated
 //     on itself, rather than being dropped so that every returned entry is complete.
 //     Dropping it was considered and rejected on the case this surface exists for:
@@ -216,9 +234,9 @@ func schemaTables(rows [][]any, budget int) ([]SchemaTable, bool) {
 		if spent+cost > budget {
 			if found {
 				// The cut landed inside a table the answer already holds, so what it dropped
-				// is one of that table's columns. Only this entry can say so: Truncated says
-				// the answer is a prefix, not which table stops being a complete statement
-				// about its own columns.
+				// is one of that table's columns. Only this entry can say so: the top-level
+				// Truncation names the bound, not which table stops being a complete
+				// statement about its own columns.
 				out[index].ColumnsTruncated = true
 			}
 			return out, true
