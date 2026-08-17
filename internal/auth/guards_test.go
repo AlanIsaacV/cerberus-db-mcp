@@ -52,6 +52,7 @@ var requiredSources = []string{
 	"config.go",
 	"identity.go",
 	"middleware.go",
+	sealingFile,
 	tokenFile,
 	path.Join(cmdDir, "main.go"),
 }
@@ -71,6 +72,11 @@ var requiredTokenScanSources = append([]string{
 // at a file that no longer has anything to hide.
 const tokenFile = "tokeninfo.go"
 
+// sealingFile holds credentials this process issued. Like [tokenFile], it is a
+// deliberately narrow place for credential material and must not import a
+// logger or formatter.
+const sealingFile = "sealing.go"
+
 // allowedImports is the whole of what this package's non-test files may import.
 //
 // It is enumerated rather than filtered for the reason internal/mcp's is: this is
@@ -82,7 +88,12 @@ const tokenFile = "tokeninfo.go"
 var allowedImports = map[string]bool{
 	"container/list":              true, // the LRU, so that a cache needs no dependency
 	"context":                     true,
+	"crypto/aes":                  true,
+	"crypto/cipher":               true,
+	"crypto/hkdf":                 true,
+	"crypto/rand":                 true,
 	"crypto/sha256":               true, // the cache key, and the only lasting form of a token
+	"encoding/base64":             true,
 	"encoding/hex":                true,
 	"encoding/json":               true,
 	"errors":                      true,
@@ -103,8 +114,9 @@ var allowedImports = map[string]bool{
 // allowlist says.
 //
 // An OAuth library would mean this package could acquire, refresh or store a
-// credential, and it acquires none: it checks somebody else's token and holds no
-// secret of its own. The MCP SDK would mean it had learned about the protocol it
+// credential, and it acquires none: it validates a credential issued elsewhere
+// and holds only the sealing master secret, which it never acquires from a third
+// party. The MCP SDK would mean it had learned about the protocol it
 // guards, and the seam it hands out is a plain net/http decorator precisely so that
 // it cannot. A database driver here would be a query path that never saw the gate.
 var forbiddenImportSubstrings = []string{
@@ -125,7 +137,7 @@ var forbiddenImportSubstrings = []string{
 // spelled `presented`, and enumerating exact spellings is a game the next edit
 // wins. It is over-broad by construction, which is the safe direction: the cost of
 // a false positive here is renaming a variable in review.
-var tokenBearingStems = []string{"token", "bearer", "credential", "secret", "presented"}
+var tokenBearingStems = []string{"token", "bearer", "credential", "secret", "presented", "key"}
 
 // tokenBearingIdents are the exact names of the structural carriers — the URL the
 // token is a query parameter of, the request that URL is on, the header values it
@@ -135,11 +147,17 @@ var tokenBearingIdents = []string{
 	"endpoint", "query", "req", "resp", "values", "authorization", "creds", "header",
 }
 
-// carriesTheToken reports whether an identifier of this name is one the token guard
-// treats as holding the credential or something derived from it.
-func carriesTheToken(name string) bool {
+// carriesTheToken reports whether an identifier of this name in file is one the
+// token guard treats as holding the credential or something derived from it.
+func carriesTheToken(file, name string) bool {
 	lower := strings.ToLower(name)
 	for _, stem := range tokenBearingStems {
+		// A bare key is the conventional iterator over a database row's map keys,
+		// which internal/mcp renders as a JSON property name. It is exempt only
+		// there: key material in internal/auth must remain visible to this guard.
+		if stem == "key" && lower == "key" && strings.HasPrefix(file, mcpDir+"/") {
+			continue
+		}
 		if strings.Contains(lower, stem) {
 			return true
 		}
@@ -148,15 +166,18 @@ func carriesTheToken(name string) bool {
 }
 
 // holdsTheTokenItself is the narrower question the rebinding check asks: is this
-// identifier the credential, or a name that merely mentions one.
+// identifier in file the credential, or a name that merely mentions one.
 //
 // A stem at the end of a name is the thing itself — token, accessToken,
 // rawCredential. A stem in the middle is usually a name *about* it:
 // failureTokenRejected is the class a rejection is logged under, and copying that
 // into a local is not a credential moving anywhere.
-func holdsTheTokenItself(name string) bool {
+func holdsTheTokenItself(file, name string) bool {
 	lower := strings.ToLower(name)
 	for _, stem := range tokenBearingStems {
+		if stem == "key" && lower == "key" && strings.HasPrefix(file, mcpDir+"/") {
+			continue
+		}
 		if strings.HasSuffix(lower, stem) {
 			return true
 		}
@@ -281,7 +302,7 @@ func TestPackageImportsNothingItShouldNot(t *testing.T) {
 			}
 			for _, bad := range forbiddenImportSubstrings {
 				if strings.Contains(imported, bad) {
-					t.Errorf("%s imports %q: this package validates somebody else's token and holds no credential of its own", name, imported)
+					t.Errorf("%s imports %q: this package validates a credential issued elsewhere and holds only the sealing master secret, which it never acquires from a third party", name, imported)
 				}
 			}
 		}
@@ -323,14 +344,16 @@ func TestPackageImportsNothingItShouldNot(t *testing.T) {
 func TestTheRawTokenNeverReachesALogger(t *testing.T) {
 	fset, files := parseTokenScanFiles(t)
 
-	// One: the file holding the token cannot log or format.
-	for _, spec := range files[tokenFile].Imports {
-		imported, err := strconv.Unquote(spec.Path.Value)
-		if err != nil {
-			t.Fatalf("unquote import %s: %v", spec.Path.Value, err)
-		}
-		if imported == "github.com/rs/zerolog" || imported == "fmt" || imported == "log" || imported == "log/slog" {
-			t.Errorf("%s imports %q; the file that holds the raw bearer token must have nothing to write it with", tokenFile, imported)
+	// One: the two files holding credentials cannot log or format.
+	for _, source := range []string{tokenFile, sealingFile} {
+		for _, spec := range files[source].Imports {
+			imported, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				t.Fatalf("unquote import %s: %v", spec.Path.Value, err)
+			}
+			if imported == "github.com/rs/zerolog" || imported == "fmt" || imported == "log" || imported == "log/slog" {
+				t.Errorf("%s imports %q; the file that holds credentials must have nothing to write them with", source, imported)
+			}
 		}
 	}
 
@@ -360,7 +383,7 @@ func TestTheRawTokenNeverReachesALogger(t *testing.T) {
 					if !ok {
 						return true
 					}
-					if carriesTheToken(id.Name) {
+					if carriesTheToken(name, id.Name) {
 						t.Errorf("%s:%d passes %s to %s, which renders a value where a person can read it; the bearer token and everything derived from it must not reach one",
 							name, fset.Position(id.Pos()).Line, id.Name, sel.Sel.Name)
 					}
@@ -403,11 +426,11 @@ func TestTheRawTokenNeverReachesALogger(t *testing.T) {
 			}
 			for i, value := range rhs {
 				source, ok := value.(*ast.Ident)
-				if !ok || !holdsTheTokenItself(source.Name) {
+				if !ok || !holdsTheTokenItself(name, source.Name) {
 					continue
 				}
 				if i < len(lhs) {
-					if target, ok := lhs[i].(*ast.Ident); ok && carriesTheToken(target.Name) {
+					if target, ok := lhs[i].(*ast.Ident); ok && carriesTheToken(name, target.Name) {
 						// Still named as what it is, so the checks above still see it.
 						continue
 					}
@@ -531,7 +554,7 @@ func TestTheAllowlistCannotBeEmptiedByConfiguration(t *testing.T) {
 				return true
 			}
 			if strings.Contains(value, "CERBERUS_AUTH_") {
-				t.Errorf("%s:%d gives a CERBERUS_AUTH_* variable a default: %q. Neither of these variables has a safe default",
+				t.Errorf("%s:%d gives a CERBERUS_AUTH_* variable a default: %q. None of these three variables has a safe default",
 					name, fset.Position(lit.Pos()).Line, value)
 			}
 			return true

@@ -532,7 +532,7 @@ func TestTheCacheIsBoundedAndForgetsItsOldestEntry(t *testing.T) {
 // constructed object rather than the constants, so that a bound loosened by
 // editing the constructor fails here too.
 func TestTheProductionValidatorTalksOnlyToGoogleOverHTTPSWithinItsBounds(t *testing.T) {
-	middleware, err := NewMiddleware(Config{ClientID: testClientID, AllowedEmails: []string{"a@example.com"}}, discardLogger())
+	middleware, err := NewMiddleware(Config{ClientID: testClientID, AllowedEmails: []string{"a@example.com"}, SealingSecret: testSealingSecret}, discardLogger())
 	if err != nil {
 		t.Fatalf("NewMiddleware: %v", err)
 	}

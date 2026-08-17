@@ -62,7 +62,7 @@ func run(log zerolog.Logger) error {
 	}
 
 	// Beside the server's own configuration, and before the audit destination is
-	// opened, because the two variables read here are the ones whose absence would
+	// opened, because the three variables read here are the ones whose absence would
 	// otherwise start a server that works: internal/mcp reads a nil Middleware as
 	// no wrapping — which is what keeps every test that builds a Server without one
 	// working — so this call is the whole of what stands between an unset variable
@@ -84,11 +84,13 @@ func run(log zerolog.Logger) error {
 		return err
 	}
 
-	// Unredacted, and the argument for it: a client ID is a public identifier, there
-	// is no OAuth secret anywhere in this process because checking somebody else's
-	// credential does not need one, and a client ID differing from the one the agent
-	// was configured with answers 401 to every request and produces no other symptom
-	// — so both values side by side in a deploy log turn an afternoon into a minute.
+	// Unredacted, and the argument for it: a client ID is a public identifier. This
+	// process also holds a sealing master secret, but that value is deliberately
+	// absent from this record; it is sensitive whereas a client ID is not. Checking
+	// somebody else's credential needs no Google client secret, and a client ID
+	// differing from the one the agent was configured with answers 401 to every
+	// request and produces no other symptom — so both values side by side in a deploy
+	// log turn an afternoon into a minute.
 	// The allowlist is beside it twice, and the pair is the point. The raw entries are
 	// what reads against the variable an operator set; the normalised ones are what a
 	// request is actually compared with, so the trailing comma that admits nobody and

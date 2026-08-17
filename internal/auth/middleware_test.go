@@ -44,9 +44,11 @@ type authHarness struct {
 	// test asserts on it, because a status code alone does not say that no tool ran.
 	reached atomic.Int64
 
-	mu         sync.Mutex
-	identity   Identity
-	identityOK bool
+	mu                     sync.Mutex
+	identity               Identity
+	identityOK             bool
+	authorizationAtHandler []string
+	authorizationAfter     []string
 }
 
 func serveBehindAuth(t *testing.T, cfg Config, f *fakeTokeninfo) *authHarness {
@@ -62,12 +64,46 @@ func serveBehindAuthWithin(t *testing.T, cfg Config, f *fakeTokeninfo, timeout t
 		id, ok := IdentityFrom(r.Context())
 		h.mu.Lock()
 		h.identity, h.identityOK = id, ok
+		h.authorizationAtHandler = r.Header.Values("Authorization")
 		h.mu.Unlock()
 		w.WriteHeader(handlerReached)
 		_, _ = w.Write([]byte("the protected handler ran"))
 	})
 	v := newValidator(cfg.ClientID, f.url, newHTTPClient(timeout), time.Now)
-	server := httptest.NewServer(newMiddleware(cfg, zerolog.New(h.appLog), v)(next))
+	guarded := newMiddleware(cfg, zerolog.New(h.appLog), v)(next)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		guarded.ServeHTTP(w, r)
+		h.mu.Lock()
+		h.authorizationAfter = r.Header.Values("Authorization")
+		h.mu.Unlock()
+	}))
+	t.Cleanup(server.Close)
+	h.url = server.URL
+	return h
+}
+
+func serveBehindAuthAt(t *testing.T, cfg Config, f *fakeTokeninfo, now func() time.Time) *authHarness {
+	t.Helper()
+	h := &authHarness{tokeninfo: f, appLog: &bytes.Buffer{}}
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.reached.Add(1)
+		id, ok := IdentityFrom(r.Context())
+		h.mu.Lock()
+		h.identity, h.identityOK = id, ok
+		h.authorizationAtHandler = r.Header.Values("Authorization")
+		h.mu.Unlock()
+		w.WriteHeader(handlerReached)
+		_, _ = w.Write([]byte("the protected handler ran"))
+	})
+	sealer := testSealer(t, cfg.SealingSecret)
+	v := newValidator(cfg.ClientID, f.url, newHTTPClient(2*time.Second), now)
+	guarded := newMiddlewareWithSealer(cfg, zerolog.New(h.appLog), v, sealer, now)(next)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		guarded.ServeHTTP(w, r)
+		h.mu.Lock()
+		h.authorizationAfter = r.Header.Values("Authorization")
+		h.mu.Unlock()
+	}))
 	t.Cleanup(server.Close)
 	h.url = server.URL
 	return h
@@ -96,6 +132,12 @@ func (h *authHarness) observedIdentity() (Identity, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.identity, h.identityOK
+}
+
+func (h *authHarness) observedAuthorization() (atHandler, after []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.authorizationAtHandler...), append([]string(nil), h.authorizationAfter...)
 }
 
 // rejections is every line the middleware wrote to the application log, decoded.
@@ -129,7 +171,9 @@ func challengeFor(t *testing.T, class string) string {
 	switch class {
 	case failureAbsentHeader, failureRepeatedHeader, failureMalformedHeader, failureTokenRejected:
 		return `Bearer realm="cerberus-db-mcp"`
-	case failureUnavailable, failureNoTokenValidation,
+	case failureSealedCredentialExpired, failureSealedCredentialCorrupt, failureSealedCredentialWrongPurpose:
+		return `Bearer realm="cerberus-db-mcp"`
+	case failureUnavailable, failureNoTokenValidation, failureNoSealedCredentialValidation,
 		failureNotAllowlisted, failureEmailUnverified, failureNoEmailInToken:
 		return ""
 	}
@@ -171,8 +215,19 @@ func (h *authHarness) assertRejected(t *testing.T, resp *http.Response, status i
 	}
 }
 
+func (h *authHarness) assertAuthorizationGone(t *testing.T) {
+	t.Helper()
+	atHandler, after := h.observedAuthorization()
+	if len(atHandler) != 0 {
+		t.Errorf("the handler behind the middleware still sees an Authorization header: %q", atHandler)
+	}
+	if len(after) != 0 {
+		t.Errorf("the request still carries an Authorization header after the middleware answered: %q", after)
+	}
+}
+
 func allowlistOf(addresses ...string) Config {
-	return Config{ClientID: testClientID, AllowedEmails: addresses}
+	return Config{ClientID: testClientID, AllowedEmails: addresses, SealingSecret: testSealingSecret}
 }
 
 // TestARequestWithNoUsableBearerTokenNeverReachesTheHandler is acceptance
@@ -464,6 +519,10 @@ func TestATokenCarryingNoEmailIsRefusedAsThatRatherThanAsAnUnknownIdentity(t *te
 			if strings.Contains(message, "is not allowed on this server") {
 				t.Errorf("message = %q, which diagnoses an allowlist that has nothing wrong with it", message)
 			}
+			const wantMessage = "request refused before any tool: Google vouched for this token and returned no email address with it, so there is nothing for the allowlist to match; check that the client requested the email scope before changing the allowlist"
+			if message != wantMessage {
+				t.Errorf("message = %q, want %q", message, wantMessage)
+			}
 		})
 	}
 }
@@ -532,6 +591,216 @@ func TestAnAllowlistedIdentityReachesTheHandlerCarryingItsSubjectAndEmail(t *tes
 	}
 }
 
+// TestASealedCredentialReachesTheHandlerAsTheSameIdentity is acceptance
+// criterion 6. The sealed route is local, so Google must not see a request; the
+// identity after the branch is nevertheless the same shape the Google route puts
+// in the context.
+func TestASealedCredentialReachesTheHandlerAsTheSameIdentity(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		subject string
+		email   string
+	}{
+		{"a verified allowlisted identity", "108134201943512340987", "One@Example.test"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newClock()
+			f := newFakeTokeninfo(t, respondWith(http.StatusInternalServerError, ""))
+			cfg := allowlistOf("one@example.TEST")
+			h := serveBehindAuthAt(t, cfg, f, clock.now)
+			sealed, err := testSealer(t, cfg.SealingSecret).SealAccess(AccessCredential{
+				Subject: tt.subject, Email: tt.email, Verified: true, ExpiresAt: clock.now().Add(time.Hour),
+			})
+			if err != nil {
+				t.Fatalf("SealAccess: %v", err)
+			}
+
+			resp := h.get(t, "Bearer "+sealed)
+			if resp.StatusCode != handlerReached {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d (%s), want the protected handler to have answered", resp.StatusCode, body)
+			}
+			if got := h.reached.Load(); got != 1 {
+				t.Errorf("the protected handler ran %d times, want 1", got)
+			}
+			id, ok := h.observedIdentity()
+			if !ok {
+				t.Fatal("the handler found no identity on its context")
+			}
+			if id != (Identity{Subject: tt.subject, Email: tt.email}) {
+				t.Errorf("Identity = %#v, want %#v", id, Identity{Subject: tt.subject, Email: tt.email})
+			}
+			if got := f.requests.Load(); got != 0 {
+				t.Errorf("Tokeninfo saw %d requests for a sealed credential, want 0", got)
+			}
+			h.assertAuthorizationGone(t)
+		})
+	}
+}
+
+// TestASealedCredentialWithAnIdentityTheServerWillNotAdmitIsForbidden is
+// acceptance criterion 7. The allowlist is deliberately evaluated after
+// unsealing on every request, so removing an address applies immediately.
+func TestASealedCredentialWithAnIdentityTheServerWillNotAdmitIsForbidden(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		identity AccessCredential
+		allowed  []string
+		class    string
+		message  string
+	}{
+		{
+			name:     "an absent email",
+			identity: AccessCredential{Subject: "sub-1", Verified: true},
+			allowed:  []string{"one@example.test"},
+			class:    failureNoEmailInToken,
+			message:  "request refused before any tool: this server's sealed credential carried no usable subject or email address; replace the local credential or investigate the local credential issuer before changing the allowlist",
+		},
+		{
+			name:     "an absent subject",
+			identity: AccessCredential{Email: "one@example.test", Verified: true},
+			allowed:  []string{"one@example.test"},
+			class:    failureNoEmailInToken,
+			message:  "request refused before any tool: this server's sealed credential carried no usable subject or email address; replace the local credential or investigate the local credential issuer before changing the allowlist",
+		},
+		{
+			name:     "an unverified allowlisted email",
+			identity: AccessCredential{Subject: "sub-1", Email: "one@example.test"},
+			allowed:  []string{"one@example.test"},
+			class:    failureEmailUnverified,
+		},
+		{
+			name:     "a verified email outside the current allowlist",
+			identity: AccessCredential{Subject: "sub-1", Email: "removed@example.test", Verified: true},
+			allowed:  []string{"one@example.test"},
+			class:    failureNotAllowlisted,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newClock()
+			f := newFakeTokeninfo(t, respondWith(http.StatusInternalServerError, ""))
+			cfg := allowlistOf(tt.allowed...)
+			h := serveBehindAuthAt(t, cfg, f, clock.now)
+			tt.identity.ExpiresAt = clock.now().Add(time.Hour)
+			sealed, err := testSealer(t, cfg.SealingSecret).SealAccess(tt.identity)
+			if err != nil {
+				t.Fatalf("SealAccess: %v", err)
+			}
+
+			resp := h.get(t, "Bearer "+sealed)
+			h.assertRejected(t, resp, http.StatusForbidden, tt.class)
+			if record := h.rejections(t)[0]; record["auth_refusal"] != "identity_allowlist" {
+				t.Errorf("auth_refusal = %v, want identity_allowlist", record["auth_refusal"])
+			}
+			if tt.message != "" {
+				if got := h.rejections(t)[0]["message"]; got != tt.message {
+					t.Errorf("message = %q, want %q", got, tt.message)
+				}
+			}
+			if got := f.requests.Load(); got != 0 {
+				t.Errorf("Tokeninfo saw %d requests for a sealed credential, want 0", got)
+			}
+			h.assertAuthorizationGone(t)
+		})
+	}
+}
+
+// TestASealedCredentialThatCannotAuthenticateIsChallenged is acceptance
+// criterion 8. The clock is hand-wound: expiry is a boundary condition, never a
+// reason to make the suite wait.
+func TestASealedCredentialThatCannotAuthenticateIsChallenged(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		seal    func(*Sealer, time.Time) (string, error)
+		advance time.Duration
+		class   string
+	}{
+		{
+			name: "an expired access credential",
+			seal: func(s *Sealer, now time.Time) (string, error) {
+				return s.SealAccess(AccessCredential{Subject: "sub-1", Email: "one@example.test", Verified: true, ExpiresAt: now.Add(time.Hour)})
+			},
+			advance: time.Hour,
+			class:   failureSealedCredentialExpired,
+		},
+		{
+			name: "a tampered access credential",
+			seal: func(s *Sealer, now time.Time) (string, error) {
+				sealed, err := s.SealAccess(AccessCredential{Subject: "sub-1", Email: "one@example.test", Verified: true, ExpiresAt: now.Add(time.Hour)})
+				if err != nil {
+					return "", err
+				}
+				last := "A"
+				if strings.HasSuffix(sealed, last) {
+					last = "B"
+				}
+				return sealed[:len(sealed)-1] + last, nil
+			},
+			class: failureSealedCredentialCorrupt,
+		},
+		{
+			name: "a refresh credential presented as access",
+			seal: func(s *Sealer, _ time.Time) (string, error) {
+				return s.SealRefresh(RefreshCredential{UpstreamSecret: "upstream-refresh-secret"})
+			},
+			class: failureSealedCredentialWrongPurpose,
+		},
+		{
+			name: "a credential with a future version",
+			seal: func(*Sealer, time.Time) (string, error) {
+				return "cdb2:a.not-a-real-ciphertext", nil
+			},
+			class: failureSealedCredentialCorrupt,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newClock()
+			f := newFakeTokeninfo(t, respondWith(http.StatusInternalServerError, ""))
+			cfg := allowlistOf("one@example.test")
+			h := serveBehindAuthAt(t, cfg, f, clock.now)
+			sealed, err := tt.seal(testSealer(t, cfg.SealingSecret), clock.now())
+			if err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			clock.advance(tt.advance)
+
+			resp := h.get(t, "Bearer "+sealed)
+			h.assertRejected(t, resp, http.StatusUnauthorized, tt.class)
+			if got := f.requests.Load(); got != 0 {
+				t.Errorf("Tokeninfo saw %d requests for a sealed credential, want 0", got)
+			}
+			h.assertAuthorizationGone(t)
+		})
+	}
+}
+
+// TestABearerValueWithoutTheSealedMarkerStillUsesGoogleValidation is acceptance
+// criterion 9's routing boundary. A token beginning with bare cdb is deliberately
+// Google-shaped here: it used to be misclassified by the three-character marker.
+func TestABearerValueWithoutTheSealedMarkerStillUsesGoogleValidation(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		token string
+	}{
+		{"a bare cdb-prefixed Google-shaped token", "cdb-google-shaped-token"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeTokeninfo(t, respondWith(http.StatusOK, acceptedBody("one@example.test")))
+			h := serveBehindAuth(t, allowlistOf("one@example.test"), f)
+
+			resp := h.get(t, "Bearer "+tt.token)
+			if resp.StatusCode != handlerReached {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d (%s), want the protected handler to have answered", resp.StatusCode, body)
+			}
+			if got := f.presented(); len(got) != 1 || got[0] != tt.token {
+				t.Errorf("Tokeninfo received %q, want only %q", got, tt.token)
+			}
+			h.assertAuthorizationGone(t)
+		})
+	}
+}
+
 // TestAMiddlewareWithNothingToValidateWithAdmitsNobody pins the direction the one
 // construction mistake this type can still be made with fails in.
 //
@@ -565,6 +834,50 @@ func TestAMiddlewareWithNothingToValidateWithAdmitsNobody(t *testing.T) {
 	}
 	if !strings.Contains(appLog.String(), failureNoTokenValidation) {
 		t.Errorf("the rejection is not logged as %s: %s", failureNoTokenValidation, appLog)
+	}
+}
+
+// TestAMiddlewareWithNothingToUnsealAdmitsNobody pins the same fail-closed
+// direction for a missing local sealer. Unlike a corrupt credential, this is a
+// construction mistake, so its 401 must not tell the caller to reauthorize.
+func TestAMiddlewareWithNothingToUnsealAdmitsNobody(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+	}{
+		{"a sealed credential"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			appLog := &bytes.Buffer{}
+			var reached atomic.Int64
+			next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Add(1) })
+			cfg := allowlistOf("one@example.test")
+			sealer := testSealer(t, cfg.SealingSecret)
+			sealed, err := sealer.SealAccess(AccessCredential{Subject: "sub-1", Email: "one@example.test", Verified: true, ExpiresAt: testNow.Add(time.Hour)})
+			if err != nil {
+				t.Fatalf("SealAccess: %v", err)
+			}
+			guarded := newMiddlewareWithSealer(cfg, zerolog.New(appLog), nil, nil, time.Now)(next)
+			req := httptest.NewRequest(http.MethodPost, "http://example.test", nil)
+			req.Header.Set("Authorization", "Bearer "+sealed)
+			resp := httptest.NewRecorder()
+			guarded.ServeHTTP(resp, req)
+
+			if resp.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401", resp.Code)
+			}
+			if got := resp.Header().Get("WWW-Authenticate"); got != "" {
+				t.Errorf("WWW-Authenticate = %q, want none for a construction mistake", got)
+			}
+			if reached.Load() != 0 {
+				t.Error("the protected handler ran behind a middleware that could not unseal anything")
+			}
+			if !strings.Contains(appLog.String(), failureNoSealedCredentialValidation) {
+				t.Errorf("the rejection is not logged as %s: %s", failureNoSealedCredentialValidation, appLog)
+			}
+			if got := req.Header.Values("Authorization"); len(got) != 0 {
+				t.Errorf("the request still carries an Authorization header after the middleware answered: %q", got)
+			}
+		})
 	}
 }
 

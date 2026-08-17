@@ -30,9 +30,16 @@ const (
 	// can fix: Google vouched for the token and returned no address to match. It is
 	// its own class because the line an operator reads on the class beside it tells
 	// them to add an address, and there is none here to add.
-	failureNoEmailInToken    = "no_email_in_token"
-	failureEmailUnverified   = "email_unverified"
-	failureNoTokenValidation = "no_validator"
+	failureNoEmailInToken               = "no_email_in_token"
+	failureEmailUnverified              = "email_unverified"
+	failureNoTokenValidation            = "no_validator"
+	failureNoSealedCredentialValidation = "no_sealer"
+	// Sealed-credential classes are deliberately distinct from Google-token
+	// classes: their operator action is to replace the local credential, not to
+	// investigate a Google Tokeninfo result.
+	failureSealedCredentialExpired      = "sealed_credential_expired"
+	failureSealedCredentialCorrupt      = "sealed_credential_corrupt"
+	failureSealedCredentialWrongPurpose = "sealed_credential_wrong_purpose"
 )
 
 // NewMiddleware builds the authentication seam internal/mcp applies to its MCP
@@ -52,8 +59,12 @@ func NewMiddleware(cfg Config, log zerolog.Logger) (func(http.Handler) http.Hand
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
+	sealer, err := NewSealer(cfg.SealingSecret)
+	if err != nil {
+		return nil, err
+	}
 	v := newValidator(cfg.ClientID, tokeninfoURL, newHTTPClient(validationTimeout), time.Now)
-	return newMiddleware(cfg, log, v), nil
+	return newMiddlewareWithSealer(cfg, log, v, sealer, time.Now), nil
 }
 
 // newMiddleware is the whole decision, over a validator a test can point
@@ -69,6 +80,16 @@ func NewMiddleware(cfg Config, log zerolog.Logger) (func(http.Handler) http.Hand
 // which is precisely the distinction an operator needs when their colleague
 // cannot connect.
 func newMiddleware(cfg Config, log zerolog.Logger, v *validator) func(http.Handler) http.Handler {
+	sealer, _ := NewSealer(cfg.SealingSecret)
+	// This helper is used only by package tests. [NewMiddleware] validates the
+	// configuration before reaching here; NewSealer already returns nil on error,
+	// and that nil sealer fails closed below.
+	return newMiddlewareWithSealer(cfg, log, v, sealer, time.Now)
+}
+
+// newMiddlewareWithSealer is the whole decision, with the local credential
+// dependencies explicit so its expiry boundary can be driven without sleeping.
+func newMiddlewareWithSealer(cfg Config, log zerolog.Logger, v *validator, sealer *Sealer, now func() time.Time) func(http.Handler) http.Handler {
 	allowed := make(map[string]bool, len(cfg.AllowedEmails))
 	for _, address := range cfg.Allowlist() {
 		allowed[address] = true
@@ -88,6 +109,52 @@ func newMiddleware(cfg Config, log zerolog.Logger, v *validator) func(http.Handl
 			token, class := bearerToken(values)
 			if class != "" {
 				unauthorized(w, log, class)
+				return
+			}
+			if IsSealedCredential(token) {
+				if sealer == nil {
+					// A nil sealer is a process construction mistake, not a statement
+					// about the credential. Unsealing has no upstream, so once a sealer
+					// exists every sealed-credential failure is local and credential
+					// specific; a missing one cannot be repaired by reauthorizing.
+					unauthorized(w, log, failureNoSealedCredentialValidation)
+					return
+				}
+				sealed, err := sealer.UnsealAccess(token)
+				if err != nil {
+					class := failureSealedCredentialCorrupt
+					if errors.Is(err, ErrSealedCredentialWrongPurpose) {
+						class = failureSealedCredentialWrongPurpose
+					}
+					// Unsealing is entirely local: it has no upstream whose temporary
+					// failure could make a good credential look bad. With a sealer in
+					// place, every refusal here is therefore a statement about the
+					// credential and is challenged; there is no sealed counterpart to
+					// validation_unavailable.
+					unauthorized(w, log, class)
+					return
+				}
+				if !sealed.ExpiresAt.After(now()) {
+					unauthorized(w, log, failureSealedCredentialExpired)
+					return
+				}
+				caller := claims{subject: sealed.Subject, email: sealed.Email, emailVerified: sealed.Verified}
+				if caller.subject == "" || normaliseEmail(caller.email) == "" {
+					forbidden(w, log, failureNoEmailInToken, caller, true)
+					return
+				}
+				if !allowed[normaliseEmail(caller.email)] {
+					forbidden(w, log, failureNotAllowlisted, caller, true)
+					return
+				}
+				if !caller.emailVerified {
+					forbidden(w, log, failureEmailUnverified, caller, true)
+					return
+				}
+				next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), Identity{
+					Subject: caller.subject,
+					Email:   caller.email,
+				})))
 				return
 			}
 			if v == nil {
@@ -114,7 +181,7 @@ func newMiddleware(cfg Config, log zerolog.Logger, v *validator) func(http.Handl
 			// caller arrives here, and this class is what keeps the first hour of
 			// diagnosis off an allowlist that was already right.
 			if normaliseEmail(caller.email) == "" {
-				forbidden(w, log, failureNoEmailInToken, caller)
+				forbidden(w, log, failureNoEmailInToken, caller, false)
 				return
 			}
 			// Membership before verification, so that a stranger's rejection reads as
@@ -122,11 +189,11 @@ func newMiddleware(cfg Config, log zerolog.Logger, v *validator) func(http.Handl
 			// produce the narrower "their email is not verified" — which is the one an
 			// operator has to do something unusual about.
 			if !allowed[normaliseEmail(caller.email)] {
-				forbidden(w, log, failureNotAllowlisted, caller)
+				forbidden(w, log, failureNotAllowlisted, caller, false)
 				return
 			}
 			if !caller.emailVerified {
-				forbidden(w, log, failureEmailUnverified, caller)
+				forbidden(w, log, failureEmailUnverified, caller, false)
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), Identity{
@@ -198,7 +265,8 @@ func unauthorized(w http.ResponseWriter, log zerolog.Logger, class string) {
 // mistake in this process — and no credential a caller can fetch will change it.
 func challengesTheCredential(class string) bool {
 	switch class {
-	case failureAbsentHeader, failureRepeatedHeader, failureMalformedHeader, failureTokenRejected:
+	case failureAbsentHeader, failureRepeatedHeader, failureMalformedHeader, failureTokenRejected,
+		failureSealedCredentialExpired, failureSealedCredentialCorrupt, failureSealedCredentialWrongPurpose:
 		return true
 	default:
 		return false
@@ -222,7 +290,7 @@ func challengesTheCredential(class string) bool {
 // package — so a 403 with an auth_refusal field is this one, and a 403 without any
 // log line from here is that one. Which of this package's own 403s it is, the
 // failure_class says.
-func forbidden(w http.ResponseWriter, log zerolog.Logger, class string, caller claims) {
+func forbidden(w http.ResponseWriter, log zerolog.Logger, class string, caller claims, sealed bool) {
 	log.Warn().
 		Str("failure_class", class).
 		Str("auth_refusal", "identity_allowlist").
@@ -230,14 +298,17 @@ func forbidden(w http.ResponseWriter, log zerolog.Logger, class string, caller c
 		Str("subject", caller.subject).
 		Bool("email_verified", caller.emailVerified).
 		Int("status", http.StatusForbidden).
-		Msg(refusalMessage(class))
+		Msg(refusalMessage(class, sealed))
 	http.Error(w, "forbidden: this identity is not allowed on this server", http.StatusForbidden)
 }
 
 // refusalMessage is what each 403 tells the operator reading it to do next, which
 // is the only thing that differs between the three of them.
-func refusalMessage(class string) string {
+func refusalMessage(class string, sealed bool) string {
 	if class == failureNoEmailInToken {
+		if sealed {
+			return "request refused before any tool: this server's sealed credential carried no usable subject or email address; replace the local credential or investigate the local credential issuer before changing the allowlist"
+		}
 		// Named as the wrong problem, this reads as an allowlist that is missing an
 		// address — and the address it appears to be missing does not exist, so the
 		// operator edits a correct configuration for as long as it takes them to

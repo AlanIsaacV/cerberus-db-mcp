@@ -118,6 +118,8 @@ func TestTheListenerTheBinaryStartsAnswersAnUnauthenticatedRequestWithAChallenge
 	address := reservedAddress(t)
 	testEnvironment(t, address)
 	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
+	sealingMaterial := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	t.Setenv("CERBERUS_AUTH_SEALING_SECRET", sealingMaterial)
 	// Written with a stray space and a trailing comma, so the startup log's two
 	// allowlist fields are visibly different values.
 	t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", " One@Example.test ,")
@@ -141,6 +143,9 @@ func TestTheListenerTheBinaryStartsAnswersAnUnauthenticatedRequestWithAChallenge
 	// the entries as they were set, and the entries a request is actually matched
 	// against.
 	logged := appLog.String()
+	if strings.Contains(logged, sealingMaterial) {
+		t.Error("the startup log contains the sealing material")
+	}
 	if !strings.Contains(logged, `" One@Example.test "`) {
 		t.Errorf("the startup log does not carry the allowlist as it was configured: %s", logged)
 	}
@@ -174,6 +179,7 @@ func TestANetworkFacingListenerTheBinaryStartsAuthenticatesBeforeTheSDKChecksThe
 	address := reservedNetworkFacingAddress(t)
 	testEnvironment(t, address)
 	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
+	t.Setenv("CERBERUS_AUTH_SEALING_SECRET", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "one@example.test")
 
 	appLog := &lockedBuffer{}

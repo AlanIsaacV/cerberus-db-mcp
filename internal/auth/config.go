@@ -11,9 +11,9 @@ import (
 
 // Configuration errors. They are sentinels for the reason internal/db's and
 // internal/mcp's are: an error about a variable names the variable and never
-// quotes the value. Nothing in this group is a secret — a client ID is public and
-// an allowlist is a list of colleagues — but the rule is the repository's and not
-// the value's, and a rule with exceptions is one somebody has to remember.
+// quotes the value. The sealing secret makes that essential here, but the rule
+// applies to every value: a rule with exceptions is one somebody has to
+// remember.
 var (
 	// ErrInvalidVariable reports a CERBERUS_AUTH_* variable whose value this
 	// package cannot use.
@@ -32,6 +32,10 @@ var (
 	// a dependency whose absence would leave a guarantee unenforced fails
 	// construction by name.
 	ErrNoAllowlist = errors.New("no identity allowlist was configured")
+	// ErrNoSealingMaterial reports a missing master secret. Credentials sealed by
+	// this process must remain usable across a restart, so making one up here
+	// would turn a deploy into a silent mass logout.
+	ErrNoSealingMaterial = errors.New("no credential sealing material was configured")
 )
 
 // Config is the whole of this package's configuration. Like the other two
@@ -47,9 +51,8 @@ type Config struct {
 	// purpose: a client ID that does not match the one the agent was configured
 	// with produces a 401 for every request and nothing else, and seeing both
 	// values in a deploy log is how that gets diagnosed in minutes rather than in
-	// an afternoon. There is no client secret in this process — validating
-	// somebody else's token does not need one — so there is nothing in this group
-	// to redact.
+	// an afternoon. It remains public even though this configuration also holds
+	// the master secret used to seal this server's own credentials.
 	ClientID string `env:"CERBERUS_AUTH_GOOGLE_CLIENT_ID"`
 
 	// AllowedEmails is the set of verified Google addresses that may reach a
@@ -63,6 +66,12 @@ type Config struct {
 	// blank entry — the trailing comma somebody leaves behind — is ignored rather
 	// than treated as an address that can never match.
 	AllowedEmails []string `env:"CERBERUS_AUTH_ALLOWED_EMAILS" envSeparator:","`
+
+	// SealingSecret is the base64-encoded, 32-byte master secret from which the
+	// distinct access and refresh credential keys are derived. It is deliberately
+	// not generated here: a generated value would invalidate every credential on
+	// the next process restart.
+	SealingSecret Secret `env:"CERBERUS_AUTH_SEALING_SECRET"`
 }
 
 // LoadConfig reads the configuration from the process environment.
@@ -106,6 +115,7 @@ func LoadConfigFrom(environ map[string]string) (*Config, error) {
 var variableForms = map[string]struct{ variable, form string }{
 	"ClientID":      {"CERBERUS_AUTH_GOOGLE_CLIENT_ID", "a Google OAuth client ID, with no spaces in it"},
 	"AllowedEmails": {"CERBERUS_AUTH_ALLOWED_EMAILS", "a comma-separated list of email addresses"},
+	"SealingSecret": {"CERBERUS_AUTH_SEALING_SECRET", "a base64-encoded 32-byte master secret, with no spaces in it"},
 }
 
 func parseError(err error) error {
@@ -156,6 +166,12 @@ func (c Config) validate() error {
 			// operator is looking at the list.
 			return fmt.Errorf("auth: %s must be %s: %w", variableForms["AllowedEmails"].variable, variableForms["AllowedEmails"].form, ErrInvalidVariable)
 		}
+	}
+	if c.SealingSecret == "" {
+		return fmt.Errorf("auth: %s is not set: %w", variableForms["SealingSecret"].variable, ErrNoSealingMaterial)
+	}
+	if _, err := decodeSealingSecret(c.SealingSecret); err != nil {
+		return fmt.Errorf("auth: %s must be %s: %w", variableForms["SealingSecret"].variable, variableForms["SealingSecret"].form, ErrInvalidVariable)
 	}
 	return nil
 }

@@ -8,6 +8,10 @@ import (
 	"testing"
 )
 
+// testSealingSecret is a base64 encoding of exactly 32 bytes. It is a fixed test
+// fixture, not a credential accepted by any deployment.
+const testSealingSecret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
 // TestNoConfigurationLoadsWithoutAClientIDAndANonEmptyAllowlist is acceptance
 // criterion 7.
 //
@@ -34,6 +38,45 @@ func TestNoConfigurationLoadsWithoutAClientIDAndANonEmptyAllowlist(t *testing.T)
 			environ: map[string]string{"CERBERUS_AUTH_GOOGLE_CLIENT_ID": testClientID},
 			want:    ErrNoAllowlist,
 			names:   "CERBERUS_AUTH_ALLOWED_EMAILS",
+		},
+		{
+			name: "a sealing secret that is absent",
+			environ: map[string]string{
+				"CERBERUS_AUTH_GOOGLE_CLIENT_ID": testClientID,
+				"CERBERUS_AUTH_ALLOWED_EMAILS":   "one@example.test",
+			},
+			want:  ErrNoSealingMaterial,
+			names: "CERBERUS_AUTH_SEALING_SECRET",
+		},
+		{
+			name: "a sealing secret that is not base64",
+			environ: map[string]string{
+				"CERBERUS_AUTH_GOOGLE_CLIENT_ID": testClientID,
+				"CERBERUS_AUTH_ALLOWED_EMAILS":   "one@example.test",
+				"CERBERUS_AUTH_SEALING_SECRET":   "not base64!",
+			},
+			want:  ErrInvalidVariable,
+			names: "CERBERUS_AUTH_SEALING_SECRET",
+		},
+		{
+			name: "a sealing secret that decodes to the wrong length",
+			environ: map[string]string{
+				"CERBERUS_AUTH_GOOGLE_CLIENT_ID": testClientID,
+				"CERBERUS_AUTH_ALLOWED_EMAILS":   "one@example.test",
+				"CERBERUS_AUTH_SEALING_SECRET":   "AQID",
+			},
+			want:  ErrInvalidVariable,
+			names: "CERBERUS_AUTH_SEALING_SECRET",
+		},
+		{
+			name: "a sealing secret with trailing whitespace is refused rather than repaired",
+			environ: map[string]string{
+				"CERBERUS_AUTH_GOOGLE_CLIENT_ID": testClientID,
+				"CERBERUS_AUTH_ALLOWED_EMAILS":   "one@example.test",
+				"CERBERUS_AUTH_SEALING_SECRET":   testSealingSecret + "\n",
+			},
+			want:  ErrInvalidVariable,
+			names: "CERBERUS_AUTH_SEALING_SECRET",
 		},
 		{
 			name: "an allowlist variable that is present and empty",
@@ -126,6 +169,7 @@ func TestNoConfigurationLoadsWithoutAClientIDAndANonEmptyAllowlist(t *testing.T)
 func TestAnEmptyVariableIsTreatedAsUnset(t *testing.T) {
 	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", testClientID)
 	t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "")
+	t.Setenv("CERBERUS_AUTH_SEALING_SECRET", testSealingSecret)
 
 	cfg, err := LoadConfig()
 	if !errors.Is(err, ErrNoAllowlist) {
@@ -136,12 +180,13 @@ func TestAnEmptyVariableIsTreatedAsUnset(t *testing.T) {
 func TestAWholeConfigurationLoadsFromTheEnvironment(t *testing.T) {
 	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", testClientID)
 	t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "one@example.test,two@example.test")
+	t.Setenv("CERBERUS_AUTH_SEALING_SECRET", testSealingSecret)
 
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	want := &Config{ClientID: testClientID, AllowedEmails: []string{"one@example.test", "two@example.test"}}
+	want := &Config{ClientID: testClientID, AllowedEmails: []string{"one@example.test", "two@example.test"}, SealingSecret: testSealingSecret}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("LoadConfig = %+v, want %+v", cfg, want)
 	}
@@ -155,6 +200,7 @@ func TestTheAllowlistAdmitsAnAddressWhateverCaseAndSpacingItWasWrittenIn(t *test
 	cfg, err := LoadConfigFrom(map[string]string{
 		"CERBERUS_AUTH_GOOGLE_CLIENT_ID": testClientID,
 		"CERBERUS_AUTH_ALLOWED_EMAILS":   " Alan.Vazquez@Example.Test , second@example.test,",
+		"CERBERUS_AUTH_SEALING_SECRET":   testSealingSecret,
 	})
 	if err != nil {
 		t.Fatalf("LoadConfigFrom: %v", err)
@@ -168,6 +214,27 @@ func TestTheAllowlistAdmitsAnAddressWhateverCaseAndSpacingItWasWrittenIn(t *test
 	want := []string{"alan.vazquez@example.test", "second@example.test"}
 	if !slices.Equal(got, want) {
 		t.Errorf("Allowlist() = %q, want %q; the trailing comma must not become an entry", got, want)
+	}
+}
+
+func TestASealingSecretIsRedactedByEveryOrdinaryRendering(t *testing.T) {
+	secret := Secret(testSealingSecret)
+	for _, tt := range []struct {
+		name string
+		got  func() string
+	}{
+		{"String", secret.String},
+		{"GoString", secret.GoString},
+		{"MarshalText", func() string { text, _ := secret.MarshalText(); return string(text) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.got(); got != redactedSecret && got != `"`+redactedSecret+`"` {
+				t.Errorf("%s rendered %q, want a redaction", tt.name, got)
+			}
+			if strings.Contains(tt.got(), testSealingSecret) {
+				t.Errorf("%s rendered the sealing secret", tt.name)
+			}
+		})
 	}
 }
 
@@ -198,7 +265,7 @@ func TestVariableFormsCoverEveryField(t *testing.T) {
 }
 
 // TestBuildingAMiddlewareIsRefusedForTheSameReasonsLoadingIs closes the route
-// around the loader: a Config assembled in code is held to the same two rules, so
+// around the loader: a Config assembled in code is held to the same three rules, so
 // the binary cannot acquire an unauthenticated middleware by building its own
 // configuration.
 func TestBuildingAMiddlewareIsRefusedForTheSameReasonsLoadingIs(t *testing.T) {
@@ -209,6 +276,7 @@ func TestBuildingAMiddlewareIsRefusedForTheSameReasonsLoadingIs(t *testing.T) {
 	}{
 		{"no client ID", Config{AllowedEmails: []string{"one@example.test"}}, ErrNoClientID},
 		{"no allowlist", Config{ClientID: testClientID}, ErrNoAllowlist},
+		{"no sealing secret", Config{ClientID: testClientID, AllowedEmails: []string{"one@example.test"}}, ErrNoSealingMaterial},
 		{"an allowlist of one blank entry", Config{ClientID: testClientID, AllowedEmails: []string{"  "}}, ErrNoAllowlist},
 		{"an unmatchable allowlist entry", Config{ClientID: testClientID, AllowedEmails: []string{"nobody"}}, ErrInvalidVariable},
 	} {

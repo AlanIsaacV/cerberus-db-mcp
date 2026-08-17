@@ -64,6 +64,9 @@ loads an `.env` beside it.
   access tokens this deployment accepts.
 - `CERBERUS_AUTH_ALLOWED_EMAILS`: the comma-separated verified Google email
   addresses allowed to reach a tool.
+- `CERBERUS_AUTH_SEALING_SECRET`: the base64-encoded 32-byte master secret,
+  generated outside this process; changing it invalidates every credential it
+  issued.
 
 ### Defaulted or optional
 
