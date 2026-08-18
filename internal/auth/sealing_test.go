@@ -40,7 +40,7 @@ func TestASealerIsRedactedByEveryOrdinaryRendering(t *testing.T) {
 	}
 }
 
-func TestSealingRoundTripsBothCredentialPurposes(t *testing.T) {
+func TestSealingRoundTripsAllCredentialPurposes(t *testing.T) {
 	sealer := testSealer(t, testSealingSecret)
 	access := AccessCredential{
 		Subject:   "108134201943512340987",
@@ -49,6 +49,15 @@ func TestSealingRoundTripsBothCredentialPurposes(t *testing.T) {
 		ExpiresAt: testNow.Add(time.Hour),
 	}
 	refresh := RefreshCredential{UpstreamSecret: "upstream-refresh-secret"}
+	authorizationCode := AuthorizationCodeCredential{
+		UpstreamSecret:      "upstream-refresh-secret",
+		Subject:             "108134201943512340987",
+		Email:               "caller@example.test",
+		Verified:            true,
+		CodeChallenge:       "client-code-challenge",
+		CodeChallengeMethod: "S256",
+		ExpiresAt:           testNow.Add(5 * time.Minute),
+	}
 
 	for _, tt := range []struct {
 		name string
@@ -67,6 +76,12 @@ func TestSealingRoundTripsBothCredentialPurposes(t *testing.T) {
 			seal: func() (string, error) { return sealer.SealRefresh(refresh) },
 			open: func(value string) (any, error) { return sealer.UnsealRefresh(value) },
 			want: refresh,
+		},
+		{
+			name: "authorization code",
+			seal: func() (string, error) { return sealer.SealAuthorizationCode(authorizationCode) },
+			open: func(value string) (any, error) { return sealer.UnsealAuthorizationCode(value) },
+			want: authorizationCode,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -165,6 +180,7 @@ func TestSealedCredentialMarkerDoesNotCatchABareCDBGoogleToken(t *testing.T) {
 	}{
 		{"a current access credential marker", "cdb1:a.anything", true},
 		{"a current refresh credential marker", "cdb1:r.anything", true},
+		{"a current authorization code credential marker", "cdb1:c.anything", true},
 		{"a future version in the credential family", "cdb2:a.anything", true},
 		{"a numeric multi-digit version in the credential family", "cdb12:a.anything", true},
 		{"a bare cdb prefix", "cdb-google-shaped-token", false},
@@ -189,6 +205,18 @@ func TestCredentialsCannotCrossPurposes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SealRefresh: %v", err)
 	}
+	authorizationCode, err := sealer.SealAuthorizationCode(AuthorizationCodeCredential{
+		UpstreamSecret:      "upstream-refresh-secret",
+		Subject:             "sub",
+		Email:               "caller@example.test",
+		Verified:            true,
+		CodeChallenge:       "client-code-challenge",
+		CodeChallengeMethod: "S256",
+		ExpiresAt:           testNow.Add(5 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("SealAuthorizationCode: %v", err)
+	}
 	for _, tt := range []struct {
 		name string
 		open func() error
@@ -196,9 +224,23 @@ func TestCredentialsCannotCrossPurposes(t *testing.T) {
 	}{
 		{"access cannot become refresh", func() error { _, err := sealer.UnsealRefresh(access); return err }, ErrSealedCredentialWrongPurpose},
 		{"refresh cannot become access", func() error { _, err := sealer.UnsealAccess(refresh); return err }, ErrSealedCredentialWrongPurpose},
+		{"authorization code cannot become access", func() error { _, err := sealer.UnsealAccess(authorizationCode); return err }, ErrSealedCredentialWrongPurpose},
+		{"authorization code cannot become refresh", func() error { _, err := sealer.UnsealRefresh(authorizationCode); return err }, ErrSealedCredentialWrongPurpose},
+		{"access cannot become an authorization code", func() error { _, err := sealer.UnsealAuthorizationCode(access); return err }, ErrSealedCredentialWrongPurpose},
+		{"refresh cannot become an authorization code", func() error { _, err := sealer.UnsealAuthorizationCode(refresh); return err }, ErrSealedCredentialWrongPurpose},
 		{"a refresh ciphertext relabelled as access", func() error {
 			relabelled := strings.Replace(refresh, "cdb1:r.", "cdb1:a.", 1)
 			_, err := sealer.UnsealAccess(relabelled)
+			return err
+		}, ErrCorruptSealedCredential},
+		{"an authorization code ciphertext relabelled as access", func() error {
+			relabelled := strings.Replace(authorizationCode, "cdb1:c.", "cdb1:a.", 1)
+			_, err := sealer.UnsealAccess(relabelled)
+			return err
+		}, ErrCorruptSealedCredential},
+		{"an access ciphertext relabelled as an authorization code", func() error {
+			relabelled := strings.Replace(access, "cdb1:a.", "cdb1:c.", 1)
+			_, err := sealer.UnsealAuthorizationCode(relabelled)
 			return err
 		}, ErrCorruptSealedCredential},
 	} {
@@ -240,6 +282,51 @@ func TestCredentialWirePrefixIsAuthenticated(t *testing.T) {
 			got, err := sealer.open(AccessPurpose, otherPrefix, raw)
 			if !errors.Is(err, ErrCorruptSealedCredential) {
 				t.Fatalf("open with relabelled prefix = (%q, %v), want an error wrapping %v", got, err, ErrCorruptSealedCredential)
+			}
+		})
+	}
+}
+
+// TestEachPurposeDerivesItsOwnKey is the assertion that the purposes are
+// separated by their HKDF label and not only by the tag they travel beside.
+//
+// Every other cross-purpose case in this file varies the wire tag and the derived
+// key together, so the AEAD's additional data refuses the value first and the key
+// is never reached. That gap was measured rather than supposed: giving
+// AuthorizationCodePurpose the access purpose's label in [labelFor] left every test
+// in internal/auth and internal/authflow green. These cases hold the additional
+// data at the prefix the value was actually sealed under and vary only the key, so
+// a collision in [labelFor] is the one thing they can fail on.
+func TestEachPurposeDerivesItsOwnKey(t *testing.T) {
+	sealer := testSealer(t, testSealingSecret)
+	for _, tt := range []struct {
+		name           string
+		sealed, opened Purpose
+	}{
+		{"an authorization code under the access key", AuthorizationCodePurpose, AccessPurpose},
+		{"an authorization code under the refresh key", AuthorizationCodePurpose, RefreshPurpose},
+		{"an access credential under the authorization code key", AccessPurpose, AuthorizationCodePurpose},
+		{"a refresh credential under the authorization code key", RefreshPurpose, AuthorizationCodePurpose},
+		{"an access credential under the refresh key", AccessPurpose, RefreshPurpose},
+		{"a refresh credential under the access key", RefreshPurpose, AccessPurpose},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			value, err := sealer.seal(tt.sealed, []byte("payload"))
+			if err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			prefix, _, encoded, err := parseCredential(value)
+			if err != nil {
+				t.Fatalf("parse sealed credential: %v", err)
+			}
+			raw, err := base64.RawURLEncoding.DecodeString(encoded)
+			if err != nil {
+				t.Fatalf("decode sealed credential: %v", err)
+			}
+			got, err := sealer.open(tt.opened, prefix, raw)
+			if !errors.Is(err, ErrCorruptSealedCredential) {
+				t.Fatalf("opening a %s credential under the %s key = (%q, %v), want an error wrapping %v; the two purposes are deriving the same key",
+					tt.sealed, tt.opened, got, err, ErrCorruptSealedCredential)
 			}
 		})
 	}

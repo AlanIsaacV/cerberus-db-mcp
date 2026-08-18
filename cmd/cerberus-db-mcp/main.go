@@ -27,6 +27,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/authflow"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/mcp"
@@ -75,6 +76,14 @@ func run(log zerolog.Logger) error {
 	// somebody else being reachable is not. Nothing here asks Google anything, so
 	// whether Tokeninfo is up has no say in whether this process starts.
 	authCfg, err := auth.LoadConfig()
+	if err != nil {
+		return err
+	}
+	flowCfg, err := authflow.LoadConfig()
+	if err != nil {
+		return err
+	}
+	flow, err := authflow.New(*flowCfg, *authCfg, log)
 	if err != nil {
 		return err
 	}
@@ -132,6 +141,10 @@ func run(log zerolog.Logger) error {
 		// Wraps the MCP endpoint only, which is internal/mcp's own arrangement and
 		// not something this file chooses.
 		Middleware: middleware,
+		UnauthenticatedRoutes: []mcp.UnauthenticatedRoute{
+			{Pattern: authflow.AuthorizationPath, Handler: flow.AuthorizationHandler()},
+			{Pattern: authflow.CallbackPath, Handler: flow.CallbackHandler()},
+		},
 	})
 	if err != nil {
 		// The executor is not closed on this path and does not need to be: nothing

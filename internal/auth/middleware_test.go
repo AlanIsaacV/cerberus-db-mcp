@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -212,6 +213,42 @@ func (h *authHarness) assertRejected(t *testing.T, resp *http.Response, status i
 	// around a tool call cannot carry an event with all of them empty.
 	if _, ok := records[0]["stream"]; ok {
 		t.Errorf("the rejection carries a stream field, so it was written as an audit event: %v", records[0])
+	}
+}
+
+// assertRefusalShape is the byte-identity check behind
+// [TestTheRefusalShapesAreTheOnesFromBeforeTheAuthorizationServer]: the status, the
+// WWW-Authenticate header values whole rather than joined, the class in the log,
+// and the auth_refusal field that says which of this listener's 403s this is.
+//
+// It compares the header as a slice because "no challenge" and "one challenge" are
+// not the only two states a header can be in: a second Set somewhere would produce
+// two values, which Header.Get hides by answering the first.
+func (h *authHarness) assertRefusalShape(t *testing.T, resp *http.Response, status int, class string, challenge []string, authRefusal string) {
+	t.Helper()
+	if resp.StatusCode != status {
+		t.Errorf("status = %d, want %d", resp.StatusCode, status)
+	}
+	if got := resp.Header.Values("WWW-Authenticate"); !slices.Equal(got, challenge) {
+		t.Errorf("WWW-Authenticate = %q, want %q for a %s refusal", got, challenge, class)
+	}
+	if got := h.reached.Load(); got != 0 {
+		t.Errorf("the protected handler ran %d times; a refused request must reach no handler", got)
+	}
+	records := h.rejections(t)
+	if len(records) != 1 {
+		t.Fatalf("the application log holds %d lines, want exactly 1 for one refusal: %s", len(records), h.appLog)
+	}
+	if records[0]["failure_class"] != class {
+		t.Errorf("failure_class = %v, want %q", records[0]["failure_class"], class)
+	}
+	got, present := records[0]["auth_refusal"]
+	switch {
+	case authRefusal == "" && present:
+		t.Errorf("a %d refusal carries auth_refusal = %v; that field is what tells this package's 403 apart from the SDK's, and putting it on anything else takes the distinction away",
+			status, got)
+	case authRefusal != "" && got != authRefusal:
+		t.Errorf("auth_refusal = %v, want %q", got, authRefusal)
 	}
 }
 
@@ -772,6 +809,194 @@ func TestASealedCredentialThatCannotAuthenticateIsChallenged(t *testing.T) {
 			h.assertAuthorizationGone(t)
 		})
 	}
+}
+
+// challengeBeforeTheAuthorizationServer is the WWW-Authenticate string this
+// middleware sent before this objective, taken from
+// `git show HEAD:internal/auth/middleware.go` and written out here whole rather
+// than assembled from [realm], so that an edit to realm is something this test
+// reports instead of something it follows.
+const challengeBeforeTheAuthorizationServer = `Bearer realm="cerberus-db-mcp"`
+
+// refusalBeforeTheAuthorizationServer is the auth_refusal value every 403 from this
+// package carried before this objective, from the same source.
+const refusalBeforeTheAuthorizationServer = "identity_allowlist"
+
+// TestTheRefusalShapesAreTheOnesFromBeforeTheAuthorizationServer is acceptance
+// criterion 10.
+//
+// This objective gave the process an authorization server of its own, and the two
+// credential paths that were already here — a Google bearer token, and a sealed
+// access credential — have to refuse exactly as they refused before it. The
+// expected side of every row is a literal read out of HEAD; the actual side is what
+// the source spells today. Writing both is the whole point: a constant compared
+// with itself follows a rename wherever it goes, and what has to be shown here is
+// that the bytes on the wire and in the log did not move. Every connected client's
+// reauthorization decision is made on the challenge, and every operator's log filter
+// is written on the class.
+//
+// It pins the classes that exist rather than the number of them. A class added
+// later is a new refusal and not a changed one, and nothing in this objective
+// touched middleware.go.
+func TestTheRefusalShapesAreTheOnesFromBeforeTheAuthorizationServer(t *testing.T) {
+	t.Run("the class each refusal is logged under, and the challenge it carries", func(t *testing.T) {
+		for _, tt := range []struct {
+			class      string
+			wire       string
+			challenged bool
+		}{
+			{failureAbsentHeader, "absent_header", true},
+			{failureRepeatedHeader, "repeated_header", true},
+			{failureMalformedHeader, "malformed_header", true},
+			{failureTokenRejected, "token_rejected", true},
+			{failureUnavailable, "validation_unavailable", false},
+			{failureNotAllowlisted, "identity_not_allowlisted", false},
+			{failureNoEmailInToken, "no_email_in_token", false},
+			{failureEmailUnverified, "email_unverified", false},
+			{failureNoTokenValidation, "no_validator", false},
+			{failureNoSealedCredentialValidation, "no_sealer", false},
+			{failureSealedCredentialExpired, "sealed_credential_expired", true},
+			{failureSealedCredentialCorrupt, "sealed_credential_corrupt", true},
+			{failureSealedCredentialWrongPurpose, "sealed_credential_wrong_purpose", true},
+		} {
+			t.Run(tt.wire, func(t *testing.T) {
+				if tt.class != tt.wire {
+					t.Errorf("a refusal of this kind is now logged as %q and was logged as %q; the class is what an operator filters on and what this server's own diagnosis is written against",
+						tt.class, tt.wire)
+				}
+				if got := challengesTheCredential(tt.class); got != tt.challenged {
+					t.Errorf("challengesTheCredential(%q) = %v, want %v: whether this class sends a client back to reauthorize is not something this objective may change",
+						tt.wire, got, tt.challenged)
+				}
+				want := ""
+				if tt.challenged {
+					want = challengeBeforeTheAuthorizationServer
+				}
+				if got := challengeFor(t, tt.class); got != want {
+					t.Errorf("challengeFor(%q) = %q, want %q", tt.wire, got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("what the Google bearer path answers", func(t *testing.T) {
+		for _, tt := range []struct {
+			name          string
+			tokeninfo     func(http.ResponseWriter, *http.Request)
+			authorization []string
+			status        int
+			class         string
+			challenge     []string
+			authRefusal   string
+		}{
+			{
+				name:      "a request carrying no credential",
+				tokeninfo: respondWith(http.StatusOK, acceptedBody("one@example.test")),
+				status:    http.StatusUnauthorized, class: "absent_header",
+				challenge: []string{challengeBeforeTheAuthorizationServer},
+			},
+			{
+				name:          "a token Google refuses",
+				tokeninfo:     respondWith(http.StatusBadRequest, `{"error":"invalid_token"}`),
+				authorization: []string{"Bearer ya29.a-token"},
+				status:        http.StatusUnauthorized, class: "token_rejected",
+				challenge: []string{challengeBeforeTheAuthorizationServer},
+			},
+			{
+				name:          "an endpoint that is throttling this deployment",
+				tokeninfo:     respondWith(http.StatusTooManyRequests, `{"error":"rate_limited"}`),
+				authorization: []string{"Bearer ya29.a-token"},
+				status:        http.StatusUnauthorized, class: "validation_unavailable",
+			},
+			{
+				name:          "an identity outside the allowlist",
+				tokeninfo:     respondWith(http.StatusOK, acceptedBody("stranger@example.test")),
+				authorization: []string{"Bearer ya29.a-token"},
+				status:        http.StatusForbidden, class: "identity_not_allowlisted",
+				authRefusal: refusalBeforeTheAuthorizationServer,
+			},
+			{
+				name:          "an allowlisted address Google has not verified",
+				tokeninfo:     respondWith(http.StatusOK, tokeninfoBody(testClientID, testClientID, "sub-1", "one@example.test", "3599", "false")),
+				authorization: []string{"Bearer ya29.a-token"},
+				status:        http.StatusForbidden, class: "email_unverified",
+				authRefusal: refusalBeforeTheAuthorizationServer,
+			},
+			{
+				name:          "a token Google returned no address with",
+				tokeninfo:     respondWith(http.StatusOK, fmt.Sprintf(`{"aud":%q,"azp":%q,"sub":"sub-1","exp":3599,"email_verified":true}`, testClientID, testClientID)),
+				authorization: []string{"Bearer ya29.a-token"},
+				status:        http.StatusForbidden, class: "no_email_in_token",
+				authRefusal: refusalBeforeTheAuthorizationServer,
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				f := newFakeTokeninfo(t, tt.tokeninfo)
+				h := serveBehindAuth(t, allowlistOf("one@example.test"), f)
+
+				resp := h.get(t, tt.authorization...)
+				h.assertRefusalShape(t, resp, tt.status, tt.class, tt.challenge, tt.authRefusal)
+			})
+		}
+	})
+
+	t.Run("what the sealed access path answers", func(t *testing.T) {
+		for _, tt := range []struct {
+			name        string
+			seal        func(*Sealer, time.Time) (string, error)
+			advance     time.Duration
+			status      int
+			class       string
+			challenge   []string
+			authRefusal string
+		}{
+			{
+				name: "a sealed access credential that has expired",
+				seal: func(s *Sealer, now time.Time) (string, error) {
+					return s.SealAccess(AccessCredential{Subject: "sub-1", Email: "one@example.test", Verified: true, ExpiresAt: now.Add(time.Hour)})
+				},
+				advance: time.Hour,
+				status:  http.StatusUnauthorized, class: "sealed_credential_expired",
+				challenge: []string{challengeBeforeTheAuthorizationServer},
+			},
+			{
+				name: "a refresh credential presented as access",
+				seal: func(s *Sealer, _ time.Time) (string, error) {
+					return s.SealRefresh(RefreshCredential{UpstreamSecret: "upstream-refresh-secret"})
+				},
+				status: http.StatusUnauthorized, class: "sealed_credential_wrong_purpose",
+				challenge: []string{challengeBeforeTheAuthorizationServer},
+			},
+			{
+				name: "a sealed identity outside the allowlist",
+				seal: func(s *Sealer, now time.Time) (string, error) {
+					return s.SealAccess(AccessCredential{Subject: "sub-1", Email: "stranger@example.test", Verified: true, ExpiresAt: now.Add(time.Hour)})
+				},
+				status: http.StatusForbidden, class: "identity_not_allowlisted",
+				authRefusal: refusalBeforeTheAuthorizationServer,
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				clock := newClock()
+				// Answering 500 to anything: a sealed credential is decided locally, so a
+				// refusal that needed Google would show up here as the wrong class.
+				f := newFakeTokeninfo(t, respondWith(http.StatusInternalServerError, ""))
+				cfg := allowlistOf("one@example.test")
+				h := serveBehindAuthAt(t, cfg, f, clock.now)
+				sealed, err := tt.seal(testSealer(t, cfg.SealingSecret), clock.now())
+				if err != nil {
+					t.Fatalf("seal: %v", err)
+				}
+				clock.advance(tt.advance)
+
+				resp := h.get(t, "Bearer "+sealed)
+				h.assertRefusalShape(t, resp, tt.status, tt.class, tt.challenge, tt.authRefusal)
+				if got := f.requests.Load(); got != 0 {
+					t.Errorf("Tokeninfo saw %d requests for a sealed credential, want 0", got)
+				}
+			})
+		}
+	})
 }
 
 // TestABearerValueWithoutTheSealedMarkerStillUsesGoogleValidation is acceptance

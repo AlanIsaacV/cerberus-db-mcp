@@ -19,6 +19,8 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rs/zerolog"
 
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/authflow"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 )
@@ -42,6 +44,58 @@ func neutraliseForeignVariables(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{"PGSERVICE", "PGSERVICEFILE", "MSSQL_USE_EPA"} {
 		t.Setenv(name, "")
+	}
+}
+
+// TestUnauthenticatedRoutesAreMountedBesideHealthzWhileMCPRemainsWrapped is
+// acceptance criterion 1. The route handlers arrive through Deps, so this test
+// proves the transport boundary without making mcp know the authorization flow.
+//
+// The patterns are internal/authflow's own constants rather than the strings
+// they currently hold, and only this test file imports that package — the
+// import guard is scoped to non-test files, so the transport's own dependencies
+// are unaffected. Written as literals, renaming a path in internal/authflow
+// would leave this test mounting stubs at the old patterns and driving the old
+// patterns, which is a green run over a server whose real routes moved.
+// Naming the constants makes that a compile-time relationship instead.
+func TestUnauthenticatedRoutesAreMountedBesideHealthzWhileMCPRemainsWrapped(t *testing.T) {
+	var log bytes.Buffer
+	middleware, err := auth.NewMiddleware(auth.Config{
+		ClientID:      "1234567890-abcdefghijklmnop.apps.googleusercontent.com",
+		AllowedEmails: []string{"one@example.test"},
+		SealingSecret: auth.Secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+	}, NewLogger(&log))
+	if err != nil {
+		t.Fatalf("auth.NewMiddleware: %v", err)
+	}
+	server := &Server{
+		cfg:        Config{Path: "/mcp"},
+		middleware: middleware,
+		unauthenticatedRoutes: []UnauthenticatedRoute{
+			{Pattern: authflow.AuthorizationPath, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })},
+			{Pattern: authflow.CallbackPath, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })},
+		},
+	}
+	for _, tt := range []struct {
+		name string
+		path string
+		want int
+	}{
+		{"authorization endpoint", authflow.AuthorizationPath, http.StatusNoContent},
+		{"callback endpoint", authflow.CallbackPath, http.StatusNoContent},
+		{"MCP endpoint", "/mcp", http.StatusUnauthorized},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			server.Handler().ServeHTTP(response, request)
+			if response.Code != tt.want {
+				t.Errorf("status = %d, want %d", response.Code, tt.want)
+			}
+		})
+	}
+	if !strings.Contains(log.String(), `"failure_class":"absent_header"`) {
+		t.Errorf("the MCP refusal is not auth's absent-header refusal: %s", log.String())
 	}
 }
 

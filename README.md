@@ -60,13 +60,43 @@ loads an `.env` beside it.
   changes the names the agent uses — see "The databases an alias exposes" below.
   The singular `CERBERUS_DB_<ALIAS>_DATABASE` this replaced is now refused at
   startup; the same section says how to migrate.
-- `CERBERUS_AUTH_GOOGLE_CLIENT_ID`: the Google OAuth client ID that issued the
-  access tokens this deployment accepts.
+- `CERBERUS_AUTH_GOOGLE_CLIENT_ID`: the public Google OAuth client ID that
+  issued the access tokens this deployment accepts and is paired with the
+  client secret this server uses for its own authorization-code exchange.
+- `CERBERUS_AUTH_GOOGLE_CLIENT_SECRET`: the paired Google OAuth client secret.
+  It is a real secret; whitespace is refused rather than trimmed, including a
+  trailing newline pasted with the value.
 - `CERBERUS_AUTH_ALLOWED_EMAILS`: the comma-separated verified Google email
   addresses allowed to reach a tool.
 - `CERBERUS_AUTH_SEALING_SECRET`: the base64-encoded 32-byte master secret,
-  generated outside this process; changing it invalidates every credential it
-  issued.
+  generated outside this process; whitespace is refused rather than trimmed,
+  and changing it invalidates every credential it issued.
+- `CERBERUS_AUTH_PUBLIC_BASE_URL`: the public HTTPS origin at which clients and
+  Google reach this process. It cannot be detected: the process binds no host
+  port and terminates no TLS, and cloudflared reaches it through an external
+  Docker network from a container configured outside this repository. It must be
+  an absolute `https` URL with no query, fragment or userinfo; a trailing slash
+  is removed, and whitespace is refused rather than trimmed. The callback to
+  register in Google is this value with `/authorize/callback` appended.
+- `CERBERUS_AUTH_CLIENT_REDIRECT_URIS`: the comma-separated redirect URIs this
+  server's authorization endpoint will send an authorization code to. With no
+  dynamic client registration, this list is the only client registry this design
+  has, and a request naming a redirect URI outside it is refused before Google
+  is contacted. Matching is exact string equality against an entry as written: a
+  different host, a different scheme, an appended path, a trailing segment on an
+  accepted prefix, or a trailing slash the entry does not have are all refusals,
+  so a URI one character away from the one the client sends fails here rather
+  than against a browser. Entries are not trimmed and whitespace anywhere in one
+  is refused — including the space in `a, b` and the empty element a trailing
+  comma leaves behind, neither of which this list forgives the way
+  `CERBERUS_AUTH_ALLOWED_EMAILS` does. An absent, empty, or all-blank value
+  refuses to start and names the variable, because an empty registry is a
+  deployment mistake rather than an endpoint deliberately admitting no client.
+
+The server, not the connecting MCP client, holds the Google client secret and
+performs the Google authorization-code flow. It has no OAuth metadata endpoint,
+dynamic client registration or `.well-known` document; the discovery surface is
+later work.
 
 ### Defaulted or optional
 

@@ -23,7 +23,10 @@ import (
 // The scans that are about the objective rather than about this package cover
 // cmd/cerberus-db-mcp too: the binary is where the middleware is wired in, and
 // "the token is handled here and nowhere else" is false the moment main learns
-// what a token is.
+// what a token is. They cover internal/authflow for the same reason from the other
+// direction: that package is where this process stopped being only a resource
+// server, and both of the claims below — which endpoints are named, and what may
+// reach a logger — are about it now more than they are about this package.
 
 // cmdDir is the binary's source, relative to this package's directory — which is
 // where `go test` runs a package's tests, and is the only path base available to a
@@ -41,6 +44,41 @@ const cmdDir = "../../cmd/cerberus-db-mcp"
 // which are about rules that are internal/auth's own.
 const mcpDir = "../mcp"
 
+// authflowDir is the authorization-server half of this process, resolved the same
+// way and for the same reason.
+//
+// It is scanned by the endpoint guard and by the token guard, and it is what made
+// extending both urgent: it is where this process talks to Google as a client
+// rather than as a validator, and it holds three values these scans exist to catch
+// — this deployment's Google client secret, an authorization code, and Google's
+// refresh token. Its files are split by which of those two things they do, in
+// [authflowCredentialFiles] and [authflowWriterFiles]. It is deliberately not
+// scanned by the import allowlist, which is a per-package rule and is
+// internal/auth's own.
+const authflowDir = "../authflow"
+
+// authflowCredentialFiles are the files of internal/authflow that hold a
+// credential: this deployment's Google client secret, Google's refresh token, and
+// the authorization code sealed out of them.
+//
+// They are enumerated, one line each, for the reason [tokenFile] is: holding a
+// credential in a new file is then a line somebody added here, in a diff that gets
+// read, rather than a value that quietly acquired a logger next to it.
+var authflowCredentialFiles = []string{
+	path.Join(authflowDir, "exchange.go"),
+	path.Join(authflowDir, "config.go"),
+}
+
+// authflowWriterFiles are the files of internal/authflow that may write where a
+// person reads — the handlers, their refusals, and the flow's one log line.
+//
+// The two lists are disjoint and [TestTheRawTokenNeverReachesALogger] checks that
+// together they are the whole package, so a new file in internal/authflow fails
+// these guards until somebody says which half it is in.
+var authflowWriterFiles = []string{
+	path.Join(authflowDir, "flow.go"),
+}
+
 // requiredSources are the files these scans must actually have parsed, named
 // rather than counted.
 //
@@ -48,13 +86,21 @@ const mcpDir = "../mcp"
 // failure mode that matters for a guard: it reports success for having looked at
 // nothing. Naming the files means a rename fails here and says which path it
 // looked in — ADR 01KZT76QT9ECEMKYGKXVZ5XPPJ.
-var requiredSources = []string{
-	"config.go",
+var requiredSources = append([]string{
+	configFile,
 	"identity.go",
 	"middleware.go",
 	sealingFile,
 	tokenFile,
 	path.Join(cmdDir, "main.go"),
+	// The files of the authorization flow come from the two lists above, so a scan
+	// that reached ../authflow and found nothing in it fails here rather than
+	// reporting success over the package these guards were extended for.
+}, authflowSources()...)
+
+// authflowSources is both halves of internal/authflow, in one list.
+func authflowSources() []string {
+	return append(append([]string{}, authflowCredentialFiles...), authflowWriterFiles...)
 }
 
 // requiredTokenScanSources are the files the token guard must have parsed: the
@@ -66,16 +112,31 @@ var requiredTokenScanSources = append([]string{
 	path.Join(mcpDir, "audit.go"),
 }, requiredSources...)
 
-// tokenFile is the one file in this repository that holds a raw bearer token. The
-// guards below are written in terms of that fact, so the name is a constant: if the
-// token handling moves, these scans must be rewritten rather than silently pointed
-// at a file that no longer has anything to hide.
+// tokenFile is the one file that holds a bearer token presented to the MCP
+// endpoint. The guards below are written in terms of that fact, so the name is a
+// constant: if the token handling moves, these scans must be rewritten rather than
+// silently pointed at a file that no longer has anything to hide.
+//
+// It is not the only file in this repository holding a raw credential —
+// internal/authflow holds Google's answer to a token exchange — and the import
+// check below covers those files too, by name, in [authflowCredentialFiles].
 const tokenFile = "tokeninfo.go"
 
 // sealingFile holds credentials this process issued. Like [tokenFile], it is a
 // deliberately narrow place for credential material and must not import a
 // logger or formatter.
 const sealingFile = "sealing.go"
+
+// configFile is where the sealing master secret enters the process, so it is
+// credential-bearing for exactly the reason the two above are and is held to the
+// same rule.
+//
+// It is the one of the three that also has to refuse a value by name, which is
+// what makes the rule bite here: `fmt.Errorf("%s", string(cfg.SealingSecret))`
+// passed every name-based check in this file until the formatter was taken away.
+// Its refusals are assembled from constants instead — see internal/auth/config.go
+// and internal/authflow/config.go, which do it the same way.
+const configFile = "config.go"
 
 // allowedImports is the whole of what this package's non-test files may import.
 //
@@ -247,22 +308,22 @@ func parsePackageFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 }
 
 // parseObjectiveFiles is the scan for the rules that are the objective's:
-// everything in internal/auth plus everything in cmd/cerberus-db-mcp, checked
-// against [requiredSources] so that a scan which found nothing fails here rather
-// than passing downstream.
+// everything in internal/auth, everything in cmd/cerberus-db-mcp and everything in
+// internal/authflow, checked against [requiredSources] so that a scan which found
+// nothing fails here rather than passing downstream.
 func parseObjectiveFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 	t.Helper()
-	fset, files := parseFiles(t, ".", cmdDir)
+	fset, files := parseFiles(t, ".", cmdDir, authflowDir)
 	requireScanned(t, files, requiredSources)
 	return fset, files
 }
 
 // parseTokenScanFiles is the scan for the one claim that reaches past this
-// objective's own files: internal/auth, the binary, and internal/mcp, which is
-// everything the credential could have travelled into.
+// objective's own files: internal/auth, the binary, internal/authflow, and
+// internal/mcp, which is everything a credential could have travelled into.
 func parseTokenScanFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 	t.Helper()
-	fset, files := parseFiles(t, ".", cmdDir, mcpDir)
+	fset, files := parseFiles(t, ".", cmdDir, mcpDir, authflowDir)
 	requireScanned(t, files, requiredTokenScanSources)
 	return fset, files
 }
@@ -310,8 +371,8 @@ func TestPackageImportsNothingItShouldNot(t *testing.T) {
 }
 
 // TestTheRawTokenNeverReachesALogger is acceptance criterion 6's source half, over
-// internal/auth, the binary, and internal/mcp — everywhere in this process the
-// credential could have been carried to.
+// internal/auth, the binary, internal/authflow and internal/mcp — everywhere in
+// this process a credential could have been carried to.
 //
 // What it establishes, and what it does not, both need saying, because an earlier
 // version of this comment claimed the whole property and a leak walked through it: a
@@ -319,14 +380,25 @@ func TestPackageImportsNothingItShouldNot(t *testing.T) {
 // package green, because the guard matched names and `presented` was not one of
 // them.
 //
-// It is a name-based scan. It cannot do dataflow analysis, so it cannot see a token
-// handed to a function that logs it under a parameter name of its own, and it cannot
-// see one rendered by a sink this file does not know is a sink. What it does check is
-// four things that are worth something together:
+// Checks two and three are a name-based scan. They cannot do dataflow analysis, so
+// they cannot see a token handed to a function that logs it under a parameter name
+// of its own, and they cannot see one rendered by a sink this file does not know is
+// a sink. A leak was demonstrated straight through them:
+// `s := string(h.config.ClientSecret)` beside a log line in internal/authflow passed
+// every one of them, because the conversion is not a rebinding and `s` is not a name
+// anything here matches. What the checks are worth together is four things, and the
+// first is the one that does not depend on a name at all:
 //
-//   - The token lives in one file, named in [tokenFile], and that file imports no
-//     logger and no formatter. The file that has the credential has nothing to write
-//     it with.
+//   - Every file that holds a credential — [tokenFile], [sealingFile] and
+//     [configFile] here, [authflowCredentialFiles] in internal/authflow — imports no
+//     logger and no formatter, and every file that can write to one holds no
+//     credential and names no credential-bearing field. It is the whole set in both
+//     packages and not the newest one: the same `s := string(...)` conversion walked
+//     through every check here out of internal/auth's own configuration, which holds
+//     the sealing master secret, for as long as that file could still format.
+//     The file with the value cannot render it, and the
+//     file that can render cannot reach the value. That is structural: it survives a
+//     rename, a conversion, and a helper this scan has never heard of.
 //   - No logging sink anywhere in the scanned directories is handed an identifier
 //     whose name carries the credential — see [carriesTheToken], which matches stems
 //     rather than exact spellings for the reason above.
@@ -336,16 +408,15 @@ func TestPackageImportsNothingItShouldNot(t *testing.T) {
 //   - The scan actually found the token where it claims it is, so a rename turns
 //     this into a failure rather than into a guard over nothing.
 //
-// The reason that is enough is not in this file. The middleware deletes the inbound
-// Authorization header on every path before anything downstream runs, so in
-// internal/mcp there is no credential left to leak — the scan there is guarding
-// against a re-read of a header that is gone, not against handling something that is
-// present.
+// internal/mcp is scanned by the name checks alone, and the reason that is enough is
+// not in this file: the middleware deletes the inbound Authorization header on every
+// path before anything downstream runs, so there is no credential left there to
+// leak. The scan there guards against a re-read of a header that is gone.
 func TestTheRawTokenNeverReachesALogger(t *testing.T) {
 	fset, files := parseTokenScanFiles(t)
 
-	// One: the two files holding credentials cannot log or format.
-	for _, source := range []string{tokenFile, sealingFile} {
+	// One: every file that holds a credential has nothing to write it with.
+	for _, source := range append([]string{tokenFile, sealingFile, configFile}, authflowCredentialFiles...) {
 		for _, spec := range files[source].Imports {
 			imported, err := strconv.Unquote(spec.Path.Value)
 			if err != nil {
@@ -354,6 +425,38 @@ func TestTheRawTokenNeverReachesALogger(t *testing.T) {
 			if imported == "github.com/rs/zerolog" || imported == "fmt" || imported == "log" || imported == "log/slog" {
 				t.Errorf("%s imports %q; the file that holds credentials must have nothing to write them with", source, imported)
 			}
+		}
+	}
+
+	// One, the other direction: a file that can write may not so much as name a
+	// credential-bearing field. Reaching one is how the demonstrated leak began, and a
+	// selector is neither a sink argument nor a rebinding, so nothing below sees it.
+	//
+	// It is asserted over internal/authflow only, and deliberately: internal/auth's
+	// middleware is the one place in this process that must hold a presented
+	// credential and log the outcome of judging it, which is why the token lives in a
+	// file of its own there instead. internal/authflow had no such seam until the
+	// exchange became a file of its own, and this is what keeps it one.
+	for _, source := range authflowWriterFiles {
+		ast.Inspect(files[source], func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok || !carriesTheToken(source, sel.Sel.Name) {
+				return true
+			}
+			t.Errorf("%s:%d reads the field %s; this file writes to a log and must reach no credential-bearing field. The value belongs behind one of %v, which cannot log",
+				source, fset.Position(sel.Sel.Pos()).Line, sel.Sel.Name, authflowCredentialFiles)
+			return true
+		})
+	}
+
+	// One, third part: the two lists are the whole of internal/authflow. Without this
+	// a new file there is guarded by neither half — it could hold the client secret
+	// and import zerolog, and every check in this test would still pass.
+	classified := authflowSources()
+	for _, source := range nonTestFiles(t, authflowDir) {
+		if !slices.Contains(classified, source) {
+			t.Errorf("%s is in internal/authflow and is on neither authflowCredentialFiles nor authflowWriterFiles; a file there either holds a credential or may write one, and which it is has to be written down",
+				source)
 		}
 	}
 
@@ -498,16 +601,43 @@ func TestNothingInTheBinaryHandlesABearerTokenItself(t *testing.T) {
 	}
 }
 
-// TestTheOnlyEndpointNamedInTheSourceIsGooglesOverHTTPS is what makes "this
-// process asks Google and nobody else" a claim about the code.
+// namedEndpoints is the whole of what this objective's source may name, one entry
+// per destination, each with what it is for.
 //
-// The token travels in the query string of that URL, so a second endpoint — a
-// staging one, a configurable one, a mock left behind — is a credential handed to
-// whoever runs it, and a plain-http one is a credential on the wire. The
-// alternative to this scan is trusting that no future edit adds a variable for it.
-func TestTheOnlyEndpointNamedInTheSourceIsGooglesOverHTTPS(t *testing.T) {
+// It is enumerated and matched whole. Not a host test, not a prefix test, not
+// "anything on oauth2.googleapis.com": a pattern would admit the next outbound
+// destination silently, and the point of this guard is that adding one costs
+// somebody a line here, in a file whose diff gets read, rather than a URL literal
+// nobody looked twice at. The three of them are all the process talks to.
+var namedEndpoints = map[string]string{
+	tokeninfoURL: "Google Tokeninfo, asked to vouch for a token a caller presented",
+	"https://accounts.google.com/o/oauth2/v2/auth": "Google's authorization endpoint, which the operator's browser is sent to",
+	"https://oauth2.googleapis.com/token":          "Google's token endpoint, where an authorization code is exchanged",
+}
+
+// TestEveryEndpointNamedInTheSourceIsOneOfGooglesOverHTTPS is what makes "this
+// process talks to Google and nobody else" a claim about the code.
+//
+// A presented token travels in Tokeninfo's query string and this deployment's
+// Google client secret travels in the token endpoint's request body, so a fourth
+// endpoint — a staging one, a configurable one, a mock left behind — is a
+// credential handed to whoever runs it, and a plain-http one is a credential on the
+// wire. The alternative to this scan is trusting that no future edit adds a
+// variable for it.
+//
+// It fails in both directions on purpose. An unlisted URL fails, which is the
+// direction that matters; and a listed URL that appears in no source file fails
+// too, so permission that has outlived its call site has to be struck off here
+// instead of standing open for whatever is added next.
+func TestEveryEndpointNamedInTheSourceIsOneOfGooglesOverHTTPS(t *testing.T) {
 	fset, files := parseObjectiveFiles(t)
-	found := 0
+	admitted := make([]string, 0, len(namedEndpoints))
+	for endpoint := range namedEndpoints {
+		admitted = append(admitted, endpoint)
+	}
+	slices.Sort(admitted)
+
+	found := make(map[string]int, len(namedEndpoints))
 	for name, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
 			lit, ok := n.(*ast.BasicLit)
@@ -518,19 +648,24 @@ func TestTheOnlyEndpointNamedInTheSourceIsGooglesOverHTTPS(t *testing.T) {
 			if err != nil || !strings.Contains(value, "://") {
 				return true
 			}
-			found++
-			if value != tokeninfoURL {
-				t.Errorf("%s:%d names the endpoint %q; the only URL this objective may contain is Google's Tokeninfo endpoint over HTTPS",
-					name, fset.Position(lit.Pos()).Line, value)
+			if _, ok := namedEndpoints[value]; !ok {
+				t.Errorf("%s:%d names the endpoint %q, which is not one of the %d this objective may talk to: %v. A new destination is admitted by naming it in namedEndpoints and not by matching its host, so that adding one is a decision somebody made in review",
+					name, fset.Position(lit.Pos()).Line, value, len(namedEndpoints), admitted)
+				return true
 			}
+			found[value]++
 			return true
 		})
 	}
-	if found == 0 {
-		t.Fatal("no URL literal was found anywhere in this objective, so this guard is asserting nothing about which endpoint the token is sent to")
-	}
-	if !strings.HasPrefix(tokeninfoURL, "https://") {
-		t.Errorf("tokeninfoURL = %q, which is not HTTPS; the token is a query parameter of it", tokeninfoURL)
+	for _, endpoint := range admitted {
+		if found[endpoint] == 0 {
+			t.Errorf("no source file names %q (%s), so this guard is admitting an endpoint nothing calls; remove the entry rather than leave the permission standing",
+				endpoint, namedEndpoints[endpoint])
+		}
+		if !strings.HasPrefix(endpoint, "https://") {
+			t.Errorf("%q is admitted and is not HTTPS; a token is a query parameter of one of these and a client secret is in the body of another",
+				endpoint)
+		}
 	}
 }
 

@@ -6,6 +6,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -15,6 +19,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/authflow"
 )
 
 // This file exists because this package reported "no test files" while holding the
@@ -56,6 +61,13 @@ func testEnvironment(t *testing.T, address string) {
 	t.Setenv("CERBERUS_MCP_ADDRESS", address)
 	t.Setenv("CERBERUS_MCP_PATH", "/mcp")
 	t.Setenv("CERBERUS_MCP_SHUTDOWN_TIMEOUT", "5s")
+	// The flow's configuration is supplied beside auth's because every test that
+	// reaches run supplies the resource-server configuration itself. It remains
+	// required even when a test only drives MCP: startup must not expose one path
+	// while the authorization callback is misconfigured.
+	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_SECRET", "test-client-secret")
+	t.Setenv("CERBERUS_AUTH_PUBLIC_BASE_URL", "https://public.example.test/")
+	t.Setenv("CERBERUS_AUTH_CLIENT_REDIRECT_URIS", "https://client.example.test/callback")
 
 	t.Setenv("CERBERUS_DB_ALIASES", "warehouse")
 	t.Setenv("CERBERUS_DB_WAREHOUSE_ENGINE", "postgresql")
@@ -75,6 +87,100 @@ func testEnvironment(t *testing.T, address string) {
 	t.Setenv("PGSERVICE", "")
 	t.Setenv("PGSERVICEFILE", "")
 	t.Setenv("MSSQL_USE_EPA", "")
+}
+
+// TestTheCompiledBinaryRefusesUnusableNewAuthenticationConfiguration is
+// acceptance criterion 7 at the process boundary. A loader test alone cannot
+// show that main reports its refusal instead of proceeding to open the database
+// or listener, so each row executes the CGO-disabled binary the test compiled.
+func TestTheCompiledBinaryRefusesUnusableNewAuthenticationConfiguration(t *testing.T) {
+	binary := compiledBinary(t)
+	testEnvironment(t, "127.0.0.1:0")
+	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
+	t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "one@example.test")
+	t.Setenv("CERBERUS_AUTH_SEALING_SECRET", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+
+	for _, tt := range []struct {
+		name     string
+		variable string
+		value    string
+	}{
+		{
+			name:     "a missing Google client secret",
+			variable: "CERBERUS_AUTH_GOOGLE_CLIENT_SECRET",
+		},
+		{
+			name:     "a Google client secret with whitespace",
+			variable: "CERBERUS_AUTH_GOOGLE_CLIENT_SECRET",
+			value:    "bad client secret",
+		},
+		{
+			name:     "a missing public base URL",
+			variable: "CERBERUS_AUTH_PUBLIC_BASE_URL",
+		},
+		{
+			name:     "a public base URL with an http scheme and a query",
+			variable: "CERBERUS_AUTH_PUBLIC_BASE_URL",
+			value:    "http://public.example.test/?bad=1",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			environ := environmentWithout(os.Environ(), tt.variable)
+			if tt.value != "" {
+				environ = append(environ, tt.variable+"="+tt.value)
+			}
+
+			command := exec.Command(binary)
+			command.Env = environ
+			output, err := command.CombinedOutput()
+			if err == nil {
+				t.Fatal("the compiled binary started successfully with unusable authentication configuration")
+			}
+			var exitError *exec.ExitError
+			if !errors.As(err, &exitError) || exitError.ExitCode() == 0 {
+				t.Fatalf("the compiled binary did not exit non-zero: %v", err)
+			}
+			if !bytes.Contains(output, []byte(tt.variable)) {
+				t.Errorf("the startup refusal did not name %s", tt.variable)
+			}
+			if tt.value != "" && bytes.Contains(output, []byte(tt.value)) {
+				t.Error("the startup refusal quoted an unusable authentication configuration value")
+			}
+		})
+	}
+}
+
+// compiledBinary builds the command under test instead of using the go test
+// process itself: main's exit and stdout error path are the behaviour criterion
+// 7 needs to observe. CGO stays disabled to match the image's binary.
+func compiledBinary(t *testing.T) string {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "cerberus-db-mcp")
+	command := exec.Command("go", "build", "-o", binary, ".")
+	command.Env = append(environmentWithout(os.Environ(), "CGO_ENABLED"), "CGO_ENABLED=0")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build command binary: %v\n%s", err, output)
+	}
+	return binary
+}
+
+// environmentWithout copies an environment after removing each named variable.
+// A child process cannot distinguish an empty required value from an absent one,
+// but this helper makes the missing-variable rows prove the latter.
+func environmentWithout(environ []string, names ...string) []string {
+	removed := make(map[string]bool, len(names))
+	for _, name := range names {
+		removed[name] = true
+	}
+	copy := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		name, _, found := strings.Cut(entry, "=")
+		if found && removed[name] {
+			continue
+		}
+		copy = append(copy, entry)
+	}
+	return copy
 }
 
 // TestTheProcessRefusesToStartWithoutAuthenticationBeforeItOpensAnythingElse is
@@ -101,6 +207,19 @@ func TestTheProcessRefusesToStartWithoutAuthenticationBeforeItOpensAnythingElse(
 			t.Fatalf("run() = %v, want an error wrapping auth.ErrNoAllowlist", err)
 		}
 	})
+}
+
+func TestTheProcessRefusesToStartWithoutAClientRedirectRegistryBeforeItOpensAnythingElse(t *testing.T) {
+	testEnvironment(t, "127.0.0.1:0")
+	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
+	t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "one@example.test")
+	t.Setenv("CERBERUS_AUTH_SEALING_SECRET", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("CERBERUS_AUTH_CLIENT_REDIRECT_URIS", "")
+
+	err := run(zerolog.New(&lockedBuffer{}))
+	if !errors.Is(err, authflow.ErrNoClientRedirectURIs) {
+		t.Fatalf("run() = %v, want an error wrapping authflow.ErrNoClientRedirectURIs", err)
+	}
 }
 
 // TestTheListenerTheBinaryStartsAnswersAnUnauthenticatedRequestWithAChallenge is
@@ -214,6 +333,138 @@ func TestANetworkFacingListenerTheBinaryStartsAuthenticatesBeforeTheSDKChecksThe
 	}
 
 	shutdownRun(t, runErr)
+}
+
+// TestTheListenerTheBinaryStartsMountsTheAuthorizationEndpointAndItsCallback is
+// the assertion that fails when the UnauthenticatedRoutes literal is deleted
+// from the mcp.Deps literal in [run] — the same class of edit, in the same
+// literal, as the one the middleware test above covers.
+//
+// internal/mcp's own criterion-1 test drives all three paths, but it mounts
+// stub handlers it supplies itself through Deps, so it is green for a process
+// that mounts none: which routes exist in the shipped process is a property of
+// this file's wiring and of nothing else. Deleting the field there leaves seven
+// green packages and an authorization flow that 404s in production, and the
+// next objective edits that same literal to add /token and the discovery
+// documents.
+//
+// Nothing here reaches Google. The authorization endpoint seals its state and
+// answers with a redirect without asking anyone anything, and the callback
+// refuses a response carrying no code before it would exchange one — so what is
+// under test is which handler answered, on a listener started from the
+// environment by [run]. A 404 says the route is not mounted and a 401 says the
+// authentication middleware wrapped something it must not; both fail here.
+func TestTheListenerTheBinaryStartsMountsTheAuthorizationEndpointAndItsCallback(t *testing.T) {
+	address := reservedAddress(t)
+	testEnvironment(t, address)
+	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
+	t.Setenv("CERBERUS_AUTH_SEALING_SECRET", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "one@example.test")
+
+	appLog := &lockedBuffer{}
+	runErr := make(chan error, 1)
+	go func() { runErr <- run(zerolog.New(appLog)) }()
+
+	// A well-formed authorization request, so that the endpoint gets as far as
+	// the redirect: a malformed one is refused by the same handler and would
+	// leave this test unable to tell the flow's own 400 from anybody else's.
+	// The challenge is RFC 7636's example value; the endpoint checks that one is
+	// present and that the method is S256, not what it hashes.
+	authorizationQuery := url.Values{
+		"redirect_uri":          {"https://client.example.test/callback"},
+		"state":                 {"the-client-own-state"},
+		"code_challenge":        {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		"code_challenge_method": {"S256"},
+		"response_type":         {"code"},
+	}
+
+	for _, tt := range []struct {
+		name               string
+		path               string
+		want               int
+		wantChallenge      bool
+		wantLocationPrefix string
+	}{
+		{
+			name:               "the authorization endpoint redirects to Google without a credential",
+			path:               authflow.AuthorizationPath + "?" + authorizationQuery.Encode(),
+			want:               http.StatusFound,
+			wantLocationPrefix: "https://accounts.google.com/",
+		},
+		{
+			// Google's callback arrives with no credential of this server's and
+			// must be answered by the flow rather than challenged. Empty here, so
+			// the answer is the flow's own refusal of an unusable authorization
+			// response — which only the mounted handler can produce.
+			name: "the callback refuses an unusable response without a credential",
+			path: authflow.CallbackPath,
+			want: http.StatusBadRequest,
+		},
+		{
+			// The other half of criterion 1, in the same process and the same mux:
+			// mounting the flow unwrapped must not have unwrapped the endpoint the
+			// middleware exists for.
+			name:          "the MCP endpoint is still wrapped and still refuses",
+			path:          "/mcp",
+			want:          http.StatusUnauthorized,
+			wantChallenge: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := getWhenServing(t, "http://"+address+tt.path, runErr)
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode == http.StatusNotFound {
+				t.Fatalf("the process this binary starts serves no handler at %s: the mcp.Deps literal in run mounts it nowhere", tt.path)
+			}
+			if resp.StatusCode != tt.want {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.want)
+			}
+			if challenged := resp.Header.Get("WWW-Authenticate") != ""; challenged != tt.wantChallenge {
+				t.Errorf("WWW-Authenticate present = %v, want %v: %q", challenged, tt.wantChallenge, resp.Header.Get("WWW-Authenticate"))
+			}
+			location := resp.Header.Get("Location")
+			if tt.wantLocationPrefix == "" {
+				if location != "" {
+					t.Errorf("Location = %q, want none", location)
+				}
+				return
+			}
+			if !strings.HasPrefix(location, tt.wantLocationPrefix) {
+				t.Errorf("Location = %q, want a redirect to %s", location, tt.wantLocationPrefix)
+			}
+		})
+	}
+
+	shutdownRun(t, runErr)
+}
+
+// getWhenServing is [postWhenServing] for the flow's two GET endpoints, with
+// redirects left unfollowed: the authorization endpoint's answer is a redirect
+// to Google, and a client that followed it would turn this test into one that
+// needs the internet and Google's consent screen to pass.
+func getWhenServing(t *testing.T, endpoint string, runErr <-chan error) *http.Response {
+	t.Helper()
+	client := &http.Client{
+		Transport:     &http.Transport{Proxy: nil},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		select {
+		case err := <-runErr:
+			t.Fatalf("run returned before it was serving: %v", err)
+		default:
+		}
+		resp, err := client.Get(endpoint)
+		if err == nil {
+			return resp
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the listener never answered at %s: %v", endpoint, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // reservedAddress is a loopback address with a port the kernel has just confirmed

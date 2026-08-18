@@ -57,14 +57,13 @@ func (Secret) MarshalText() ([]byte, error) { return []byte(redactedSecret), nil
 
 func (s Secret) reveal() string { return string(s) }
 
-// Purpose separates the two credential kinds at the key-derivation boundary.
-// A future refresh flow can use RefreshPurpose without making an access
-// credential key capable of opening a refresh credential.
+// Purpose separates credential kinds at the key-derivation boundary.
 type Purpose string
 
 const (
-	AccessPurpose  Purpose = "access"
-	RefreshPurpose Purpose = "refresh"
+	AccessPurpose            Purpose = "access"
+	RefreshPurpose           Purpose = "refresh"
+	AuthorizationCodePurpose Purpose = "authorization-code"
 )
 
 // AccessCredential is the sealed identity carried by a credential accepted at
@@ -81,6 +80,18 @@ type AccessCredential struct {
 // retrofitted onto live access credentials.
 type RefreshCredential struct {
 	UpstreamSecret string `json:"upstream_secret"`
+}
+
+// AuthorizationCodeCredential is the stateless authorization result a later
+// token endpoint will exchange for this server's credentials.
+type AuthorizationCodeCredential struct {
+	UpstreamSecret      string    `json:"upstream_secret"`
+	Subject             string    `json:"subject"`
+	Email               string    `json:"email"`
+	Verified            bool      `json:"verified"`
+	CodeChallenge       string    `json:"code_challenge"`
+	CodeChallengeMethod string    `json:"code_challenge_method"`
+	ExpiresAt           time.Time `json:"expires_at"`
 }
 
 // Sealer issues and accepts this process's opaque credentials. It keeps only the
@@ -166,6 +177,28 @@ func (s *Sealer) UnsealRefresh(value string) (RefreshCredential, error) {
 	var payload RefreshCredential
 	if err := json.Unmarshal(encoded, &payload); err != nil {
 		return RefreshCredential{}, ErrMalformedSealedCredential
+	}
+	return payload, nil
+}
+
+// SealAuthorizationCode seals an authorization code credential.
+func (s *Sealer) SealAuthorizationCode(payload AuthorizationCodeCredential) (string, error) {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", ErrMalformedSealedCredential
+	}
+	return s.seal(AuthorizationCodePurpose, encoded)
+}
+
+// UnsealAuthorizationCode opens an authorization code credential.
+func (s *Sealer) UnsealAuthorizationCode(value string) (AuthorizationCodeCredential, error) {
+	encoded, err := s.unseal(AuthorizationCodePurpose, value)
+	if err != nil {
+		return AuthorizationCodeCredential{}, err
+	}
+	var payload AuthorizationCodeCredential
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		return AuthorizationCodeCredential{}, ErrMalformedSealedCredential
 	}
 	return payload, nil
 }
@@ -267,6 +300,8 @@ func prefixFor(purpose Purpose) (string, error) {
 		return credentialMarker + "a", nil
 	case RefreshPurpose:
 		return credentialMarker + "r", nil
+	case AuthorizationCodePurpose:
+		return credentialMarker + "c", nil
 	default:
 		return "", ErrSealedCredentialWrongPurpose
 	}
@@ -278,6 +313,8 @@ func labelFor(purpose Purpose) (string, error) {
 		return "cerberus-db-mcp/sealed-credential/access/v1", nil
 	case RefreshPurpose:
 		return "cerberus-db-mcp/sealed-credential/refresh/v1", nil
+	case AuthorizationCodePurpose:
+		return "cerberus-db-mcp/sealed-credential/authorization-code/v1", nil
 	default:
 		return "", ErrSealedCredentialWrongPurpose
 	}
@@ -303,6 +340,8 @@ func parseCredential(value string) (prefix string, purpose Purpose, encoded stri
 		purpose = AccessPurpose
 	case "r":
 		purpose = RefreshPurpose
+	case "c":
+		purpose = AuthorizationCodePurpose
 	default:
 		return "", "", "", ErrMalformedSealedCredential
 	}

@@ -89,6 +89,10 @@ type Deps struct {
 	// refusing to start without authentication is the binary's property rather than
 	// this constructor's.
 	Middleware func(http.Handler) http.Handler
+	// UnauthenticatedRoutes are endpoints whose authentication belongs to a
+	// dependency other than this transport. They are mounted beside healthz;
+	// the MCP path remains the only endpoint this package decorates.
+	UnauthenticatedRoutes []UnauthenticatedRoute
 	// Ready, when non-nil, is called once with the address the listener actually
 	// bound. It exists because "127.0.0.1:0" is the only way to run this server in
 	// a test without choosing a port that might be in use, and the resolved port
@@ -96,14 +100,23 @@ type Deps struct {
 	Ready func(addr string)
 }
 
+// UnauthenticatedRoute is an externally supplied HTTP endpoint mounted without
+// the MCP authentication seam. Its meaning belongs to the caller that supplied
+// it; this package only owns the transport registration.
+type UnauthenticatedRoute struct {
+	Pattern string
+	Handler http.Handler
+}
+
 // Server is the MCP transport over one executor.
 type Server struct {
-	cfg        Config
-	executor   *db.Executor
-	log        zerolog.Logger
-	audit      *Auditor
-	middleware func(http.Handler) http.Handler
-	ready      func(addr string)
+	cfg                   Config
+	executor              *db.Executor
+	log                   zerolog.Logger
+	audit                 *Auditor
+	middleware            func(http.Handler) http.Handler
+	unauthenticatedRoutes []UnauthenticatedRoute
+	ready                 func(addr string)
 }
 
 // ErrNoExecutor and ErrNoAuditor report a server built without a dependency
@@ -129,12 +142,13 @@ func New(deps Deps) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		cfg:        deps.Config,
-		executor:   deps.Executor,
-		log:        deps.Log,
-		audit:      deps.Audit,
-		middleware: deps.Middleware,
-		ready:      deps.Ready,
+		cfg:                   deps.Config,
+		executor:              deps.Executor,
+		log:                   deps.Log,
+		audit:                 deps.Audit,
+		middleware:            deps.Middleware,
+		unauthenticatedRoutes: deps.UnauthenticatedRoutes,
+		ready:                 deps.Ready,
 	}, nil
 }
 
@@ -152,6 +166,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+healthPath, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, healthBody)
 	})
+	for _, route := range s.unauthenticatedRoutes {
+		mux.Handle(route.Pattern, route.Handler)
+	}
 	mux.Handle(s.cfg.Path, s.middlewareOrPassThrough()(s.mcpHandler()))
 	return mux
 }

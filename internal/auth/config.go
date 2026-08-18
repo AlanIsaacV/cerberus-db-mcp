@@ -2,12 +2,18 @@ package auth
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"strings"
 
 	"github.com/caarlos0/env/v11"
 )
+
+// This file holds the sealing master secret — [Config.SealingSecret] is where it
+// enters the process — so, like sealing.go, like tokeninfo.go and like
+// internal/authflow/config.go, it imports no formatter and no logger. That is why
+// the refusals below are assembled from constants rather than written with
+// fmt.Errorf: a file that has nothing to render with cannot render a value it was
+// handed by mistake, whatever the value ends up being called.
 
 // Configuration errors. They are sentinels for the reason internal/db's and
 // internal/mcp's are: an error about a variable names the variable and never
@@ -118,10 +124,33 @@ var variableForms = map[string]struct{ variable, form string }{
 	"SealingSecret": {"CERBERUS_AUTH_SEALING_SECRET", "a base64-encoded 32-byte master secret, with no spaces in it"},
 }
 
+// variableFault is a refusal naming a variable, assembled rather than formatted.
+// Its message is built from constants and variable names alone, and its cause is
+// what errors.Is answers on, so it wraps exactly as the fmt.Errorf %w it replaced
+// did. internal/authflow/config.go carries the same type for the same reason.
+type variableFault struct {
+	message string
+	cause   error
+}
+
+func (f variableFault) Error() string { return f.message }
+
+func (f variableFault) Unwrap() error { return f.cause }
+
+func fault(detail string, cause error) error {
+	return variableFault{message: "auth: " + detail + ": " + cause.Error(), cause: cause}
+}
+
+// mustBe is the "this variable must be that form" half of a refusal, for the
+// fields whose value can be present and unusable.
+func mustBe(field string) string {
+	return variableForms[field].variable + " must be " + variableForms[field].form
+}
+
 func parseError(err error) error {
 	var aggregate env.AggregateError
 	if !errors.As(err, &aggregate) {
-		return fmt.Errorf("auth: a CERBERUS_AUTH_* variable could not be parsed: %w", ErrInvalidVariable)
+		return fault("a CERBERUS_AUTH_* variable could not be parsed", ErrInvalidVariable)
 	}
 	var named []string
 	for _, member := range aggregate.Errors {
@@ -136,14 +165,14 @@ func parseError(err error) error {
 	if len(named) == 0 {
 		// env grew a failure this code does not recognise. Its own text holds the
 		// value, so it goes no further.
-		return fmt.Errorf("auth: a CERBERUS_AUTH_* variable could not be parsed: %w", ErrInvalidVariable)
+		return fault("a CERBERUS_AUTH_* variable could not be parsed", ErrInvalidVariable)
 	}
-	return fmt.Errorf("auth: %s: %w", strings.Join(named, "; "), ErrInvalidVariable)
+	return fault(strings.Join(named, "; "), ErrInvalidVariable)
 }
 
 func (c Config) validate() error {
 	if c.ClientID == "" {
-		return fmt.Errorf("auth: %s is not set: %w", variableForms["ClientID"].variable, ErrNoClientID)
+		return fault(variableForms["ClientID"].variable+" is not set", ErrNoClientID)
 	}
 	// Refused rather than trimmed. A client ID with whitespace in it is a
 	// credential file read with its trailing newline or a value pasted across two
@@ -152,11 +181,11 @@ func (c Config) validate() error {
 	// successfully and work, which is fine right up to the value that trimming
 	// cannot repair.
 	if strings.ContainsAny(c.ClientID, whitespace) {
-		return fmt.Errorf("auth: %s must be %s: %w", variableForms["ClientID"].variable, variableForms["ClientID"].form, ErrInvalidVariable)
+		return fault(mustBe("ClientID"), ErrInvalidVariable)
 	}
 	allowed := c.Allowlist()
 	if len(allowed) == 0 {
-		return fmt.Errorf("auth: %s is not set, or holds no address: %w", variableForms["AllowedEmails"].variable, ErrNoAllowlist)
+		return fault(variableForms["AllowedEmails"].variable+" is not set, or holds no address", ErrNoAllowlist)
 	}
 	for _, address := range allowed {
 		if !isAddress(address) {
@@ -164,14 +193,14 @@ func (c Config) validate() error {
 			// secret — it is that the rule is the same rule everywhere in this
 			// repository. Naming the variable and the form is enough to find it: the
 			// operator is looking at the list.
-			return fmt.Errorf("auth: %s must be %s: %w", variableForms["AllowedEmails"].variable, variableForms["AllowedEmails"].form, ErrInvalidVariable)
+			return fault(mustBe("AllowedEmails"), ErrInvalidVariable)
 		}
 	}
 	if c.SealingSecret == "" {
-		return fmt.Errorf("auth: %s is not set: %w", variableForms["SealingSecret"].variable, ErrNoSealingMaterial)
+		return fault(variableForms["SealingSecret"].variable+" is not set", ErrNoSealingMaterial)
 	}
 	if _, err := decodeSealingSecret(c.SealingSecret); err != nil {
-		return fmt.Errorf("auth: %s must be %s: %w", variableForms["SealingSecret"].variable, variableForms["SealingSecret"].form, ErrInvalidVariable)
+		return fault(mustBe("SealingSecret"), ErrInvalidVariable)
 	}
 	return nil
 }
