@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## v0.5.0 - 2026-08-19
+## v0.5.0 - 2026-08-25
 
 
 ### Features
@@ -10,6 +10,8 @@ All notable changes to this project are documented in this file.
 - Save encrypted refresh token to persits longer sessions
 
 - Auth flow
+
+- Add /token to enable OAuth flow
 
 
 ## v0.4.0 - 2026-08-16
