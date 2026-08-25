@@ -94,9 +94,13 @@ loads an `.env` beside it.
   deployment mistake rather than an endpoint deliberately admitting no client.
 
 The server, not the connecting MCP client, holds the Google client secret and
-performs the Google authorization-code flow. It has no OAuth metadata endpoint,
-dynamic client registration or `.well-known` document; the discovery surface is
-later work.
+performs the Google authorization-code flow. It is an OAuth 2.1 authorization
+server in its own right, in front of Google: it publishes three discovery
+documents, issues its own credentials at `/token`, and renews them without a
+browser — see "Connecting an MCP client" below. What it does not have is dynamic
+client registration: `CERBERUS_AUTH_CLIENT_REDIRECT_URIS` is the whole client
+registry, and a client's redirect URI has to be listed there before it can
+connect.
 
 ### Defaulted or optional
 
@@ -304,6 +308,114 @@ and SQL Server reads `sys.*`, neither of which filters the column list by
 privilege. MySQL reads `information_schema`, which does: a MySQL login without
 permission on a column receives a short column list with no error.
 
+## Connecting an MCP client
+
+This server signs a client in once. It runs the Google flow itself, and hands the
+client a credential pair of its own, so a connected client does not go back
+through a browser every hour the way it does when it points its own OAuth
+straight at Google.
+
+The reason it has to work this way is narrow: Google issues a refresh token only
+when the authorization request carries `access_type=offline`, and no MCP client
+sends that. This server sends it, keeps Google's refresh token sealed inside the
+credential it gives the client, and spends it on the client's behalf at every
+renewal.
+
+### What is served
+
+Everything below is answered without authentication, beside the MCP endpoint,
+which is not:
+
+| Path | What it is |
+| --- | --- |
+| `/.well-known/oauth-protected-resource` | RFC 9728 document naming this server's MCP endpoint as the resource and this server as its authorization server |
+| `/.well-known/oauth-protected-resource<CERBERUS_MCP_PATH>` | the same document at the path-suffixed location some clients build |
+| `/.well-known/oauth-authorization-server` | RFC 8414 document naming `/authorize`, `/token`, `S256`, the two grants, `token_endpoint_auth_methods_supported: ["none"]`, and `offline_access` among its scopes |
+| `/authorize` | starts the flow; requires a registered `redirect_uri` and an S256 PKCE challenge |
+| `/authorize/callback` | Google's callback, registered in Google Cloud |
+| `/token` | `grant_type=authorization_code` and `grant_type=refresh_token` |
+
+A `401` from the MCP endpoint that is a statement about the credential carries
+`WWW-Authenticate: Bearer realm="cerberus-db-mcp", resource_metadata="<CERBERUS_AUTH_PUBLIC_BASE_URL>/.well-known/oauth-protected-resource"`,
+which is how a client that has only ever seen a refusal finds the rest.
+
+### The flow, end to end
+
+1. The client fetches the protected-resource document, follows it to the
+   authorization-server document, and sends the operator's browser to
+   `/authorize` with its own `redirect_uri`, `state` and S256 PKCE challenge.
+2. This server asks Google for consent with `access_type=offline` and
+   `prompt=consent`, using its own client secret and its own PKCE verifier. The
+   client's challenge and redirect URI travel in a sealed `state` parameter, so
+   nothing is stored here and a restart mid-flow breaks nothing.
+3. Google returns to `/authorize/callback`. This server exchanges the code, asks
+   Google's Tokeninfo who the caller is, checks that address against
+   `CERBERUS_AUTH_ALLOWED_EMAILS`, and redirects the client back to its own
+   `redirect_uri` with an authorization code of this server's — a sealed value
+   carrying Google's refresh token, the identity, the client's PKCE challenge and
+   a five-minute expiry.
+4. The client posts that code, its `code_verifier` and its `redirect_uri` to
+   `/token` and gets back `access_token`, `refresh_token`, `token_type: "Bearer"`
+   and `expires_in: 3600`. Both values are sealed with
+   `CERBERUS_AUTH_SEALING_SECRET` and are opaque to the client.
+5. The client calls tools with the access credential as a bearer token for an
+   hour, then posts `grant_type=refresh_token` to `/token` with no browser
+   involved. Every renewal spends Google's refresh token against Google,
+   re-derives the identity through Tokeninfo, and re-checks it against the
+   allowlist before issuing anything.
+
+No client secret is issued, stored or checked by this server: every client is
+public, and the PKCE `code_verifier` is the whole of what authenticates the caller
+at `/token`.
+
+### Configuring Claude Code
+
+```sh
+claude mcp add --transport http cerberus-db https://<public-hostname>/mcp
+```
+
+Claude Code discovers the rest: the first call gets a `401` naming the
+protected-resource document, and the browser sign-in follows from there. Before
+that works, the redirect URI Claude Code uses has to be listed in
+`CERBERUS_AUTH_CLIENT_REDIRECT_URIS` exactly as the client sends it — that list is
+the whole client registry, matched by string equality, and there is no dynamic
+registration to fill it in. The value the client sent appears in nothing this
+server logs, so take it from the client's own configuration or from the
+`redirect_uri` in the browser's address bar when `/authorize` refuses it with
+`invalid redirect URI`.
+
+Claude web and desktop custom connectors are configured with the same URL. Whether
+they complete a flow against a non-Anthropic authorization server has not been
+established here.
+
+### What ends a session
+
+- Revoking this server's grant in Google Account permissions. The next renewal
+  spends a refresh token Google no longer honours, `/token` answers `400
+  {"error":"invalid_grant"}`, and the client starts again at a browser. The
+  access credential already issued keeps working for the rest of its hour.
+- Removing the address from `CERBERUS_AUTH_ALLOWED_EMAILS` and restarting. The
+  next renewal is refused `403`.
+- Changing `CERBERUS_AUTH_SEALING_SECRET`. Every credential this server ever
+  issued stops opening at once, for everybody.
+
+A restart ends nothing. This process stores no session — the credentials carry
+everything they need — so a redeploy with the same sealing secret leaves every
+connected client connected.
+
+### Authorization codes are not replay-checked
+
+This server is stateless on purpose: it stores nothing, and a restart invalidates
+no session. That means it has nowhere to record that an authorization code has
+already been spent, so a code presented twice at `/token` inside its five-minute
+window is honoured twice. What bounds that is the five-minute expiry and the PKCE
+binding: the code alone is useless, because whoever presents it must also produce
+the verifier whose S256 hash the client sent to `/authorize`, and that verifier
+never travels the path the code does — it is not in the redirect, not in the
+browser's history, and not sent to Google. Closing the gap properly would mean
+giving this process a store to remember spent codes in, which is the trade this
+design refused.
+
 ## Raspberry Pi deployment
 
 This deployment has not been tested on the Raspberry Pi. Its operating system,
@@ -345,10 +457,18 @@ ingress:
 
 ### Interpreting 403 responses
 
-An allowlist refusal returns `forbidden: this identity is not allowed on this
-server` and writes an application log record with
+An allowlist refusal at the MCP endpoint returns `forbidden: this identity is not
+allowed on this server` and writes an application log record with
 `auth_refusal=identity_allowlist`. Add the verified address to
 `CERBERUS_AUTH_ALLOWED_EMAILS` when that is the intended caller.
+
+A renewal refused for the same reason is a different event: `POST /token` answers
+`403` with `{"error":"access_denied"}` and the log record carries
+`auth_refusal=renewal_identity_allowlist`. It means a client that was signed in
+tried to renew and the address behind it is no longer on the allowlist, so the
+session ends there. The two are deliberately distinguishable — the first is a
+request that never reached a tool, the second is a session that has just been
+closed.
 
 The MCP SDK has a separate Host-header refusal, but it cannot occur in this
 container topology because the service binds `0.0.0.0:8080`, not a loopback

@@ -52,6 +52,18 @@ func main() {
 	}
 }
 
+// unauthenticated carries internal/authflow's routes across to internal/mcp's
+// seam. The two structs are deliberately not the same type: the transport must
+// not learn what an authorization flow is, and the flow must not import the
+// transport to hand it a route.
+func unauthenticated(routes []authflow.Route) []mcp.UnauthenticatedRoute {
+	out := make([]mcp.UnauthenticatedRoute, 0, len(routes))
+	for _, route := range routes {
+		out = append(out, mcp.UnauthenticatedRoute{Pattern: route.Pattern, Handler: route.Handler})
+	}
+	return out
+}
+
 // run builds the dependencies and hands the process to the server.
 //
 // The order is a startup order: everything that can be refused is refused before
@@ -83,12 +95,21 @@ func run(log zerolog.Logger) error {
 	if err != nil {
 		return err
 	}
-	flow, err := authflow.New(*flowCfg, *authCfg, log)
+	// The MCP path goes in because the protected-resource document this flow serves
+	// names the resource a client is authorizing for, and that resource is this
+	// process's MCP endpoint wherever CERBERUS_MCP_PATH puts it.
+	flow, err := authflow.New(*flowCfg, *authCfg, cfg.Path, log)
 	if err != nil {
 		return err
 	}
 
-	middleware, err := auth.NewMiddleware(*authCfg, log)
+	// The public base URL reaches the middleware as an argument, from the one
+	// configuration that already validated and normalised it. internal/auth could
+	// read CERBERUS_AUTH_PUBLIC_BASE_URL for itself, and then two structs would hold
+	// the same variable under two validations — and the 401's pointer to the
+	// discovery document would be free to disagree with the document's own issuer,
+	// which is the one thing a discovering client compares.
+	middleware, err := auth.NewMiddleware(*authCfg, flowCfg.PublicBaseURL, log)
 	if err != nil {
 		return err
 	}
@@ -141,10 +162,13 @@ func run(log zerolog.Logger) error {
 		// Wraps the MCP endpoint only, which is internal/mcp's own arrangement and
 		// not something this file chooses.
 		Middleware: middleware,
-		UnauthenticatedRoutes: []mcp.UnauthenticatedRoute{
-			{Pattern: authflow.AuthorizationPath, Handler: flow.AuthorizationHandler()},
-			{Pattern: authflow.CallbackPath, Handler: flow.CallbackHandler()},
-		},
+		// Copied from the flow's own list rather than written out here, because the
+		// set of endpoints this server's authorization half needs mounted is that
+		// package's to know: a document served at a path no client asks for, or an
+		// endpoint the discovery documents advertise and nothing answers, is a
+		// failure that only ever shows up in a browser. This file mounts what it is
+		// handed and decides none of it.
+		UnauthenticatedRoutes: unauthenticated(flow.Routes()),
 	})
 	if err != nil {
 		// The executor is not closed on this path and does not need to be: nothing

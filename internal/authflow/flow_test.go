@@ -28,10 +28,15 @@ const (
 	testRefreshToken  = "refresh-token-must-never-render"
 	testSealingSecret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
-	testClientID    = "1234567890-abcdefghijklmnop.apps.googleusercontent.com"
-	testRedirectURI = "https://client.example.test/callback"
-	testClientState = "client-state"
-	testAccessToken = "Google-access-token"
+	testClientID = "1234567890-abcdefghijklmnop.apps.googleusercontent.com"
+	// testResourcePath is where the MCP endpoint is mounted in these tests, which
+	// this package is told rather than knows: it is internal/mcp's default, and the
+	// protected-resource documents are built from it.
+	testResourcePath  = "/mcp"
+	testPublicBaseURL = "https://public.example.test"
+	testRedirectURI   = "https://client.example.test/callback"
+	testClientState   = "client-state"
+	testAccessToken   = "Google-access-token"
 
 	// Where a redirect from the fake Google points. Nothing this process sends may
 	// ever arrive here: the fake serves every host, so a request recorded against
@@ -54,6 +59,15 @@ type fakeGoogle struct {
 	identity    googleIdentity
 	refresh     string
 	accessToken string
+	// tokenStatus and tokenBody, when set, are what the token endpoint answers
+	// instead of a token: Google refusing a grant it will not honour any more.
+	// They are set before the fake is used and read-only after.
+	tokenStatus int
+	tokenBody   string
+	// rotatedRefresh is the refresh token the *refresh* grant answers with. Empty
+	// is the normal case and the default: Google's answer to a refresh grant
+	// carries an access token and no new refresh token.
+	rotatedRefresh string
 	// The redirect fields are set before the fake is used and read-only after.
 	// redirectFrom is the path that answers 3xx instead of a token or an identity.
 	redirectFrom   string
@@ -111,7 +125,19 @@ func (f *fakeGoogle) RoundTrip(r *http.Request) (*http.Response, error) {
 	var body string
 	switch r.URL.Path {
 	case "/token":
-		body = `{"access_token":"` + f.accessToken + `","refresh_token":"` + f.refresh + `"}`
+		switch {
+		case f.tokenStatus != 0:
+			status, body = f.tokenStatus, f.tokenBody
+		case isRefreshGrant(string(sent)):
+			// An access token and nothing else, which is what Google answers a
+			// refresh grant with unless it has decided to issue a new refresh token.
+			body = `{"access_token":"` + f.accessToken + `"}`
+			if f.rotatedRefresh != "" {
+				body = `{"access_token":"` + f.accessToken + `","refresh_token":"` + f.rotatedRefresh + `"}`
+			}
+		default:
+			body = `{"access_token":"` + f.accessToken + `","refresh_token":"` + f.refresh + `"}`
+		}
 	case "/tokeninfo":
 		encoded, err := json.Marshal(f.identity)
 		if err != nil {
@@ -129,10 +155,33 @@ func (f *fakeGoogle) RoundTrip(r *http.Request) (*http.Response, error) {
 	}, nil
 }
 
+// isRefreshGrant reads the grant out of a form-encoded request body, which is how
+// the fake tells the two exchanges at Google's one token endpoint apart.
+func isRefreshGrant(body string) bool {
+	form, err := url.ParseQuery(body)
+	if err != nil {
+		return false
+	}
+	return form.Get("grant_type") == grantRefreshToken
+}
+
+// refreshGrantsSpent is how many times this process has spent a Google refresh
+// token against the fake. It is the measurement that says a renewal actually
+// contacted Google rather than being answered from something sealed locally.
+func (f *fakeGoogle) refreshGrantsSpent() int {
+	spent := 0
+	for _, request := range f.snapshot() {
+		if isRefreshGrant(request.body) {
+			spent++
+		}
+	}
+	return spent
+}
+
 func testConfig() Config {
 	return Config{
 		ClientSecret:       auth.Secret(testClientSecret),
-		PublicBaseURL:      "https://public.example.test/",
+		PublicBaseURL:      testPublicBaseURL + "/",
 		ClientRedirectURIs: []string{testRedirectURI},
 	}
 }
@@ -172,9 +221,14 @@ func permissiveRedirectClient(fake *fakeGoogle) *http.Client {
 	}
 }
 
+// zerologTo is the logger every handler in these tests is built with, in one
+// place so that a test that captures the log and a test that discards it differ
+// only in the writer.
+func zerologTo(w io.Writer) zerolog.Logger { return zerolog.New(w) }
+
 func testHandlers(t *testing.T, fake *fakeGoogle, logWriter io.Writer) *Handlers {
 	t.Helper()
-	handlers, err := newHandlers(testConfig(), testAuthentication(), testEndpoints(), testClient(fake), zerolog.New(logWriter))
+	handlers, err := newHandlers(testConfig(), testAuthentication(), testResourcePath, testEndpoints(), testClient(fake), zerolog.New(logWriter))
 	if err != nil {
 		t.Fatalf("newHandlers: %v", err)
 	}
@@ -183,10 +237,19 @@ func testHandlers(t *testing.T, fake *fakeGoogle, logWriter io.Writer) *Handlers
 
 func authorizationRequest(t *testing.T, handlers *Handlers, redirectURI string) *httptest.ResponseRecorder {
 	t.Helper()
+	return authorizationRequestFor(t, handlers, redirectURI, "client-challenge")
+}
+
+// authorizationRequestFor is [authorizationRequest] with the client's own PKCE
+// challenge chosen by the caller, which the token endpoint's tests need: the
+// authorization half only checks that a challenge is present and S256, so the
+// tests written before it could use a value that hashes from nothing.
+func authorizationRequestFor(t *testing.T, handlers *Handlers, redirectURI, challenge string) *httptest.ResponseRecorder {
+	t.Helper()
 	request := httptest.NewRequest(http.MethodGet, AuthorizationPath+"?"+url.Values{
 		"redirect_uri":          {redirectURI},
 		"state":                 {testClientState},
-		"code_challenge":        {"client-challenge"},
+		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 	}.Encode(), nil)
 	recorder := httptest.NewRecorder()
@@ -630,7 +693,7 @@ func TestTheFlowRefusesToBuildWithoutADependencyItNames(t *testing.T) {
 			if tt.change != nil {
 				tt.change(&authentication)
 			}
-			handlers, err := newHandlers(testConfig(), authentication, testEndpoints(), tt.client, zerolog.New(io.Discard))
+			handlers, err := newHandlers(testConfig(), authentication, testResourcePath, testEndpoints(), tt.client, zerolog.New(io.Discard))
 			if !errors.Is(err, tt.want) || handlers != nil {
 				t.Fatalf("newHandlers returned handlers=%t and %v, want no handlers and an error wrapping %v", handlers != nil, err, tt.want)
 			}
@@ -688,7 +751,7 @@ func TestTheRedirectCheckIsAskedWithArgumentsARealOneCanInspect(t *testing.T) {
 					return errors.New("redirects are refused")
 				},
 			}
-			handlers, err := newHandlers(testConfig(), testAuthentication(), testEndpoints(), client, zerolog.New(io.Discard))
+			handlers, err := newHandlers(testConfig(), testAuthentication(), testResourcePath, testEndpoints(), client, zerolog.New(io.Discard))
 			if err != nil || handlers == nil {
 				t.Fatalf("newHandlers returned handlers=%t and %v, want handlers and no error: a client that refuses every redirect is the one this flow is meant to run on", handlers != nil, err)
 			}

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -401,6 +402,34 @@ func TestTheListenerTheBinaryStartsMountsTheAuthorizationEndpointAndItsCallback(
 			want: http.StatusBadRequest,
 		},
 		{
+			// A GET at the token endpoint is answered 405 by the flow's own handler.
+			// That is what says it is mounted and outside the authentication seam:
+			// a 404 would mean nothing serves it, and a 401 would mean the
+			// middleware wrapped the one endpoint a client with no credential has
+			// to be able to reach.
+			name: "the token endpoint is mounted outside the authentication seam",
+			path: authflow.TokenPath,
+			want: http.StatusMethodNotAllowed,
+		},
+		{
+			name: "the authorization server document is served unauthenticated",
+			path: authflow.AuthorizationServerMetadataPath,
+			want: http.StatusOK,
+		},
+		{
+			name: "the protected resource document is served unauthenticated",
+			path: auth.ProtectedResourceMetadataPath,
+			want: http.StatusOK,
+		},
+		{
+			// The path-suffixed form a client builds when the resource is not at the
+			// origin root. CERBERUS_MCP_PATH is /mcp in this environment, and the
+			// process joins it onto the well-known path itself.
+			name: "the path-suffixed protected resource document is served unauthenticated",
+			path: auth.ProtectedResourceMetadataPath + "/mcp",
+			want: http.StatusOK,
+		},
+		{
 			// The other half of criterion 1, in the same process and the same mux:
 			// mounting the flow unwrapped must not have unwrapped the endpoint the
 			// middleware exists for.
@@ -435,6 +464,50 @@ func TestTheListenerTheBinaryStartsMountsTheAuthorizationEndpointAndItsCallback(
 			}
 		})
 	}
+
+	// The route set itself, and not only the paths written out above. Which
+	// endpoints this server's authorization half needs mounted is
+	// internal/authflow's to say — [authflow.Handlers.Routes] — and this asserts
+	// two things at once: that the list is the six paths the documents and the
+	// 401 challenge point clients at, and that every one of them is answered by
+	// the process this binary starts. A path added to Routes and not mounted here,
+	// or mounted here and dropped from Routes, fails.
+	t.Run("every route the flow says it serves is mounted", func(t *testing.T) {
+		flowCfg, err := authflow.LoadConfig()
+		if err != nil {
+			t.Fatalf("authflow.LoadConfig: %v", err)
+		}
+		authCfg, err := auth.LoadConfig()
+		if err != nil {
+			t.Fatalf("auth.LoadConfig: %v", err)
+		}
+		flow, err := authflow.New(*flowCfg, *authCfg, "/mcp", zerolog.New(io.Discard))
+		if err != nil {
+			t.Fatalf("authflow.New: %v", err)
+		}
+		var mounted []string
+		for _, route := range flow.Routes() {
+			mounted = append(mounted, route.Pattern)
+		}
+		want := []string{
+			authflow.AuthorizationPath,
+			authflow.CallbackPath,
+			authflow.TokenPath,
+			authflow.AuthorizationServerMetadataPath,
+			auth.ProtectedResourceMetadataPath,
+			auth.ProtectedResourceMetadataPath + "/mcp",
+		}
+		if !slices.Equal(mounted, want) {
+			t.Fatalf("the flow serves %v, want %v", mounted, want)
+		}
+		for _, pattern := range mounted {
+			resp := getWhenServing(t, "http://"+address+pattern, runErr)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusNotFound {
+				t.Errorf("the process this binary starts serves no handler at %s", pattern)
+			}
+		}
+	})
 
 	shutdownRun(t, runErr)
 }

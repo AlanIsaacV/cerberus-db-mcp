@@ -29,6 +29,15 @@ const handlerReached = http.StatusTeapot
 
 func discardLogger() zerolog.Logger { return zerolog.New(io.Discard) }
 
+// noPublicBaseURL is what every harness in this file builds its middleware with,
+// and it is the state the whole suite below was written against: a middleware that
+// was not told the origin it is reachable at challenges with the realm alone, which
+// is byte for byte what this package sent before the process had an authorization
+// server of its own. The deployed process is never in that state — the binary
+// passes the validated public base URL — and what it challenges with instead is
+// [TestAChallengedRefusalPointsAtTheProtectedResourceDocument]'s subject.
+const noPublicBaseURL = ""
+
 // authHarness is one middleware over one fake Tokeninfo endpoint, with a handler
 // behind it that records what it saw.
 //
@@ -71,7 +80,7 @@ func serveBehindAuthWithin(t *testing.T, cfg Config, f *fakeTokeninfo, timeout t
 		_, _ = w.Write([]byte("the protected handler ran"))
 	})
 	v := newValidator(cfg.ClientID, f.url, newHTTPClient(timeout), time.Now)
-	guarded := newMiddleware(cfg, zerolog.New(h.appLog), v)(next)
+	guarded := newMiddleware(cfg, noPublicBaseURL, zerolog.New(h.appLog), v)(next)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		guarded.ServeHTTP(w, r)
 		h.mu.Lock()
@@ -98,7 +107,7 @@ func serveBehindAuthAt(t *testing.T, cfg Config, f *fakeTokeninfo, now func() ti
 	})
 	sealer := testSealer(t, cfg.SealingSecret)
 	v := newValidator(cfg.ClientID, f.url, newHTTPClient(2*time.Second), now)
-	guarded := newMiddlewareWithSealer(cfg, zerolog.New(h.appLog), v, sealer, now)(next)
+	guarded := newMiddlewareWithSealer(cfg, noPublicBaseURL, zerolog.New(h.appLog), v, sealer, now)(next)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		guarded.ServeHTTP(w, r)
 		h.mu.Lock()
@@ -430,7 +439,7 @@ func TestTheCredentialIsGoneFromTheRequestByTheTimeAnythingDownstreamRuns(t *tes
 				w.WriteHeader(handlerReached)
 			})
 			v := newValidator(testClientID, f.url, newHTTPClient(2*time.Second), time.Now)
-			guarded := newMiddleware(allowlistOf("one@example.test"), discardLogger(), v)(next)
+			guarded := newMiddleware(allowlistOf("one@example.test"), noPublicBaseURL, discardLogger(), v)(next)
 			// The middleware hands next a shallow copy of the request, which shares this
 			// header map, so what is observed here is what every layer after the
 			// middleware would see — on the refused path too, where there is no next
@@ -1037,7 +1046,7 @@ func TestAMiddlewareWithNothingToValidateWithAdmitsNobody(t *testing.T) {
 	appLog := &bytes.Buffer{}
 	var reached atomic.Int64
 	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Add(1) })
-	server := httptest.NewServer(newMiddleware(allowlistOf("one@example.test"), zerolog.New(appLog), nil)(next))
+	server := httptest.NewServer(newMiddleware(allowlistOf("one@example.test"), noPublicBaseURL, zerolog.New(appLog), nil)(next))
 	t.Cleanup(server.Close)
 
 	req, err := http.NewRequest(http.MethodPost, server.URL, nil)
@@ -1081,7 +1090,7 @@ func TestAMiddlewareWithNothingToUnsealAdmitsNobody(t *testing.T) {
 			if err != nil {
 				t.Fatalf("SealAccess: %v", err)
 			}
-			guarded := newMiddlewareWithSealer(cfg, zerolog.New(appLog), nil, nil, time.Now)(next)
+			guarded := newMiddlewareWithSealer(cfg, noPublicBaseURL, zerolog.New(appLog), nil, nil, time.Now)(next)
 			req := httptest.NewRequest(http.MethodPost, "http://example.test", nil)
 			req.Header.Set("Authorization", "Bearer "+sealed)
 			resp := httptest.NewRecorder()
@@ -1257,5 +1266,222 @@ func waitUntil(t *testing.T, cond func() bool, within time.Duration, what string
 			t.Fatalf("waited %v for %s", within, what)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// testPublicBaseURL is the origin the deployed process is reachable at, as
+// internal/authflow validated it: no trailing slash, so every URL published from
+// it is a plain concatenation.
+const testPublicBaseURL = "https://public.example.test"
+
+// challengeWithTheDocument is the WWW-Authenticate the deployed process sends,
+// written out whole rather than assembled from [realm] and
+// [ProtectedResourceMetadataPath], for the reason
+// [challengeBeforeTheAuthorizationServer] is written out whole: a client's whole
+// discovery hangs off these bytes, and an expectation built the way the code
+// builds it follows a rename wherever it goes.
+const challengeWithTheDocument = `Bearer realm="cerberus-db-mcp", resource_metadata="https://public.example.test/.well-known/oauth-protected-resource"`
+
+// TestAChallengedRefusalPointsAtTheProtectedResourceDocument is acceptance
+// criterion 6, one case per failure class.
+//
+// The pointer is what makes an MCP client able to find this server's authorization
+// endpoints from a 401 alone — RFC 9728 section 5.1 — and it is exactly as
+// important that the two classes which are not statements about the credential
+// still carry no header at all. validation_unavailable is Google having a bad
+// minute and no_validator is a construction mistake in this process; sending a
+// discovering client off to reauthorize over either would turn a retry into a
+// browser.
+func TestAChallengedRefusalPointsAtTheProtectedResourceDocument(t *testing.T) {
+	// neverAsked is a validator pointed at a name that resolves nowhere. Every row
+	// using it is decided before Google is reached — a header that is not a bearer
+	// credential, or a sealed credential opened locally — so a row that did reach
+	// out would fail here rather than quietly pass under the wrong class.
+	neverAsked := func(t *testing.T) *validator {
+		t.Helper()
+		return newValidator(testClientID, "https://tokeninfo.invalid", newHTTPClient(time.Second), time.Now)
+	}
+	sealedAccess := func(t *testing.T, cfg Config, identity AccessCredential) string {
+		t.Helper()
+		sealed, err := testSealer(t, cfg.SealingSecret).SealAccess(identity)
+		if err != nil {
+			t.Fatalf("SealAccess: %v", err)
+		}
+		return sealed
+	}
+	for _, tt := range []struct {
+		name  string
+		class string
+		// build is one middleware that was told the public base URL, and the
+		// Authorization header values the request carries.
+		build func(*testing.T, Config) (func(http.Handler) http.Handler, []string)
+		want  string
+	}{
+		{
+			name: "no credential at all", class: failureAbsentHeader, want: challengeWithTheDocument,
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), neverAsked(t)), nil
+			},
+		},
+		{
+			name: "two Authorization headers", class: failureRepeatedHeader, want: challengeWithTheDocument,
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), neverAsked(t)),
+					[]string{"Bearer one", "Bearer two"}
+			},
+		},
+		{
+			name: "a header that is not a bearer credential", class: failureMalformedHeader, want: challengeWithTheDocument,
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), neverAsked(t)),
+					[]string{"Basic dXNlcjpwYXNz"}
+			},
+		},
+		{
+			name: "a token Google refuses", class: failureTokenRejected, want: challengeWithTheDocument,
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				f := newFakeTokeninfo(t, respondWith(http.StatusBadRequest, `{"error":"invalid_token"}`))
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), validatorAgainst(t, f, newClock())),
+					[]string{"Bearer ya29.a-token"}
+			},
+		},
+		{
+			name: "a Google that is throttling this deployment", class: failureUnavailable, want: "",
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				f := newFakeTokeninfo(t, respondWith(http.StatusTooManyRequests, `{"error":"rate_limited"}`))
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), validatorAgainst(t, f, newClock())),
+					[]string{"Bearer ya29.a-token"}
+			},
+		},
+		{
+			name: "a middleware built with no validator", class: failureNoTokenValidation, want: "",
+			build: func(_ *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), nil), []string{"Bearer ya29.a-token"}
+			},
+		},
+		{
+			name: "a middleware built with no sealer", class: failureNoSealedCredentialValidation, want: "",
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				return newMiddlewareWithSealer(cfg, testPublicBaseURL, discardLogger(),
+						neverAsked(t), nil, time.Now),
+					[]string{"Bearer cdb1:a.something"}
+			},
+		},
+		{
+			name: "a sealed credential past its expiry", class: failureSealedCredentialExpired, want: challengeWithTheDocument,
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				sealed := sealedAccess(t, cfg, AccessCredential{
+					Subject: "sub-1", Email: "one@example.test", Verified: true,
+					ExpiresAt: time.Now().Add(-time.Minute),
+				})
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), neverAsked(t)),
+					[]string{"Bearer " + sealed}
+			},
+		},
+		{
+			name: "a sealed credential whose bytes were edited", class: failureSealedCredentialCorrupt, want: challengeWithTheDocument,
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				sealed := sealedAccess(t, cfg, AccessCredential{
+					Subject: "sub-1", Email: "one@example.test", Verified: true,
+					ExpiresAt: time.Now().Add(time.Hour),
+				})
+				last := "A"
+				if strings.HasSuffix(sealed, last) {
+					last = "B"
+				}
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), neverAsked(t)),
+					[]string{"Bearer " + sealed[:len(sealed)-1] + last}
+			},
+		},
+		{
+			name: "a refresh credential presented as access", class: failureSealedCredentialWrongPurpose, want: challengeWithTheDocument,
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				sealed, err := testSealer(t, cfg.SealingSecret).SealRefresh(RefreshCredential{UpstreamSecret: "upstream-refresh-secret"})
+				if err != nil {
+					t.Fatalf("SealRefresh: %v", err)
+				}
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), neverAsked(t)),
+					[]string{"Bearer " + sealed}
+			},
+		},
+		{
+			name: "an identity outside the allowlist", class: failureNotAllowlisted, want: "",
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				sealed := sealedAccess(t, cfg, AccessCredential{
+					Subject: "sub-1", Email: "stranger@example.test", Verified: true,
+					ExpiresAt: time.Now().Add(time.Hour),
+				})
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), neverAsked(t)),
+					[]string{"Bearer " + sealed}
+			},
+		},
+		{
+			name: "an address the identity provider has not verified", class: failureEmailUnverified, want: "",
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				sealed := sealedAccess(t, cfg, AccessCredential{
+					Subject: "sub-1", Email: "one@example.test",
+					ExpiresAt: time.Now().Add(time.Hour),
+				})
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), neverAsked(t)),
+					[]string{"Bearer " + sealed}
+			},
+		},
+		{
+			name: "a credential carrying no address to match", class: failureNoEmailInToken, want: "",
+			build: func(t *testing.T, cfg Config) (func(http.Handler) http.Handler, []string) {
+				sealed := sealedAccess(t, cfg, AccessCredential{
+					Subject: "sub-1", Verified: true, ExpiresAt: time.Now().Add(time.Hour),
+				})
+				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), neverAsked(t)),
+					[]string{"Bearer " + sealed}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := allowlistOf("one@example.test")
+			middleware, authorization := tt.build(t, cfg)
+			reached := 0
+			guarded := middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				reached++
+				w.WriteHeader(handlerReached)
+			}))
+
+			request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","method":"tools/list","id":1}`))
+			for _, value := range authorization {
+				request.Header.Add("Authorization", value)
+			}
+			response := httptest.NewRecorder()
+			guarded.ServeHTTP(response, request)
+
+			if reached != 0 {
+				t.Errorf("the protected handler ran %d times; every row here is a refusal", reached)
+			}
+			// Compared as a slice: "no challenge" and "one challenge" are not the
+			// only two states, and a second Set would produce two values that
+			// Header.Get hides by answering the first.
+			var want []string
+			if tt.want != "" {
+				want = []string{tt.want}
+			}
+			if got := response.Header().Values("WWW-Authenticate"); !slices.Equal(got, want) {
+				t.Errorf("WWW-Authenticate = %q, want %q for a %s refusal", got, want, tt.class)
+			}
+			if (tt.want != "") != challengesTheCredential(tt.class) {
+				t.Errorf("this row expects challenge=%v for %s, which is not what challengesTheCredential says; the two must be decided together",
+					tt.want != "", tt.class)
+			}
+		})
+	}
+}
+
+// TestTheChallengeIsTheOneFromBeforeWhenNothingSuppliedAnOrigin is the other side
+// of the argument in [challengeValue]: a middleware that was not told where this
+// process is reachable points at no document rather than at half a URL.
+func TestTheChallengeIsTheOneFromBeforeWhenNothingSuppliedAnOrigin(t *testing.T) {
+	if got := challengeValue(noPublicBaseURL); got != challengeBeforeTheAuthorizationServer {
+		t.Errorf("challengeValue(\"\") = %q, want %q", got, challengeBeforeTheAuthorizationServer)
+	}
+	if got := challengeValue(testPublicBaseURL); got != challengeWithTheDocument {
+		t.Errorf("challengeValue(%q) = %q, want %q", testPublicBaseURL, got, challengeWithTheDocument)
 	}
 }

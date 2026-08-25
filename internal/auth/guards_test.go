@@ -67,6 +67,11 @@ const authflowDir = "../authflow"
 var authflowCredentialFiles = []string{
 	path.Join(authflowDir, "exchange.go"),
 	path.Join(authflowDir, "config.go"),
+	// The token endpoint's credential half: the authorization code a client
+	// presents, the Google refresh token inside a sealed refresh credential, and
+	// both credentials this server mints. It writes the 200 carrying that pair
+	// itself, for the reason exchange.go writes the callback's redirect itself.
+	path.Join(authflowDir, "token.go"),
 }
 
 // authflowWriterFiles are the files of internal/authflow that may write where a
@@ -77,6 +82,11 @@ var authflowCredentialFiles = []string{
 // these guards until somebody says which half it is in.
 var authflowWriterFiles = []string{
 	path.Join(authflowDir, "flow.go"),
+	// The three discovery documents. Everything in them is meant to be fetched by
+	// a client that has not authenticated, which is the opposite of a credential —
+	// but it is on this list rather than exempt from both, because the rule that
+	// makes the split worth anything is that every file is on one of them.
+	path.Join(authflowDir, "metadata.go"),
 }
 
 // requiredSources are the files these scans must actually have parsed, named

@@ -55,7 +55,11 @@ var (
 	errExchangeRefused       = errors.New("authflow: the Google token exchange did not complete")
 	errIdentityUnusable      = errors.New("authflow: Google would not vouch for this identity")
 	errIdentityRefused       = errors.New("authflow: this identity may not use this server")
-	errFlowUnavailable       = errors.New("authflow: this authorization cannot be completed")
+	// errRenewalUnavailable is Google being unreachable or unwell at a renewal, as
+	// opposed to Google refusing the grant. The two answer differently at
+	// [TokenPath] for the reason [credentialFlow.renew] gives.
+	errRenewalUnavailable = errors.New("authflow: this grant could not be checked with Google")
+	errFlowUnavailable    = errors.New("authflow: this authorization cannot be completed")
 
 	// The ways construction can fail. Each names one dependency, because the
 	// operator who reads it at startup has to know which one to supply — the same
@@ -82,14 +86,26 @@ var (
 type credentialFlow struct {
 	clientID     string
 	clientSecret auth.Secret
-	callbackURL  string
-	redirectURIs []string
-	allowed      map[string]bool
-	sealer       *auth.Sealer
-	stateAEAD    cipher.AEAD
-	httpClient   *http.Client
-	tokenURL     string
-	tokeninfoURL string
+	// publicBaseURL is the origin after [Config.validate] normalised it — the
+	// trailing slash removed — which is the form every URL this process publishes
+	// is built by concatenating onto. It is here rather than read from the
+	// configuration a second time because validation happens once, and the copy
+	// that was validated is this one.
+	publicBaseURL string
+	callbackURL   string
+	redirectURIs  []string
+	allowed       map[string]bool
+	sealer        *auth.Sealer
+	stateAEAD     cipher.AEAD
+	httpClient    *http.Client
+	tokenURL      string
+	tokeninfoURL  string
+	// now is this flow's clock. It exists for the reason internal/auth's
+	// newMiddlewareWithSealer takes one: both expiry boundaries this package owns —
+	// the authorization code's five minutes and the access credential's hour — are
+	// the kind of thing a test has to stand on either side of, and a suite that
+	// slept for an hour to check the second would not be run.
+	now func() time.Time
 }
 
 func newCredentialFlow(config Config, authentication auth.Config, google endpoints, client *http.Client) (*credentialFlow, error) {
@@ -136,17 +152,28 @@ func newCredentialFlow(config Config, authentication auth.Config, google endpoin
 		return nil, errRedirectingHTTPClient
 	}
 	return &credentialFlow{
-		clientID:     authentication.ClientID,
-		clientSecret: config.ClientSecret,
-		callbackURL:  config.PublicBaseURL + CallbackPath,
-		redirectURIs: config.ClientRedirectURIs,
-		allowed:      allowed,
-		sealer:       sealer,
-		stateAEAD:    stateAEAD,
-		httpClient:   client,
-		tokenURL:     google.tokenURL,
-		tokeninfoURL: google.tokeninfoURL,
+		clientID:      authentication.ClientID,
+		clientSecret:  config.ClientSecret,
+		publicBaseURL: config.PublicBaseURL,
+		callbackURL:   config.PublicBaseURL + CallbackPath,
+		redirectURIs:  config.ClientRedirectURIs,
+		allowed:       allowed,
+		sealer:        sealer,
+		stateAEAD:     stateAEAD,
+		httpClient:    client,
+		tokenURL:      google.tokenURL,
+		tokeninfoURL:  google.tokeninfoURL,
+		now:           time.Now,
 	}, nil
+}
+
+// allows is the identity allowlist, asked the same way everywhere it is asked:
+// the callback before it mints a code, the authorization-code grant before it
+// mints a credential pair, and every renewal. An empty address is not in the map
+// and so is refused, which is the correct answer rather than an accident — an
+// identity Google returned no address for is one this allowlist cannot admit.
+func (f *credentialFlow) allows(email string) bool {
+	return f.allowed[strings.ToLower(strings.TrimSpace(email))]
 }
 
 // redirectProbeHost is where the hop [refusesEveryRedirect] asks about points.
@@ -283,7 +310,7 @@ func (f *credentialFlow) finish(w http.ResponseWriter, r *http.Request) (complet
 	if err != nil {
 		return completion{}, errIdentityUnusable
 	}
-	if !identity.Verified || identity.Email == "" || !f.allowed[strings.ToLower(strings.TrimSpace(identity.Email))] {
+	if !identity.Verified || !f.allows(identity.Email) {
 		return completion{}, errIdentityRefused
 	}
 	sealedCredential, err := f.sealer.SealAuthorizationCode(auth.AuthorizationCodeCredential{
@@ -293,7 +320,7 @@ func (f *credentialFlow) finish(w http.ResponseWriter, r *http.Request) (complet
 		Verified:            identity.Verified,
 		CodeChallenge:       state.ClientCodeChallenge,
 		CodeChallengeMethod: state.ClientChallengeMethod,
-		ExpiresAt:           time.Now().Add(codeLifetime),
+		ExpiresAt:           f.now().Add(codeLifetime),
 	})
 	if err != nil {
 		return completion{}, errFlowUnavailable
@@ -404,6 +431,51 @@ func (f *credentialFlow) exchange(ctx context.Context, code, verifier string) (t
 	var token tokenResponse
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&token); err != nil || token.AccessToken == "" || token.RefreshToken == "" {
 		return tokenResponse{}, errors.New("Google token exchange response was unusable")
+	}
+	return token, nil
+}
+
+// renew spends a Google refresh token at the same endpoint the authorization-code
+// exchange uses, and is deliberately written beside it: the two requests differ
+// in three form fields and in nothing else that matters, and a second HTTP client,
+// a second timeout or a second endpoint constant here would each be a way for one
+// of them to acquire a property the other was reviewed for.
+//
+// It classifies the refusal, which [credentialFlow.exchange] has no reason to. A
+// 4xx is Google saying this grant is finished — revoked, expired, or issued to
+// another client — and the client's session is over, so the caller must be told
+// to start again at /authorize. Anything else is Google being unreachable or
+// unwell, and answering that with "your grant is invalid" would end a live session
+// over a 500 and send an agent to a browser it did not need to open.
+func (f *credentialFlow) renew(ctx context.Context, upstream string) (tokenResponse, error) {
+	form := url.Values{
+		"client_id":     {f.clientID},
+		"client_secret": {string(f.clientSecret)},
+		"refresh_token": {upstream},
+		"grant_type":    {grantRefreshToken},
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, f.tokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return tokenResponse{}, errRenewalUnavailable
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response, err := f.httpClient.Do(request)
+	if err != nil {
+		return tokenResponse{}, errRenewalUnavailable
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= http.StatusBadRequest && response.StatusCode < http.StatusInternalServerError {
+		return tokenResponse{}, errGrantUnusable
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return tokenResponse{}, errRenewalUnavailable
+	}
+	var token tokenResponse
+	// No refresh token is required in the answer, and that is the difference from
+	// the exchange: Google returns one only when it has issued a new one, and this
+	// grant is normally answered with an access token alone.
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&token); err != nil || token.AccessToken == "" {
+		return tokenResponse{}, errRenewalUnavailable
 	}
 	return token, nil
 }

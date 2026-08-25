@@ -64,7 +64,7 @@ func TestUnauthenticatedRoutesAreMountedBesideHealthzWhileMCPRemainsWrapped(t *t
 		ClientID:      "1234567890-abcdefghijklmnop.apps.googleusercontent.com",
 		AllowedEmails: []string{"one@example.test"},
 		SealingSecret: auth.Secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
-	}, NewLogger(&log))
+	}, "https://public.example.test", NewLogger(&log))
 	if err != nil {
 		t.Fatalf("auth.NewMiddleware: %v", err)
 	}

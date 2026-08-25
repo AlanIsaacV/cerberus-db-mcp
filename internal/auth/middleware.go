@@ -15,6 +15,14 @@ import (
 // constant and not a variable an operator has to set.
 const realm = "cerberus-db-mcp"
 
+// ProtectedResourceMetadataPath is where this process serves RFC 9728's
+// protected-resource document, and it is a constant of this package because two
+// places have to agree on it: internal/authflow mounts the document there, and the
+// challenge below points a client at it. A client that cannot find the document
+// cannot find the authorization server either, so the two spellings diverging
+// would end every discovery before it started.
+const ProtectedResourceMetadataPath = "/.well-known/oauth-protected-resource"
+
 // The failure classes a rejection is logged under. They are coarse on purpose —
 // each one says what an operator should do next and nothing about what was
 // presented — and they are distinct because collapsing them would put "the client
@@ -55,7 +63,7 @@ const (
 // The returned function is the only thing this package hands out. The validator
 // behind it, its endpoint and its bounds are not reachable or replaceable by a
 // caller.
-func NewMiddleware(cfg Config, log zerolog.Logger) (func(http.Handler) http.Handler, error) {
+func NewMiddleware(cfg Config, publicBaseURL string, log zerolog.Logger) (func(http.Handler) http.Handler, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -64,7 +72,7 @@ func NewMiddleware(cfg Config, log zerolog.Logger) (func(http.Handler) http.Hand
 		return nil, err
 	}
 	v := newValidator(cfg.ClientID, tokeninfoURL, newHTTPClient(validationTimeout), time.Now)
-	return newMiddlewareWithSealer(cfg, log, v, sealer, time.Now), nil
+	return newMiddlewareWithSealer(cfg, publicBaseURL, log, v, sealer, time.Now), nil
 }
 
 // newMiddleware is the whole decision, over a validator a test can point
@@ -79,21 +87,25 @@ func NewMiddleware(cfg Config, log zerolog.Logger) (func(http.Handler) http.Hand
 // valid" the same event — indistinguishable in the log and identical on the wire,
 // which is precisely the distinction an operator needs when their colleague
 // cannot connect.
-func newMiddleware(cfg Config, log zerolog.Logger, v *validator) func(http.Handler) http.Handler {
+func newMiddleware(cfg Config, publicBaseURL string, log zerolog.Logger, v *validator) func(http.Handler) http.Handler {
 	sealer, _ := NewSealer(cfg.SealingSecret)
 	// This helper is used only by package tests. [NewMiddleware] validates the
 	// configuration before reaching here; NewSealer already returns nil on error,
 	// and that nil sealer fails closed below.
-	return newMiddlewareWithSealer(cfg, log, v, sealer, time.Now)
+	return newMiddlewareWithSealer(cfg, publicBaseURL, log, v, sealer, time.Now)
 }
 
 // newMiddlewareWithSealer is the whole decision, with the local credential
 // dependencies explicit so its expiry boundary can be driven without sleeping.
-func newMiddlewareWithSealer(cfg Config, log zerolog.Logger, v *validator, sealer *Sealer, now func() time.Time) func(http.Handler) http.Handler {
+func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logger, v *validator, sealer *Sealer, now func() time.Time) func(http.Handler) http.Handler {
 	allowed := make(map[string]bool, len(cfg.AllowedEmails))
 	for _, address := range cfg.Allowlist() {
 		allowed[address] = true
 	}
+	// Assembled once, here, rather than per refusal: the value is the same for
+	// every request this process will ever refuse, and building it in the handler
+	// would put a string concatenation on the path of a denial-of-service attempt.
+	challenge := challengeValue(publicBaseURL)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			values := r.Header.Values("Authorization")
@@ -108,7 +120,7 @@ func newMiddlewareWithSealer(cfg Config, log zerolog.Logger, v *validator, seale
 			r.Header.Del("Authorization")
 			token, class := bearerToken(values)
 			if class != "" {
-				unauthorized(w, log, class)
+				unauthorized(w, log, challenge, class)
 				return
 			}
 			if IsSealedCredential(token) {
@@ -117,7 +129,7 @@ func newMiddlewareWithSealer(cfg Config, log zerolog.Logger, v *validator, seale
 					// about the credential. Unsealing has no upstream, so once a sealer
 					// exists every sealed-credential failure is local and credential
 					// specific; a missing one cannot be repaired by reauthorizing.
-					unauthorized(w, log, failureNoSealedCredentialValidation)
+					unauthorized(w, log, challenge, failureNoSealedCredentialValidation)
 					return
 				}
 				sealed, err := sealer.UnsealAccess(token)
@@ -131,11 +143,11 @@ func newMiddlewareWithSealer(cfg Config, log zerolog.Logger, v *validator, seale
 					// place, every refusal here is therefore a statement about the
 					// credential and is challenged; there is no sealed counterpart to
 					// validation_unavailable.
-					unauthorized(w, log, class)
+					unauthorized(w, log, challenge, class)
 					return
 				}
 				if !sealed.ExpiresAt.After(now()) {
-					unauthorized(w, log, failureSealedCredentialExpired)
+					unauthorized(w, log, challenge, failureSealedCredentialExpired)
 					return
 				}
 				caller := claims{subject: sealed.Subject, email: sealed.Email, emailVerified: sealed.Verified}
@@ -161,7 +173,7 @@ func newMiddlewareWithSealer(cfg Config, log zerolog.Logger, v *validator, seale
 				// A middleware with no validator would admit every caller, so it admits
 				// none. Unreachable through [NewMiddleware]; here because the failure
 				// mode of the alternative is silent.
-				unauthorized(w, log, failureNoTokenValidation)
+				unauthorized(w, log, challenge, failureNoTokenValidation)
 				return
 			}
 			caller, err := v.validate(r.Context(), token)
@@ -170,7 +182,7 @@ func newMiddlewareWithSealer(cfg Config, log zerolog.Logger, v *validator, seale
 				if errors.Is(err, errTokenRejected) {
 					class = failureTokenRejected
 				}
-				unauthorized(w, log, class)
+				unauthorized(w, log, challenge, class)
 				return
 			}
 			// Before the allowlist, because the two are different problems with
@@ -235,7 +247,7 @@ func bearerToken(values []string) (token, failureClass string) {
 // of credential this endpoint wants, which is the difference between an agent
 // that can prompt for a login and one that reports a broken server. When it is
 // not sent, see [challengesTheCredential].
-func unauthorized(w http.ResponseWriter, log zerolog.Logger, class string) {
+func unauthorized(w http.ResponseWriter, log zerolog.Logger, challenge, class string) {
 	// The application log, never the audit stream. An AuditEvent is shaped around a
 	// tool call — tool, alias, statement, verdict — and a request refused here
 	// reached no tool, so every one of those fields would be empty. What was
@@ -246,9 +258,32 @@ func unauthorized(w http.ResponseWriter, log zerolog.Logger, class string) {
 		Int("status", http.StatusUnauthorized).
 		Msg("request refused before any tool: no usable bearer token")
 	if challengesTheCredential(class) {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="`+realm+`"`)
+		w.Header().Set("WWW-Authenticate", challenge)
 	}
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
+}
+
+// challengeValue is the whole WWW-Authenticate a challenged 401 carries.
+//
+// The realm alone is what this middleware sent before this process had an
+// authorization server of its own, and it is still the whole of the challenge when
+// publicBaseURL is empty. That is not a fallback: it is the honest answer for a
+// middleware that was not told the origin it is reachable at, because
+// resource_metadata is a URL a client will fetch, and a wrong or half-built one
+// sends every discovering client somewhere that does not answer. The binary always
+// supplies it — internal/authflow validated it at startup — so the deployed
+// process always challenges with the pointer, and only a hand-built middleware
+// challenges without one.
+//
+// RFC 9728 §5.1: the parameter names the protected-resource document, which names
+// the authorization server, which is how a client that has only ever seen a 401
+// from this endpoint finds /authorize and /token.
+func challengeValue(publicBaseURL string) string {
+	realmChallenge := `Bearer realm="` + realm + `"`
+	if publicBaseURL == "" {
+		return realmChallenge
+	}
+	return realmChallenge + `, resource_metadata="` + publicBaseURL + ProtectedResourceMetadataPath + `"`
 }
 
 // challengesTheCredential reports whether a 401 of this class is a statement

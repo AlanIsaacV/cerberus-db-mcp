@@ -281,7 +281,7 @@ func TestBuildingAMiddlewareIsRefusedForTheSameReasonsLoadingIs(t *testing.T) {
 		{"an unmatchable allowlist entry", Config{ClientID: testClientID, AllowedEmails: []string{"nobody"}}, ErrInvalidVariable},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			middleware, err := NewMiddleware(tt.cfg, discardLogger())
+			middleware, err := NewMiddleware(tt.cfg, noPublicBaseURL, discardLogger())
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("NewMiddleware = %v, want an error wrapping %v", err, tt.want)
 			}
