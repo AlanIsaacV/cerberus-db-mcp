@@ -82,6 +82,7 @@ var authflowCredentialFiles = []string{
 // these guards until somebody says which half it is in.
 var authflowWriterFiles = []string{
 	path.Join(authflowDir, "flow.go"),
+	path.Join(authflowDir, "google.go"), // Google failure detail is rendered only in the writer half.
 	// The three discovery documents. Everything in them is meant to be fetched by
 	// a client that has not authenticated, which is the opposite of a credential —
 	// but it is on this list rather than exempt from both, because the rule that

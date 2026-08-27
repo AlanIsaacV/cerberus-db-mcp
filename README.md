@@ -447,13 +447,49 @@ the VPN is down and only fail when the first query attempts to connect.
 
 `cloudflared` is operator-managed in its own container and is intentionally not
 defined by this repository's compose file. It must join the same `homelab`
-network and route the public hostname to the application container:
+network and route the whole public hostname to the application container. The
+hostname rule must not be narrowed to `/mcp`: the MCP endpoint is only one part
+of the public surface, and a path rule for it alone leaves the authorization
+flow unreachable at the edge.
 
 ```yaml
 ingress:
   - hostname: <public-hostname>
     service: http://cerberus-db-mcp:8080
 ```
+
+The port in this example must match the port the container actually listens on.
+The tracked compose file and the deployment have been observed to disagree, so
+use the [port-discovery step in the manual checks](.ai-kit/plans/a-claude-code-session-that-outlives-the-hour/manual-checks.md#criterion-2--confirm-that-the-public-surface-reaches-the-origin)
+before relying on it. A correct path rule directed at the wrong port produces a
+Cloudflare 502 over a healthy origin, which is indistinguishable from an
+application fault unless the port is checked.
+
+That one hostname rule has to carry all six tunnel-routed paths to the origin:
+`/authorize`, `/authorize/callback`, and `/token`; the authorization-server
+document at `/.well-known/oauth-authorization-server`; the protected-resource
+documents at `/.well-known/oauth-protected-resource` and
+`/.well-known/oauth-protected-resource<CERBERUS_MCP_PATH>`. `GET /healthz` is
+deliberately outside the Cloudflare tunnel. The OAuth surface is reachable
+through the public hostname only when the tunnel routes all six paths, not
+merely the authenticated MCP path.
+
+After a tunnel or application deploy, confirm the entire public surface from a
+checkout:
+
+```sh
+go run ./tools/reachability https://cerberus-db-mcp.alanv.me
+```
+
+When `CERBERUS_MCP_PATH` is not `/mcp`, pass its value with `-mcp-path`; without
+it, the tool probes `/mcp` and its suffixed protected-resource document, which
+both return edge 404s and can look like a tunnel problem rather than a flag
+problem.
+
+It probes `/healthz` first. Because that path is deliberately outside the
+tunnel, the tool exits 1 on an otherwise healthy deployment. It checks each
+path without credentials and distinguishes a Cloudflare edge 404 from an
+origin 404.
 
 ### Interpreting 403 responses
 

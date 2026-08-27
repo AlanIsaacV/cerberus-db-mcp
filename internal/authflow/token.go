@@ -37,6 +37,10 @@ const (
 
 	grantAuthorizationCode = "authorization_code"
 	grantRefreshToken      = "refresh_token"
+	// grantUnsupported is chosen here rather than copied out of an unauthenticated
+	// request, because issuance logs the grant class and a client-controlled value
+	// would make that log a channel for arbitrary input.
+	grantUnsupported = "unsupported"
 
 	// challengeMethod is the only PKCE method this server issues a code under and
 	// the only one it will verify one against. The authorization endpoint refuses
@@ -140,7 +144,7 @@ func (f *credentialFlow) issue(w http.ResponseWriter, r *http.Request) (issuance
 	case grantRefreshToken:
 		return f.issueFromRenewal(r.Context(), w, request)
 	default:
-		return issuance{grant: request.grant}, errGrantUnsupported
+		return issuance{grant: grantUnsupported}, errGrantUnsupported
 	}
 }
 
@@ -235,9 +239,9 @@ func (f *credentialFlow) issueFromRenewal(ctx context.Context, w http.ResponseWr
 	}
 	identity, err := f.identity(ctx, renewed.AccessToken)
 	if err != nil {
-		return issuance{grant: request.grant}, errIdentityUnusable
+		return issuance{grant: request.grant}, errors.Join(errIdentityUnusable, err)
 	}
-	if !identity.Verified || !f.allows(identity.Email) {
+	if !bool(identity.Verified) || !f.allows(identity.Email) {
 		return issuance{grant: request.grant}, errIdentityRefused
 	}
 	// The presented credential is handed straight back, unrotated, because a
@@ -256,7 +260,7 @@ func (f *credentialFlow) issueFromRenewal(ctx context.Context, w http.ResponseWr
 	return f.mint(w, request.grant, auth.AccessCredential{
 		Subject:  identity.Subject,
 		Email:    identity.Email,
-		Verified: identity.Verified,
+		Verified: bool(identity.Verified),
 	}, renewal)
 }
 

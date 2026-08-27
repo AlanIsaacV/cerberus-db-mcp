@@ -234,6 +234,10 @@ func (h *Handlers) callback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		message, status := refusal(err)
 		http.Error(w, message, status)
+		googleFailureFields(h.log.Warn().
+			Str("failure_class", message).
+			Int("status", status), err).
+			Msg("the authorization callback refused a response")
 		return
 	}
 	// The two lengths are what acceptance criterion 4 is graded on against real
@@ -274,7 +278,7 @@ func (h *Handlers) issuance(w http.ResponseWriter, r *http.Request) {
 			// here is a different event with a different remedy.
 			event = event.Str("auth_refusal", "renewal_identity_allowlist")
 		}
-		event.Msg("the token endpoint refused a request")
+		googleFailureFields(event, err).Msg("the token endpoint refused a request")
 		return
 	}
 	// Lengths and the grant, and nothing else. Both figures are the measurement the

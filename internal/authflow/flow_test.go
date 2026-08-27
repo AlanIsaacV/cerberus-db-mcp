@@ -62,8 +62,10 @@ type fakeGoogle struct {
 	// tokenStatus and tokenBody, when set, are what the token endpoint answers
 	// instead of a token: Google refusing a grant it will not honour any more.
 	// They are set before the fake is used and read-only after.
-	tokenStatus int
-	tokenBody   string
+	tokenStatus     int
+	tokenBody       string
+	tokeninfoStatus int
+	tokeninfoBody   string
 	// rotatedRefresh is the refresh token the *refresh* grant answers with. Empty
 	// is the normal case and the default: Google's answer to a refresh grant
 	// carries an access token and no new refresh token.
@@ -139,11 +141,17 @@ func (f *fakeGoogle) RoundTrip(r *http.Request) (*http.Response, error) {
 			body = `{"access_token":"` + f.accessToken + `","refresh_token":"` + f.refresh + `"}`
 		}
 	case "/tokeninfo":
-		encoded, err := json.Marshal(f.identity)
-		if err != nil {
-			return nil, err
+		if f.tokeninfoStatus != 0 {
+			status, body = f.tokeninfoStatus, f.tokeninfoBody
+		} else if f.tokeninfoBody != "" {
+			body = f.tokeninfoBody
+		} else {
+			verified := "false"
+			if f.identity.Verified {
+				verified = `"true"`
+			}
+			body = `{"sub":"` + f.identity.Subject + `","email":"` + f.identity.Email + `","email_verified":` + verified + `,"expires_in":"3599","exp":"3599"}`
 		}
-		body = string(encoded)
 	default:
 		status = http.StatusNotFound
 	}
@@ -408,6 +416,292 @@ func TestCallbackRefusesUnallowlistedAndUnverifiedIdentities(t *testing.T) {
 				t.Error("forbidden callback body resembles a sealed credential")
 			}
 		})
+	}
+}
+
+func TestCallbackAcceptsBothGoogleSpellingsOfEmailVerified(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{"the quoted spelling Google has historically returned", ""},
+		{"the bare boolean Google documents", `{"sub":"sub-1","email":"one@example.test","email_verified":true,"expires_in":"3599","exp":"3599"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: true}, testRefreshToken)
+			fake.tokeninfoBody = tt.body
+			handlers := testHandlers(t, fake, io.Discard)
+			authorization := authorizationRequest(t, handlers, testRedirectURI)
+
+			response := callbackRequest(t, handlers, stateFromAuthorization(t, authorization))
+
+			if response.Code != http.StatusFound {
+				t.Errorf("status = %d, want %d: Tokeninfo's email_verified spelling must not refuse the callback", response.Code, http.StatusFound)
+			}
+		})
+	}
+}
+
+func TestCallbackNamesTheGoogleFailureThatRefusedIt(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		tokenStatus int
+		tokenBody   string
+		stage       string
+		status      int
+		oauth       string
+		description string
+	}{
+		{
+			name:        "a Google token refusal",
+			tokenStatus: http.StatusBadRequest,
+			tokenBody:   `{"error":"invalid_grant","error_description":"the authorization grant was revoked"}`,
+			stage:       "response_status",
+			status:      http.StatusBadRequest,
+			oauth:       "invalid_grant",
+			description: "the authorization grant was revoked",
+		},
+		{
+			name:        "an otherwise successful answer without a refresh token",
+			tokenStatus: http.StatusOK,
+			tokenBody:   `{"access_token":"` + testAccessToken + `"}`,
+			stage:       "response_refresh",
+			status:      http.StatusOK,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: true}, testRefreshToken)
+			fake.tokenStatus, fake.tokenBody = tt.tokenStatus, tt.tokenBody
+			var captured bytes.Buffer
+			handlers := testHandlers(t, fake, &captured)
+			authorization := authorizationRequest(t, handlers, testRedirectURI)
+
+			response := callbackRequest(t, handlers, stateFromAuthorization(t, authorization))
+
+			if response.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want %d", response.Code, http.StatusBadGateway)
+			}
+			record := oneLogLine(t, captured.String())
+			if record["google_call"] != "token_endpoint" || record["google_stage"] != tt.stage {
+				t.Errorf("Google failure = call %v, stage %v, want token_endpoint at %q", record["google_call"], record["google_stage"], tt.stage)
+			}
+			if got, ok := record["google_status"].(float64); !ok || int(got) != tt.status {
+				t.Errorf("google_status = %v, want %d", record["google_status"], tt.status)
+			}
+			if record["google_error"] != tt.oauth || record["google_error_description"] != tt.description {
+				t.Errorf("Google OAuth detail = (%v, %v), want (%q, %q)", record["google_error"], record["google_error_description"], tt.oauth, tt.description)
+			}
+			if (tt.description != "" && strings.Contains(response.Body.String(), tt.description)) || (tt.oauth != "" && strings.Contains(response.Body.String(), tt.oauth)) {
+				t.Error("the callback response carries Google's refusal detail")
+			}
+		})
+	}
+}
+
+func TestCallbackWritesOneFailureLineForEveryRefusal(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(*fakeGoogle)
+		state func(t *testing.T, handlers *Handlers) string
+		want  int
+	}{
+		{
+			name:  "an authorization response this server cannot open",
+			setup: func(*fakeGoogle) {},
+			state: func(*testing.T, *Handlers) string { return "not-a-state" },
+			want:  http.StatusBadRequest,
+		},
+		{
+			name: "a refused authorization-code exchange",
+			setup: func(fake *fakeGoogle) {
+				fake.tokenStatus, fake.tokenBody = http.StatusBadRequest, `{"error":"invalid_grant","error_description":"revoked"}`
+			},
+			state: callbackStateForTest,
+			want:  http.StatusBadGateway,
+		},
+		{
+			name: "an unusable identity response",
+			setup: func(fake *fakeGoogle) {
+				fake.tokeninfoStatus, fake.tokeninfoBody = http.StatusInternalServerError, `{"error":"server_error","error_description":"retry later"}`
+			},
+			state: callbackStateForTest,
+			want:  http.StatusBadGateway,
+		},
+		{
+			name:  "an identity that is not verified",
+			setup: func(fake *fakeGoogle) { fake.identity.Verified = false },
+			state: callbackStateForTest,
+			want:  http.StatusForbidden,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: true}, testRefreshToken)
+			tt.setup(fake)
+			var captured bytes.Buffer
+			handlers := testHandlers(t, fake, &captured)
+
+			response := callbackRequest(t, handlers, tt.state(t, handlers))
+
+			if response.Code != tt.want {
+				t.Errorf("status = %d, want %d", response.Code, tt.want)
+			}
+			record := oneLogLine(t, captured.String())
+			if record["status"] != float64(tt.want) {
+				t.Errorf("logged status = %v, want %d", record["status"], tt.want)
+			}
+		})
+	}
+}
+
+func TestCallbackWritesOneFailureLineWhenFlowIsUnavailable(t *testing.T) {
+	fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: true}, testRefreshToken)
+	var captured bytes.Buffer
+	handlers := testHandlers(t, fake, &captured)
+	handlers.flow.redirectURIs = []string{":"}
+	state, err := handlers.flow.sealState(callbackState{
+		ClientRedirectURI:     ":",
+		ClientState:           testClientState,
+		ClientCodeChallenge:   "client-challenge",
+		ClientChallengeMethod: "S256",
+		GoogleCodeVerifier:    "Google-verifier",
+	})
+	if err != nil {
+		t.Fatalf("sealState: %v", err)
+	}
+
+	response := callbackRequest(t, handlers, state)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	record := oneLogLine(t, captured.String())
+	if record["status"] != float64(http.StatusServiceUnavailable) {
+		t.Errorf("logged status = %v, want %d", record["status"], http.StatusServiceUnavailable)
+	}
+}
+
+func TestGoogleFailureDetailsSurviveTheSentinelFolds(t *testing.T) {
+	t.Run("the callback keeps its exchange and identity sentinels", func(t *testing.T) {
+		for _, tt := range []struct {
+			name   string
+			change func(*credentialFlow)
+			want   error
+		}{
+			{"an exchange request that cannot be built", func(flow *credentialFlow) { flow.tokenURL = ":" }, errExchangeRefused},
+			{"an identity request that cannot be built", func(flow *credentialFlow) { flow.tokeninfoURL = ":" }, errIdentityUnusable},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: true}, testRefreshToken)
+				handlers := testHandlers(t, fake, io.Discard)
+				tt.change(handlers.flow)
+				state := callbackStateForTest(t, handlers)
+				request := httptest.NewRequest(http.MethodGet, CallbackPath+"?"+url.Values{"code": {"Google-code"}, "state": {state}}.Encode(), nil)
+
+				_, err := handlers.flow.finish(httptest.NewRecorder(), request)
+
+				if !errors.Is(err, tt.want) {
+					t.Errorf("errors.Is(%v, %v) = false", err, tt.want)
+				}
+				var failure *googleFailure
+				if !errors.As(err, &failure) {
+					t.Errorf("errors.As(%v, *googleFailure) = false", err)
+				}
+			})
+		}
+	})
+
+	t.Run("the callback preserves its authorization and allowlist sentinels", func(t *testing.T) {
+		fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: false}, testRefreshToken)
+		handlers := testHandlers(t, fake, io.Discard)
+		invalid := httptest.NewRequest(http.MethodGet, CallbackPath+"?code=Google-code&state=not-a-state", nil)
+		if _, err := handlers.flow.finish(httptest.NewRecorder(), invalid); !errors.Is(err, errAuthorizationResponse) {
+			t.Errorf("authorization response error = %v, want errors.Is(..., errAuthorizationResponse)", err)
+		}
+		state := callbackStateForTest(t, handlers)
+		request := httptest.NewRequest(http.MethodGet, CallbackPath+"?"+url.Values{"code": {"Google-code"}, "state": {state}}.Encode(), nil)
+		if _, err := handlers.flow.finish(httptest.NewRecorder(), request); !errors.Is(err, errIdentityRefused) {
+			t.Errorf("identity refusal = %v, want errors.Is(..., errIdentityRefused)", err)
+		}
+	})
+
+	t.Run("renewal keeps its identity sentinel and Google detail", func(t *testing.T) {
+		fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: true}, testRefreshToken)
+		fake.tokeninfoStatus = http.StatusServiceUnavailable
+		handlers := testHandlers(t, fake, io.Discard)
+		renewal, err := handlers.flow.sealer.SealRefresh(auth.RefreshCredential{UpstreamSecret: testRefreshToken})
+		if err != nil {
+			t.Fatalf("SealRefresh: %v", err)
+		}
+		_, err = handlers.flow.issueFromRenewal(t.Context(), httptest.NewRecorder(), tokenRequest{grant: grantRefreshToken, renewal: renewal})
+		if !errors.Is(err, errIdentityUnusable) {
+			t.Errorf("errors.Is(%v, errIdentityUnusable) = false", err)
+		}
+		var failure *googleFailure
+		if !errors.As(err, &failure) {
+			t.Errorf("errors.As(%v, *googleFailure) = false", err)
+		}
+	})
+}
+
+func callbackStateForTest(t *testing.T, handlers *Handlers) string {
+	t.Helper()
+	return stateFromAuthorization(t, authorizationRequest(t, handlers, testRedirectURI))
+}
+
+func oneLogLine(t *testing.T, logged string) map[string]any {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(logged), "\n")
+	if len(lines) != 1 || lines[0] == "" {
+		t.Fatalf("log = %q, want exactly one JSON line", logged)
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("failure log is not JSON: %v in %q", err, logged)
+	}
+	return record
+}
+
+func TestRenewalCarriesTokeninfoFailureDetailToItsExistingWarningLine(t *testing.T) {
+	fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: true}, testRefreshToken)
+	client := authorize(t, fake)
+	pair := decodePair(t, post(t, client.handlers, codeGrant(client.code)))
+	fake.tokeninfoStatus = http.StatusServiceUnavailable
+	fake.tokeninfoBody = `{"error":"temporarily_unavailable","error_description":"Tokeninfo is unavailable"}`
+
+	response := post(t, client.handlers, url.Values{
+		"grant_type":    {grantRefreshToken},
+		"refresh_token": {pair.RefreshToken},
+	})
+
+	assertOAuthRefusal(t, response, http.StatusServiceUnavailable, "temporarily_unavailable")
+	record := lastLogLine(t, client.log.String())
+	if record["google_call"] != "tokeninfo_endpoint" || record["google_stage"] != "response_status" {
+		t.Errorf("Google failure = call %v, stage %v, want tokeninfo_endpoint at response_status", record["google_call"], record["google_stage"])
+	}
+	if record["google_status"] != float64(http.StatusServiceUnavailable) || record["google_error"] != "temporarily_unavailable" || record["google_error_description"] != "Tokeninfo is unavailable" {
+		t.Errorf("Google failure detail = (%v, %v, %v), want (%d, temporarily_unavailable, Tokeninfo is unavailable)", record["google_status"], record["google_error"], record["google_error_description"], http.StatusServiceUnavailable)
+	}
+}
+
+func TestRenewalCarriesTokenEndpointFailureDetailToItsExistingWarningLine(t *testing.T) {
+	fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: true}, testRefreshToken)
+	client := authorize(t, fake)
+	pair := decodePair(t, post(t, client.handlers, codeGrant(client.code)))
+	fake.tokenStatus = http.StatusBadRequest
+	fake.tokenBody = `{"error":"invalid_grant","error_description":"the refresh grant was revoked"}`
+
+	response := post(t, client.handlers, url.Values{
+		"grant_type":    {grantRefreshToken},
+		"refresh_token": {pair.RefreshToken},
+	})
+
+	assertOAuthRefusal(t, response, http.StatusBadRequest, "invalid_grant")
+	record := lastLogLine(t, client.log.String())
+	if record["google_call"] != "renewal_token_endpoint" || record["google_stage"] != "response_status" {
+		t.Errorf("Google failure = call %v, stage %v, want renewal_token_endpoint at response_status", record["google_call"], record["google_stage"])
+	}
+	if record["google_status"] != float64(http.StatusBadRequest) || record["google_error"] != "invalid_grant" || record["google_error_description"] != "the refresh grant was revoked" {
+		t.Errorf("Google failure detail = (%v, %v, %v), want (%d, invalid_grant, the refresh grant was revoked)", record["google_status"], record["google_error"], record["google_error_description"], http.StatusBadRequest)
 	}
 }
 

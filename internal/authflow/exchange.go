@@ -304,20 +304,20 @@ func (f *credentialFlow) finish(w http.ResponseWriter, r *http.Request) (complet
 	}
 	token, err := f.exchange(r.Context(), googleCode, state.GoogleCodeVerifier)
 	if err != nil {
-		return completion{}, errExchangeRefused
+		return completion{}, errors.Join(errExchangeRefused, err)
 	}
 	identity, err := f.identity(r.Context(), token.AccessToken)
 	if err != nil {
-		return completion{}, errIdentityUnusable
+		return completion{}, errors.Join(errIdentityUnusable, err)
 	}
-	if !identity.Verified || !f.allows(identity.Email) {
+	if !bool(identity.Verified) || !f.allows(identity.Email) {
 		return completion{}, errIdentityRefused
 	}
 	sealedCredential, err := f.sealer.SealAuthorizationCode(auth.AuthorizationCodeCredential{
 		UpstreamSecret:      token.RefreshToken,
 		Subject:             identity.Subject,
 		Email:               identity.Email,
-		Verified:            identity.Verified,
+		Verified:            bool(identity.Verified),
 		CodeChallenge:       state.ClientCodeChallenge,
 		CodeChallengeMethod: state.ClientChallengeMethod,
 		ExpiresAt:           f.now().Add(codeLifetime),
@@ -417,20 +417,31 @@ func (f *credentialFlow) exchange(ctx context.Context, code, verifier string) (t
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, f.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return tokenResponse{}, err
+		return tokenResponse{}, &googleFailure{call: "token_endpoint", stage: "request"}
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response, err := f.httpClient.Do(request)
 	if err != nil {
-		return tokenResponse{}, err
+		return tokenResponse{}, &googleFailure{call: "token_endpoint", stage: "transport"}
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return tokenResponse{}, errors.New("Google token exchange was refused")
+		failure := &googleFailure{call: "token_endpoint", stage: "response_status", status: response.StatusCode}
+		var refusal googleOAuthRefusal
+		if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&refusal); err == nil {
+			failure.oauth, failure.description = refusal.Code, refusal.Description
+		}
+		return tokenResponse{}, failure
 	}
 	var token tokenResponse
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&token); err != nil || token.AccessToken == "" || token.RefreshToken == "" {
-		return tokenResponse{}, errors.New("Google token exchange response was unusable")
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&token); err != nil {
+		return tokenResponse{}, &googleFailure{call: "token_endpoint", stage: "response_decode", status: response.StatusCode}
+	}
+	if token.AccessToken == "" {
+		return tokenResponse{}, &googleFailure{call: "token_endpoint", stage: "response_access", status: response.StatusCode}
+	}
+	if token.RefreshToken == "" {
+		return tokenResponse{}, &googleFailure{call: "token_endpoint", stage: "response_refresh", status: response.StatusCode}
 	}
 	return token, nil
 }
@@ -456,59 +467,80 @@ func (f *credentialFlow) renew(ctx context.Context, upstream string) (tokenRespo
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, f.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return tokenResponse{}, errRenewalUnavailable
+		return tokenResponse{}, errors.Join(errRenewalUnavailable, &googleFailure{call: "renewal_token_endpoint", stage: "request"})
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	response, err := f.httpClient.Do(request)
 	if err != nil {
-		return tokenResponse{}, errRenewalUnavailable
+		return tokenResponse{}, errors.Join(errRenewalUnavailable, &googleFailure{call: "renewal_token_endpoint", stage: "transport"})
 	}
 	defer response.Body.Close()
 	if response.StatusCode >= http.StatusBadRequest && response.StatusCode < http.StatusInternalServerError {
-		return tokenResponse{}, errGrantUnusable
+		failure := &googleFailure{call: "renewal_token_endpoint", stage: "response_status", status: response.StatusCode}
+		var refusal googleOAuthRefusal
+		if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&refusal); err == nil {
+			failure.oauth, failure.description = refusal.Code, refusal.Description
+		}
+		return tokenResponse{}, errors.Join(errGrantUnusable, failure)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return tokenResponse{}, errRenewalUnavailable
+		failure := &googleFailure{call: "renewal_token_endpoint", stage: "response_status", status: response.StatusCode}
+		var refusal googleOAuthRefusal
+		if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&refusal); err == nil {
+			failure.oauth, failure.description = refusal.Code, refusal.Description
+		}
+		return tokenResponse{}, errors.Join(errRenewalUnavailable, failure)
 	}
 	var token tokenResponse
 	// No refresh token is required in the answer, and that is the difference from
 	// the exchange: Google returns one only when it has issued a new one, and this
 	// grant is normally answered with an access token alone.
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&token); err != nil || token.AccessToken == "" {
-		return tokenResponse{}, errRenewalUnavailable
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&token); err != nil {
+		return tokenResponse{}, errors.Join(errRenewalUnavailable, &googleFailure{call: "renewal_token_endpoint", stage: "response_decode", status: response.StatusCode})
+	}
+	if token.AccessToken == "" {
+		return tokenResponse{}, errors.Join(errRenewalUnavailable, &googleFailure{call: "renewal_token_endpoint", stage: "response_access", status: response.StatusCode})
 	}
 	return token, nil
 }
 
 type googleIdentity struct {
-	Subject  string `json:"sub"`
-	Email    string `json:"email"`
-	Verified bool   `json:"email_verified"`
+	Subject  string       `json:"sub"`
+	Email    string       `json:"email"`
+	Verified stringOrBool `json:"email_verified"`
 }
 
 func (f *credentialFlow) identity(ctx context.Context, accessToken string) (googleIdentity, error) {
 	target, err := url.Parse(f.tokeninfoURL)
 	if err != nil {
-		return googleIdentity{}, err
+		return googleIdentity{}, &googleFailure{call: "tokeninfo_endpoint", stage: "url"}
 	}
 	values := target.Query()
 	values.Set("access_token", accessToken)
 	target.RawQuery = values.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
-		return googleIdentity{}, err
+		return googleIdentity{}, &googleFailure{call: "tokeninfo_endpoint", stage: "request"}
 	}
 	response, err := f.httpClient.Do(request)
 	if err != nil {
-		return googleIdentity{}, err
+		return googleIdentity{}, &googleFailure{call: "tokeninfo_endpoint", stage: "transport"}
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return googleIdentity{}, errors.New("Google identity response was refused")
+		failure := &googleFailure{call: "tokeninfo_endpoint", stage: "response_status", status: response.StatusCode}
+		var refusal googleOAuthRefusal
+		if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&refusal); err == nil {
+			failure.oauth, failure.description = refusal.Code, refusal.Description
+		}
+		return googleIdentity{}, failure
 	}
 	var identity googleIdentity
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&identity); err != nil || identity.Subject == "" {
-		return googleIdentity{}, errors.New("Google identity response was unusable")
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&identity); err != nil {
+		return googleIdentity{}, &googleFailure{call: "tokeninfo_endpoint", stage: "response_decode", status: response.StatusCode}
+	}
+	if identity.Subject == "" {
+		return googleIdentity{}, &googleFailure{call: "tokeninfo_endpoint", stage: "response_subject", status: response.StatusCode}
 	}
 	return identity, nil
 }
