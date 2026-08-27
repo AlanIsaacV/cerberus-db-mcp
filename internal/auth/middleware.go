@@ -163,6 +163,11 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 					forbidden(w, log, failureEmailUnverified, caller, true)
 					return
 				}
+				log.Debug().
+					Str("email", caller.email).
+					Str("subject", caller.subject).
+					Str("path", r.URL.Path).
+					Msg("request admitted")
 				next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), Identity{
 					Subject: caller.subject,
 					Email:   caller.email,
@@ -208,6 +213,11 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 				forbidden(w, log, failureEmailUnverified, caller, false)
 				return
 			}
+			log.Debug().
+				Str("email", caller.email).
+				Str("subject", caller.subject).
+				Str("path", r.URL.Path).
+				Msg("request admitted")
 			next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), Identity{
 				Subject: caller.subject,
 				Email:   caller.email,

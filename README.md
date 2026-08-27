@@ -118,6 +118,8 @@ connect.
   the service on the shared Docker network.
 - `CERBERUS_MCP_PATH` defaults to `/mcp`.
 - `CERBERUS_MCP_SHUTDOWN_TIMEOUT` defaults to `30s`.
+- `CERBERUS_MCP_LOG_LEVEL` defaults to `info`; accepted values are `debug`,
+  `info`, `warn`, and `error`.
 
 The process also refuses to start when a configured PostgreSQL alias has a
 non-empty `PGSERVICE` or `PGSERVICEFILE`, or when a configured SQL Server alias

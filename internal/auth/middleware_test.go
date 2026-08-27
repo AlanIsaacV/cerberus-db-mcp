@@ -68,6 +68,11 @@ func serveBehindAuth(t *testing.T, cfg Config, f *fakeTokeninfo) *authHarness {
 
 func serveBehindAuthWithin(t *testing.T, cfg Config, f *fakeTokeninfo, timeout time.Duration) *authHarness {
 	t.Helper()
+	return serveBehindAuthWithinLevel(t, cfg, f, timeout, zerolog.InfoLevel)
+}
+
+func serveBehindAuthWithinLevel(t *testing.T, cfg Config, f *fakeTokeninfo, timeout time.Duration, level zerolog.Level) *authHarness {
+	t.Helper()
 	h := &authHarness{tokeninfo: f, appLog: &bytes.Buffer{}}
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.reached.Add(1)
@@ -80,7 +85,7 @@ func serveBehindAuthWithin(t *testing.T, cfg Config, f *fakeTokeninfo, timeout t
 		_, _ = w.Write([]byte("the protected handler ran"))
 	})
 	v := newValidator(cfg.ClientID, f.url, newHTTPClient(timeout), time.Now)
-	guarded := newMiddleware(cfg, noPublicBaseURL, zerolog.New(h.appLog), v)(next)
+	guarded := newMiddleware(cfg, noPublicBaseURL, zerolog.New(h.appLog).Level(level), v)(next)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		guarded.ServeHTTP(w, r)
 		h.mu.Lock()
@@ -93,6 +98,11 @@ func serveBehindAuthWithin(t *testing.T, cfg Config, f *fakeTokeninfo, timeout t
 }
 
 func serveBehindAuthAt(t *testing.T, cfg Config, f *fakeTokeninfo, now func() time.Time) *authHarness {
+	t.Helper()
+	return serveBehindAuthAtLevel(t, cfg, f, now, zerolog.InfoLevel)
+}
+
+func serveBehindAuthAtLevel(t *testing.T, cfg Config, f *fakeTokeninfo, now func() time.Time, level zerolog.Level) *authHarness {
 	t.Helper()
 	h := &authHarness{tokeninfo: f, appLog: &bytes.Buffer{}}
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +117,7 @@ func serveBehindAuthAt(t *testing.T, cfg Config, f *fakeTokeninfo, now func() ti
 	})
 	sealer := testSealer(t, cfg.SealingSecret)
 	v := newValidator(cfg.ClientID, f.url, newHTTPClient(2*time.Second), now)
-	guarded := newMiddlewareWithSealer(cfg, noPublicBaseURL, zerolog.New(h.appLog), v, sealer, now)(next)
+	guarded := newMiddlewareWithSealer(cfg, noPublicBaseURL, zerolog.New(h.appLog).Level(level), v, sealer, now)(next)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		guarded.ServeHTTP(w, r)
 		h.mu.Lock()
@@ -632,8 +642,71 @@ func TestAnAllowlistedIdentityReachesTheHandlerCarryingItsSubjectAndEmail(t *tes
 	if id.Email != "One@Example.test" {
 		t.Errorf("Email = %q, want the address Google returned", id.Email)
 	}
-	if lines := h.appLog.String(); lines != "" {
-		t.Errorf("an admitted request wrote to the application log: %s", lines)
+	if records := h.rejections(t); len(records) != 0 {
+		t.Errorf("an admitted request wrote %d application log lines at info: %s", len(records), h.appLog)
+	}
+}
+
+func TestEveryAdmittedRequestLogsItsIdentityAtDebug(t *testing.T) {
+	const (
+		wantSubject = "108134201943512340987"
+		wantEmail   = "One@Example.test"
+		wantPath    = "/admitted-request"
+	)
+	for _, tt := range []struct {
+		name  string
+		setup func(*testing.T) (*authHarness, string)
+	}{
+		{
+			name: "a Google identity",
+			setup: func(t *testing.T) (*authHarness, string) {
+				f := newFakeTokeninfo(t, respondWith(http.StatusOK, tokeninfoBody(testClientID, testClientID, wantSubject, wantEmail, "3599", "true")))
+				return serveBehindAuthWithinLevel(t, allowlistOf("one@example.test"), f, 2*time.Second, zerolog.DebugLevel), "Bearer ya29.a-token"
+			},
+		},
+		{
+			name: "a sealed identity",
+			setup: func(t *testing.T) (*authHarness, string) {
+				clock := newClock()
+				f := newFakeTokeninfo(t, respondWith(http.StatusInternalServerError, ""))
+				cfg := allowlistOf("one@example.test")
+				h := serveBehindAuthAtLevel(t, cfg, f, clock.now, zerolog.DebugLevel)
+				presented, err := testSealer(t, cfg.SealingSecret).SealAccess(AccessCredential{
+					Subject: wantSubject, Email: wantEmail, Verified: true, ExpiresAt: clock.now().Add(time.Hour),
+				})
+				if err != nil {
+					t.Fatalf("SealAccess: %v", err)
+				}
+				return h, "Bearer " + presented
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, header := tt.setup(t)
+			h.url += wantPath
+			resp := h.get(t, header)
+			if resp.StatusCode != handlerReached {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d (%s), want the protected handler to have answered", resp.StatusCode, body)
+			}
+			records := h.rejections(t)
+			if len(records) != 1 {
+				t.Fatalf("the application log holds %d lines, want exactly 1 for one admitted request: %s", len(records), h.appLog)
+			}
+			record := records[0]
+			if record["level"] != "debug" {
+				t.Errorf("level = %v, want debug", record["level"])
+			}
+			if record["email"] != wantEmail {
+				t.Errorf("email = %v, want %q", record["email"], wantEmail)
+			}
+			if record["subject"] != wantSubject {
+				t.Errorf("subject = %v, want %q", record["subject"], wantSubject)
+			}
+			if record["path"] != wantPath {
+				t.Errorf("path = %v, want %q", record["path"], wantPath)
+			}
+		})
 	}
 }
 
@@ -680,6 +753,9 @@ func TestASealedCredentialReachesTheHandlerAsTheSameIdentity(t *testing.T) {
 				t.Errorf("Tokeninfo saw %d requests for a sealed credential, want 0", got)
 			}
 			h.assertAuthorizationGone(t)
+			if records := h.rejections(t); len(records) != 0 {
+				t.Errorf("an admitted request wrote %d application log lines at info: %s", len(records), h.appLog)
+			}
 		})
 	}
 }
@@ -1123,42 +1199,64 @@ func TestTheTokenNeverAppearsInTheApplicationLogInAnyForm(t *testing.T) {
 	// Distinctive enough that any fragment of it in the log is unambiguous, and
 	// shaped like a Google access token so that a redaction keyed on the prefix
 	// would be exercised.
-	const token = "ya29.a0AfB_QUARANTINE-9x7Kq2ZmVbNpLrTsWyXcDfGhJkMnPqRt-EVIDENCE"
-	sum := sha256.Sum256([]byte(token))
-	hashed := hex.EncodeToString(sum[:])
+	const input = "ya29.a0AfB_QUARANTINE-9x7Kq2ZmVbNpLrTsWyXcDfGhJkMnPqRt-EVIDENCE"
 
 	for _, tt := range []struct {
-		name   string
-		status int
-		body   string
+		name           string
+		status         int
+		body           string
+		level          zerolog.Level
+		localAdmission bool
 	}{
-		{"a token Tokeninfo rejects", http.StatusBadRequest, `{"error":"invalid_token"}`},
+		{"a token Tokeninfo rejects", http.StatusBadRequest, `{"error":"invalid_token"}`, zerolog.InfoLevel, false},
 		{"a token for another audience", http.StatusOK,
-			tokeninfoBody("other.apps.googleusercontent.com", testClientID, "sub-1", "one@example.test", "3599", "true")},
-		{"an identity that is not allowlisted", http.StatusOK, acceptedBody("stranger@example.test")},
-		{"an endpoint that is throttling", http.StatusTooManyRequests, ``},
-		{"an identity that is admitted", http.StatusOK, acceptedBody("one@example.test")},
+			tokeninfoBody("other.apps.googleusercontent.com", testClientID, "sub-1", "one@example.test", "3599", "true"), zerolog.InfoLevel, false},
+		{"an identity that is not allowlisted", http.StatusOK, acceptedBody("stranger@example.test"), zerolog.InfoLevel, false},
+		{"an endpoint that is throttling", http.StatusTooManyRequests, ``, zerolog.InfoLevel, false},
+		{"a Google identity that is admitted", http.StatusOK, acceptedBody("one@example.test"), zerolog.DebugLevel, false},
+		{"a sealed identity that is admitted", http.StatusInternalServerError, ``, zerolog.DebugLevel, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFakeTokeninfo(t, respondWith(tt.status, tt.body))
-			h := serveBehindAuth(t, allowlistOf("one@example.test"), f)
+			cfg := allowlistOf("one@example.test")
+			requestValue := input
+			var h *authHarness
+			if tt.localAdmission {
+				clock := newClock()
+				h = serveBehindAuthAtLevel(t, cfg, f, clock.now, tt.level)
+				var err error
+				requestValue, err = testSealer(t, cfg.SealingSecret).SealAccess(AccessCredential{
+					Subject: "sub-1", Email: "one@example.test", Verified: true, ExpiresAt: clock.now().Add(time.Hour),
+				})
+				if err != nil {
+					t.Fatalf("SealAccess: %v", err)
+				}
+			} else {
+				h = serveBehindAuthWithinLevel(t, cfg, f, 2*time.Second, tt.level)
+			}
 
-			_ = h.get(t, "Bearer "+token)
+			_ = h.get(t, "Bearer "+requestValue)
 
+			records := h.rejections(t)
+			if tt.level == zerolog.DebugLevel && len(records) != 1 {
+				t.Fatalf("the application log holds %d lines, want exactly 1 for one admitted request: %s", len(records), h.appLog)
+			}
 			logged := h.appLog.String()
 			// Every substring of this length, not just the token whole: a truncated or
 			// prefixed rendering is the way a credential actually escapes into a log.
 			const fragment = 8
-			for i := 0; i+fragment <= len(token); i++ {
-				if piece := token[i : i+fragment]; strings.Contains(logged, piece) {
-					t.Fatalf("the application log contains %q, a fragment of the presented token: %s", piece, logged)
+			for i := 0; i+fragment <= len(requestValue); i++ {
+				if piece := requestValue[i : i+fragment]; strings.Contains(logged, piece) {
+					t.Fatalf("the application log contains %q, a fragment of the presented value: %s", piece, logged)
 				}
 			}
+			sum := sha256.Sum256([]byte(requestValue))
+			hashed := hex.EncodeToString(sum[:])
 			// The hash is permitted as a cache key and is still not logged: it is a
 			// stable identifier for a credential, and correlating it across lines is
 			// not something this log needs to support.
 			if strings.Contains(logged, hashed) {
-				t.Errorf("the application log contains the token's SHA-256: %s", logged)
+				t.Errorf("the application log contains the presented value's SHA-256: %s", logged)
 			}
 		})
 	}

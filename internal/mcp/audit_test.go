@@ -146,6 +146,87 @@ func TestTheAuditStreamIsSeparateFromTheApplicationLog(t *testing.T) {
 	}
 }
 
+func TestAuditStreamIsUnaffectedByApplicationLogLevel(t *testing.T) {
+	event := AuditEvent{
+		Tool:      ToolExecuteQuery,
+		Identity:  "analyst@example.com",
+		Subject:   "104427392015467281503",
+		Alias:     "warehouse",
+		Engine:    gate.PostgreSQL,
+		Statement: "SELECT * FROM invoices WHERE total > 100 -- and a comment",
+		Outcome:   OutcomeRefused,
+		Verdict:   gate.NeedsApproval,
+		Reason:    gate.ReasonUnknownFunction,
+		RuleID:    "function:calcular_saldo",
+		Pending:   []string{"function:calcular_saldo", "function:otra"},
+		ErrorKind: db.KindNeedsApproval,
+		Rows:      0,
+		Truncated: false,
+		Elapsed:   1500 * time.Microsecond,
+	}
+
+	var want map[string]any
+	for _, tt := range []struct {
+		level      zerolog.Level
+		appRecords int
+	}{
+		{level: zerolog.DebugLevel, appRecords: 2},
+		{level: zerolog.InfoLevel, appRecords: 1},
+		{level: zerolog.WarnLevel, appRecords: 0},
+		{level: zerolog.ErrorLevel, appRecords: 0},
+	} {
+		t.Run(tt.level.String(), func(t *testing.T) {
+			cfg, err := LoadConfigFrom(map[string]string{"CERBERUS_MCP_LOG_LEVEL": tt.level.String()})
+			if err != nil {
+				t.Fatalf("load configuration at %s: %v", tt.level, err)
+			}
+			if cfg.LogLevel != tt.level {
+				t.Fatalf("configured log level = %s, want %s", cfg.LogLevel, tt.level)
+			}
+
+			var buf bytes.Buffer
+			app := NewLogger(&buf).Level(cfg.LogLevel)
+			app.Debug().Msg("debug event")
+			app.Info().Msg("info event")
+			NewAuditor(&buf).Record(event)
+
+			var got map[string]any
+			appRecords := 0
+			for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+				record := decodeOneEvent(t, line)
+				if record["stream"] == "audit" {
+					if got != nil {
+						t.Fatalf("got more than one audit record:\n%s", buf.String())
+					}
+					got = record
+					continue
+				}
+				appRecords++
+			}
+			if got == nil {
+				t.Fatalf("the shared stream has no audit record:\n%s", buf.String())
+			}
+			if appRecords != tt.appRecords {
+				t.Fatalf("application records at %s = %d, want %d:\n%s", tt.level, appRecords, tt.appRecords, buf.String())
+			}
+			if _, ok := got["time"].(string); !ok {
+				t.Fatalf("the record carries no timestamp: %v", got)
+			}
+			delete(got, "time")
+
+			if want == nil {
+				want = got
+				return
+			}
+			if !reflect.DeepEqual(got, want) {
+				gotJSON, _ := json.Marshal(got)
+				wantJSON, _ := json.Marshal(want)
+				t.Errorf("the audit record at %s =\n%s\nwant\n%s", tt.level, gotJSON, wantJSON)
+			}
+		})
+	}
+}
+
 // splittingWriter passes p to w in PIPE_BUF-sized pieces, yielding between
 // them.
 //

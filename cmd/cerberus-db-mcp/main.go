@@ -73,6 +73,9 @@ func run(log zerolog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// Each component below receives its own logger copy, so apply the level before
+	// constructing any of them.
+	log = log.Level(cfg.LogLevel)
 
 	// Beside the server's own configuration, and before the audit destination is
 	// opened, because the three variables read here are the ones whose absence would

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/caarlos0/env/v11"
+	"github.com/rs/zerolog"
 )
 
 // Configuration errors. They are sentinels for the same reason internal/db's
@@ -55,6 +56,10 @@ type Config struct {
 	// own shutdown. It is a bound and not a promise: a client holding a
 	// connection open cannot delay this process indefinitely.
 	ShutdownTimeout time.Duration `env:"CERBERUS_MCP_SHUTDOWN_TIMEOUT" envDefault:"30s"`
+
+	// LogLevel controls application logging. It deliberately does not control the
+	// audit stream, which builds and owns a separate logger.
+	LogLevel zerolog.Level `env:"CERBERUS_MCP_LOG_LEVEL" envDefault:"info"`
 }
 
 // pathRejected are the characters [Config.Path] may not contain: every ASCII
@@ -72,7 +77,7 @@ func LoadConfig() (*Config, error) {
 	environ := make(map[string]string)
 	for _, entry := range os.Environ() {
 		key, value, ok := strings.Cut(entry, "=")
-		if ok && value != "" {
+		if ok {
 			environ[key] = value
 		}
 	}
@@ -82,6 +87,7 @@ func LoadConfig() (*Config, error) {
 // LoadConfigFrom reads the configuration from an explicit environment, so that
 // configuration can be tested without mutating the process's own.
 func LoadConfigFrom(environ map[string]string) (*Config, error) {
+	environ = withoutEmptyValues(environ)
 	var cfg Config
 	if err := env.ParseWithOptions(&cfg, env.Options{Environment: environ}); err != nil {
 		return nil, parseError(err)
@@ -90,6 +96,16 @@ func LoadConfigFrom(environ map[string]string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func withoutEmptyValues(environ map[string]string) map[string]string {
+	filtered := make(map[string]string, len(environ))
+	for key, value := range environ {
+		if value != "" {
+			filtered[key] = value
+		}
+	}
+	return filtered
 }
 
 // variableForms is, per field of [Config], the variable it is read from and the
@@ -102,6 +118,7 @@ func LoadConfigFrom(environ map[string]string) (*Config, error) {
 // TestVariableFormsCoverEveryField keeps it in step with the struct's tags.
 var variableForms = map[string]struct{ variable, form string }{
 	"Address":         {"CERBERUS_MCP_ADDRESS", "a host and port, such as 127.0.0.1:8080"},
+	"LogLevel":        {"CERBERUS_MCP_LOG_LEVEL", "one of debug, info, warn, or error"},
 	"Path":            {"CERBERUS_MCP_PATH", "an absolute path with no spaces or braces, such as /mcp"},
 	"ShutdownTimeout": {"CERBERUS_MCP_SHUTDOWN_TIMEOUT", "a duration with a unit, such as 30s"},
 }
@@ -132,6 +149,11 @@ func parseError(err error) error {
 func (c Config) validate() error {
 	if _, _, err := splitAddress(c.Address); err != nil {
 		return err
+	}
+	switch c.LogLevel {
+	case zerolog.DebugLevel, zerolog.InfoLevel, zerolog.WarnLevel, zerolog.ErrorLevel:
+	default:
+		return fmt.Errorf("mcp: %s must be %s: %w", variableForms["LogLevel"].variable, variableForms["LogLevel"].form, ErrInvalidVariable)
 	}
 	// Braces and whitespace are refused, not only a missing leading slash,
 	// because http.ServeMux reads its argument as a pattern rather than as a

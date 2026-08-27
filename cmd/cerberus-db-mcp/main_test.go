@@ -151,6 +151,116 @@ func TestTheCompiledBinaryRefusesUnusableNewAuthenticationConfiguration(t *testi
 	}
 }
 
+// TestTheCompiledBinaryStartsWithEachUsableMCPLogLevel exercises the level at
+// the process boundary: each accepted value must leave a running binary, rather
+// than only parsing successfully in the configuration package.
+func TestTheCompiledBinaryStartsWithEachUsableMCPLogLevel(t *testing.T) {
+	binary := compiledBinary(t)
+
+	for _, level := range []string{"debug", "info", "warn", "error"} {
+		t.Run(level, func(t *testing.T) {
+			address := reservedAddress(t)
+			testEnvironment(t, address)
+			t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
+			t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "one@example.test")
+			t.Setenv("CERBERUS_AUTH_SEALING_SECRET", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+			t.Setenv("CERBERUS_MCP_LOG_LEVEL", level)
+
+			command := exec.Command(binary)
+			command.Env = os.Environ()
+			output := &lockedBuffer{}
+			command.Stdout = output
+			command.Stderr = output
+			if err := command.Start(); err != nil {
+				t.Fatalf("start compiled binary: %v", err)
+			}
+
+			exit := make(chan error, 1)
+			go func() { exit <- command.Wait() }()
+			stopped := false
+			t.Cleanup(func() {
+				if stopped {
+					return
+				}
+				select {
+				case <-exit:
+					return
+				default:
+				}
+				_ = command.Process.Signal(syscall.SIGTERM)
+				select {
+				case <-exit:
+				case <-time.After(30 * time.Second):
+					_ = command.Process.Kill()
+					<-exit
+				}
+			})
+
+			deadline := time.Now().Add(20 * time.Second)
+			for {
+				select {
+				case err := <-exit:
+					stopped = true
+					t.Fatalf("the compiled binary exited before serving with %q: %v\n%s", level, err, output.String())
+				default:
+				}
+
+				resp, err := (&http.Client{Transport: &http.Transport{Proxy: nil}}).Get("http://" + address + "/healthz")
+				if err == nil {
+					_ = resp.Body.Close()
+					if resp.StatusCode != http.StatusOK {
+						t.Fatalf("health status = %d, want %d", resp.StatusCode, http.StatusOK)
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the compiled binary never served with %q: %v\n%s", level, err, output.String())
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+
+			if err := command.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatalf("stop compiled binary: %v", err)
+			}
+			select {
+			case err := <-exit:
+				stopped = true
+				if err != nil {
+					t.Errorf("compiled binary exits after SIGTERM: %v\n%s", err, output.String())
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("compiled binary did not stop after SIGTERM")
+			}
+		})
+	}
+}
+
+// TestTheCompiledBinaryRefusesUnusableMCPLogLevel keeps the accepted set at the
+// process boundary: a spelling this process does not support must not be allowed
+// to start it with a different effective level.
+func TestTheCompiledBinaryRefusesUnusableMCPLogLevel(t *testing.T) {
+	binary := compiledBinary(t)
+	testEnvironment(t, "127.0.0.1:0")
+	t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
+	t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "one@example.test")
+	t.Setenv("CERBERUS_AUTH_SEALING_SECRET", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("CERBERUS_MCP_LOG_LEVEL", "trace")
+
+	command := exec.Command(binary)
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatal("the compiled binary started successfully with an unusable MCP log level")
+	}
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() == 0 {
+		t.Fatalf("the compiled binary did not exit non-zero: %v", err)
+	}
+	if !bytes.Contains(output, []byte("CERBERUS_MCP_LOG_LEVEL")) {
+		t.Error("the startup refusal did not name CERBERUS_MCP_LOG_LEVEL")
+	}
+}
+
 // compiledBinary builds the command under test instead of using the go test
 // process itself: main's exit and stdout error path are the behaviour criterion
 // 7 needs to observe. CGO stays disabled to match the image's binary.

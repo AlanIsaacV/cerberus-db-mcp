@@ -6,6 +6,7 @@ import (
 	gotoken "go/token"
 	"os"
 	"path"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -32,6 +33,10 @@ import (
 // the only path base available to a test.
 const cmdDir = "../../cmd/cerberus-db-mcp"
 
+// repoDir is the repository root relative to this package, where `go test`
+// starts this package's tests.
+const repoDir = "../.."
+
 // requiredSources are files the whole-objective scans must actually have
 // parsed, named rather than counted.
 //
@@ -44,6 +49,20 @@ var requiredSources = []string{
 	"server.go",
 	"tools.go",
 	path.Join(cmdDir, "main.go"),
+}
+
+// requiredGlobalLevelSources anchors TestNoSourceSetsZerologGlobalLevel's root
+// walk. Naming these paths makes a moved or narrowed root fail instead of
+// silently asserting an empty or partial scan.
+var requiredGlobalLevelSources = []string{
+	path.Join(repoDir, "cmd/cerberus-db-mcp/main.go"),
+	path.Join(repoDir, "internal/auth/config.go"),
+	path.Join(repoDir, "internal/authflow/config.go"),
+	path.Join(repoDir, "internal/db/config.go"),
+	path.Join(repoDir, "internal/gate/engine.go"),
+	path.Join(repoDir, "internal/mcp/audit.go"),
+	path.Join(repoDir, "tools/reachability/main.go"),
+	path.Join(repoDir, "tools/wide-schema/main.go"),
 }
 
 // allowedImports is the whole of what this package's non-test files may import.
@@ -135,6 +154,38 @@ func parseFiles(t *testing.T, dirs ...string) (*gotoken.FileSet, map[string]*ast
 	return fset, files
 }
 
+func parseRepositoryFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
+	t.Helper()
+	fset := gotoken.NewFileSet()
+	files := make(map[string]*ast.File)
+	err := filepath.WalkDir(repoDir, func(name string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			// These directories are not module-owned source; parsing them would make
+			// the guard depend on editor metadata or vendored code.
+			if name != repoDir && (strings.HasPrefix(entry.Name(), ".") || entry.Name() == "vendor" || entry.Name() == "deploy") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		f, err := parser.ParseFile(fset, name, nil, parser.ParseComments)
+		if err != nil {
+			return err
+		}
+		files[name] = f
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk non-test source under %s: %v", repoDir, err)
+	}
+	return fset, files
+}
+
 // parsePackageFiles is the scan for the rules that are this package's own.
 func parsePackageFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 	t.Helper()
@@ -148,19 +199,27 @@ func parsePackageFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 func parseObjectiveFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 	t.Helper()
 	fset, files := parseFiles(t, ".", cmdDir)
+	requireScanned(t, files, requiredSources)
+	return fset, files
+}
+
+// requireScanned is the anti-vacuity check every whole-tree scan runs first: a
+// scan that resolved no files, or missed a directory, passes every assertion it
+// makes by having looked at nothing.
+func requireScanned(t *testing.T, files map[string]*ast.File, required []string) {
+	t.Helper()
 	scanned := make([]string, 0, len(files))
 	for name := range files {
 		scanned = append(scanned, name)
 	}
 	slices.Sort(scanned)
-	for _, want := range requiredSources {
+	for _, want := range required {
 		if _, ok := files[want]; !ok {
 			t.Fatalf("the source scan did not reach %s; it found %v. This guard covers the whole objective, and a scan that misses a directory asserts nothing about it",
 				want, scanned)
 		}
 	}
 	t.Logf("scanned %d files: %v", len(scanned), scanned)
-	return fset, files
 }
 
 // TestPackageImportsNothingItShouldNot is scoped to this package's own
@@ -391,5 +450,51 @@ func TestNoOtherListenAddressDefaultExists(t *testing.T) {
 	}
 	if got := field.Tag.Get("envDefault"); got != "127.0.0.1:8080" {
 		t.Errorf("Config.Address envDefault = %q, want a loopback address", got)
+	}
+}
+
+// TestNoSourceSetsZerologGlobalLevel is acceptance criterion 8. The auditor
+// owns an independent logger, so a process-wide level would let this application's
+// logger configuration suppress audit records without touching the auditor.
+func TestNoSourceSetsZerologGlobalLevel(t *testing.T) {
+	fset, files := parseRepositoryFiles(t)
+	requireScanned(t, files, requiredGlobalLevelSources)
+	for name, f := range files {
+		zerologNames := map[string]bool{}
+		dotImported := false
+		for _, spec := range f.Imports {
+			imported, err := strconv.Unquote(spec.Path.Value)
+			if err != nil || imported != "github.com/rs/zerolog" {
+				continue
+			}
+			if spec.Name == nil {
+				zerologNames["zerolog"] = true
+				continue
+			}
+			switch spec.Name.Name {
+			case ".":
+				dotImported = true
+			case "_":
+			default:
+				zerologNames[spec.Name.Name] = true
+			}
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "SetGlobalLevel" {
+				if ident, ok := selector.X.(*ast.Ident); ok && zerologNames[ident.Name] {
+					t.Errorf("%s:%d calls zerolog.SetGlobalLevel; the audit logger must remain outside application level control",
+						name, fset.Position(call.Pos()).Line)
+				}
+			}
+			if ident, ok := call.Fun.(*ast.Ident); ok && dotImported && ident.Name == "SetGlobalLevel" {
+				t.Errorf("%s:%d calls zerolog.SetGlobalLevel; the audit logger must remain outside application level control",
+					name, fset.Position(call.Pos()).Line)
+			}
+			return true
+		})
 	}
 }

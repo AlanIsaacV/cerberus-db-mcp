@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // TestDefaultsAreLoopbackAndNothingElse is acceptance criterion 9's loader half:
@@ -43,11 +45,57 @@ func TestDefaultsAreLoopbackAndNothingElse(t *testing.T) {
 
 	want := &Config{
 		Address:         "127.0.0.1:8080",
+		LogLevel:        zerolog.InfoLevel,
 		Path:            "/mcp",
 		ShutdownTimeout: 30 * time.Second,
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("LoadConfigFrom(nothing) = %+v, want %+v", cfg, want)
+	}
+}
+
+func TestLogLevelDefaultsAndAcceptedValues(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		environ map[string]string
+		want    zerolog.Level
+	}{
+		{"absent", map[string]string{}, zerolog.InfoLevel},
+		{"empty", map[string]string{"CERBERUS_MCP_LOG_LEVEL": ""}, zerolog.InfoLevel},
+		{"debug", map[string]string{"CERBERUS_MCP_LOG_LEVEL": "debug"}, zerolog.DebugLevel},
+		{"info", map[string]string{"CERBERUS_MCP_LOG_LEVEL": "info"}, zerolog.InfoLevel},
+		{"warn", map[string]string{"CERBERUS_MCP_LOG_LEVEL": "warn"}, zerolog.WarnLevel},
+		{"error", map[string]string{"CERBERUS_MCP_LOG_LEVEL": "error"}, zerolog.ErrorLevel},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := LoadConfigFrom(tt.environ)
+			if err != nil {
+				t.Fatalf("LoadConfigFrom(%v) = %v, want a usable configuration", tt.environ, err)
+			}
+			if cfg.LogLevel != tt.want {
+				t.Errorf("LogLevel = %s, want %s", cfg.LogLevel, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigRejectsUnusableLogLevels(t *testing.T) {
+	for _, value := range []string{"not-a-level", "trace", "fatal", "panic", "disabled", "42"} {
+		t.Run(value, func(t *testing.T) {
+			_, err := LoadConfigFrom(map[string]string{"CERBERUS_MCP_LOG_LEVEL": value})
+			if !errors.Is(err, ErrInvalidVariable) {
+				t.Fatalf("LoadConfigFrom(%q) = %v, want an error wrapping ErrInvalidVariable", value, err)
+			}
+			if !strings.Contains(err.Error(), "CERBERUS_MCP_LOG_LEVEL") {
+				t.Errorf("the error does not name CERBERUS_MCP_LOG_LEVEL: %s", err)
+			}
+			if !strings.Contains(err.Error(), "one of debug, info, warn, or error") {
+				t.Errorf("the error does not give the accepted form: %s", err)
+			}
+			if strings.Contains(err.Error(), "LogLevel") {
+				t.Errorf("the error names the Go field: %s", err)
+			}
+		})
 	}
 }
 
