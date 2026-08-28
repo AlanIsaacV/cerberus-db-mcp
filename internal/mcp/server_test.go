@@ -5,14 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	gotoken "go/token"
 	"io"
 	"mime"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +27,7 @@ import (
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/authflow"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/httplog"
 )
 
 // No test in this package calls t.Parallel, and that is a rule rather than an
@@ -171,8 +176,70 @@ func unreachableExecutor(t *testing.T, aliases ...db.AliasSpec) *db.Executor {
 type harness struct {
 	session *sdk.ClientSession
 	audit   *bytes.Buffer
-	appLog  *bytes.Buffer
+	appLog  testLog
 	url     string
+}
+
+type testLog interface {
+	io.Writer
+	Reset()
+	String() string
+}
+
+// lockedBuffer keeps the test's reads synchronized with the handler goroutine
+// that can write a status line after the client has received its response.
+type lockedBuffer struct {
+	buffer *bytes.Buffer
+	mu     sync.Mutex
+}
+
+func newLockedBuffer() *lockedBuffer {
+	return &lockedBuffer{buffer: &bytes.Buffer{}}
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+
+func (b *lockedBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buffer.Reset()
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
+// waitForLogLine gives a dependency-owned handler time to finish the status
+// line it writes after its response has reached the client, then waits for a
+// quiet buffer so callers can prove no second line follows it.
+func waitForLogLine(t *testing.T, captured testLog) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	const quietFor = 25 * time.Millisecond
+	var last string
+	var lastGrowth time.Time
+	for {
+		capturedLog := captured.String()
+		if line := strings.TrimSpace(capturedLog); line != "" {
+			if capturedLog != last {
+				last = capturedLog
+				lastGrowth = time.Now()
+			}
+			if time.Since(lastGrowth) >= quietFor {
+				return line
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("application log = %q, want a status line before the deadline", captured.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // connect serves the package's own handler through httptest and connects the
@@ -185,7 +252,7 @@ type harness struct {
 // property of what the client receives and not of what the handler returned.
 func connect(t *testing.T, e *db.Executor, adjust ...func(*Deps)) *harness {
 	t.Helper()
-	h := &harness{audit: &bytes.Buffer{}, appLog: &bytes.Buffer{}}
+	h := &harness{audit: &bytes.Buffer{}, appLog: newLockedBuffer()}
 
 	deps := Deps{
 		Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: 5 * time.Second},
@@ -218,6 +285,11 @@ func connect(t *testing.T, e *db.Executor, adjust ...func(*Deps)) *harness {
 	}
 	t.Cleanup(func() { _ = session.Close() })
 	h.session = session
+	// Connect returns when its client has a response, while the server writes its
+	// status line only after that response. Drain the handshake line before any
+	// caller resets this shared harness buffer for its own request.
+	waitForLogLine(t, h.appLog)
+	h.appLog.Reset()
 	return h
 }
 
@@ -724,6 +796,488 @@ func TestALoopbackListenerRefusesAForeignHostHeader(t *testing.T) {
 		t.Errorf("status = %d for a non-loopback Host header, want %d; if the SDK changed this, the tunnel's httpHostHeader note in this test is stale",
 			resp.StatusCode, http.StatusForbidden)
 	}
+}
+
+// TestPanicRecoveryAnswersAndLogsOnce exercises the listener rather than the
+// wrapper directly: Handler is the choke point that has to cover routes this
+// package did not write as well as /mcp itself.
+func TestPanicRecoveryAnswersAndLogsOnce(t *testing.T) {
+	var captured bytes.Buffer
+	srv := &Server{
+		cfg: Config{Path: "/mcp"},
+		log: zerolog.New(&captured),
+		unauthenticatedRoutes: []UnauthenticatedRoute{{
+			Pattern: "GET /panic",
+			Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				panic("the recovered value must never reach a log")
+			}),
+		}},
+	}
+
+	httpServer := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpServer.Close)
+	response, err := http.Get(httpServer.URL + "/panic")
+	if err != nil {
+		t.Fatalf("GET /panic: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusInternalServerError)
+	}
+
+	// oneLogLine is package-private to authflow, so it cannot be used here. This
+	// keeps the established one-line JSON assertion inline rather than adding a
+	// third general-purpose test helper.
+	lines := strings.Split(strings.TrimSpace(captured.String()), "\n")
+	if len(lines) != 1 || lines[0] == "" {
+		t.Fatalf("application log = %q, want exactly one JSON line", captured.String())
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("decode application log: %v", err)
+	}
+	if record["level"] != "error" || record["method"] != http.MethodGet || record["path"] != "/panic" || record["status"] != float64(http.StatusInternalServerError) {
+		t.Errorf("panic log = %v, want error GET /panic status %d", record, http.StatusInternalServerError)
+	}
+}
+
+// TestPanicRecoveryPreservesErrAbortHandler checks the sentinel separately: it
+// is net/http's intentional no-stack-trace abort, not an application failure.
+func TestPanicRecoveryPreservesErrAbortHandler(t *testing.T) {
+	var captured bytes.Buffer
+	srv := &Server{
+		cfg: Config{Path: "/mcp"},
+		log: zerolog.New(&captured),
+		unauthenticatedRoutes: []UnauthenticatedRoute{{
+			Pattern: "GET /abort",
+			Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				panic(http.ErrAbortHandler)
+			}),
+		}},
+	}
+
+	httpServer := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpServer.Close)
+	response, err := http.Get(httpServer.URL + "/abort")
+	if response != nil {
+		_ = response.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("GET /abort succeeded, want the connection to abort")
+	}
+	if got := captured.String(); got != "" {
+		t.Errorf("application log = %q, want no ErrAbortHandler error line", got)
+	}
+}
+
+// TestPanicRecoveryDoesNotExposeAfterHeaders configures net/http's ErrorLog as
+// Run does, because the standard library is the path that would otherwise render
+// a recovered panic value after headers have already started the response.
+func TestPanicRecoveryDoesNotExposeAfterHeaders(t *testing.T) {
+	const marker = "panic-value-must-not-reach-log-stream"
+	captured := newLockedBuffer()
+	srv := &Server{
+		cfg: Config{Path: "/mcp"},
+		log: zerolog.New(captured),
+		unauthenticatedRoutes: []UnauthenticatedRoute{{
+			Pattern: "GET /panic-after-headers",
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				panic(marker)
+			}),
+		}},
+	}
+
+	httpServer := httptest.NewUnstartedServer(srv.Handler())
+	httpServer.Config.ErrorLog = httplog.NewServerErrorLog(srv.log)
+	httpServer.Start()
+	t.Cleanup(httpServer.Close)
+	response, _ := http.Get(httpServer.URL + "/panic-after-headers")
+	if response != nil {
+		_ = response.Body.Close()
+	}
+	if line := waitForLogLine(t, captured); strings.Contains(line, marker) {
+		t.Errorf("application log line = %q, must not expose recovered panic value", line)
+	}
+	if got := captured.String(); strings.Contains(got, marker) {
+		t.Errorf("application log = %q, must not expose recovered panic value", got)
+	}
+}
+
+// TestStreamableHandlerStatusLines names the status written by the SDK rather
+// than inferring success from the client result. The foreign Host branch is the
+// DNS-rebinding refusal that this package cannot otherwise observe.
+func TestStreamableHandlerStatusLines(t *testing.T) {
+	h := connect(t, unreachableExecutor(t))
+	h.appLog.Reset()
+	request, err := http.NewRequest(http.MethodPost, h.url, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	if err != nil {
+		t.Fatalf("new successful SDK request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("POST /mcp: %v", err)
+	}
+	_ = response.Body.Close()
+	lines := strings.Split(waitForLogLine(t, h.appLog), "\n")
+	if len(lines) != 1 || lines[0] == "" {
+		t.Fatalf("successful SDK log = %q, want exactly one line", h.appLog.String())
+	}
+	var success map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &success); err != nil {
+		t.Fatalf("decode successful SDK log: %v", err)
+	}
+	if success["status"] != float64(response.StatusCode) {
+		t.Errorf("successful SDK status = %v, want client status %d", success["status"], response.StatusCode)
+	}
+	if success["level"] != "info" {
+		t.Errorf("successful SDK level = %v, want info", success["level"])
+	}
+
+	h.appLog.Reset()
+	request, err = http.NewRequest(http.MethodPost, h.url, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	if err != nil {
+		t.Fatalf("new foreign-host request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Host = "cerberus.example.test"
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("POST /mcp with foreign Host: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("foreign Host status = %d, want %d", response.StatusCode, http.StatusForbidden)
+	}
+	lines = strings.Split(waitForLogLine(t, h.appLog), "\n")
+	if len(lines) != 1 || lines[0] == "" {
+		t.Fatalf("foreign Host SDK log = %q, want exactly one line", h.appLog.String())
+	}
+	var refused map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &refused); err != nil {
+		t.Fatalf("decode foreign Host SDK log: %v", err)
+	}
+	if refused["status"] != float64(http.StatusForbidden) {
+		t.Errorf("foreign Host SDK status = %v, want %d", refused["status"], http.StatusForbidden)
+	}
+	if refused["level"] != "warn" {
+		t.Errorf("foreign Host SDK level = %v, want warn", refused["level"])
+	}
+	identityAllowlist, renewalAllowlist := existingAuthRefusalValues(t)
+	if refusal, _ := refused["auth_refusal"].(string); refusal == "" || refusal == identityAllowlist || refusal == renewalAllowlist {
+		t.Errorf("foreign Host auth_refusal = %q, want its own value distinct from the allowlist refusals", refusal)
+	}
+}
+
+// TestProtectedResourceMetadataStatusLine exercises the SDK handler through the
+// listener which mounts authflow's opaque routes. The metadata handler itself
+// knows that a non-GET is a 405; the transport only proves that the line made it
+// to the application stream once, alongside the status that reached the client.
+func TestProtectedResourceMetadataStatusLine(t *testing.T) {
+	captured := newLockedBuffer()
+	appLog := zerolog.New(captured)
+	handlers, err := authflow.New(authflow.Config{
+		ClientSecret:       auth.Secret("client-secret-must-never-render"),
+		PublicBaseURL:      "https://public.example.test",
+		ClientRedirectURIs: []string{"https://client.example.test/callback"},
+	}, auth.Config{
+		ClientID:      "1234567890-abcdefghijklmnop.apps.googleusercontent.com",
+		AllowedEmails: []string{"one@example.test"},
+		SealingSecret: auth.Secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+	}, "/mcp", appLog)
+	if err != nil {
+		t.Fatalf("authflow.New: %v", err)
+	}
+	routes := make([]UnauthenticatedRoute, 0, len(handlers.Routes()))
+	for _, route := range handlers.Routes() {
+		routes = append(routes, UnauthenticatedRoute{Pattern: route.Pattern, Handler: route.Handler})
+	}
+	srv, err := New(Deps{
+		Config:                Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second},
+		Executor:              unreachableExecutor(t),
+		Log:                   appLog,
+		Audit:                 NewAuditor(io.Discard),
+		UnauthenticatedRoutes: routes,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	httpServer := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpServer.Close)
+	response, err := http.Post(httpServer.URL+auth.ProtectedResourceMetadataPath, "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST protected-resource metadata: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusMethodNotAllowed)
+	}
+
+	// oneLogLine is package-private to authflow, so this keeps the established
+	// one-line assertion inline instead of adding a third general-purpose helper.
+	lines := strings.Split(waitForLogLine(t, captured), "\n")
+	if len(lines) != 1 || lines[0] == "" {
+		t.Fatalf("metadata SDK log = %q, want exactly one line", captured.String())
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("decode metadata SDK log: %v", err)
+	}
+	if record["status"] != float64(response.StatusCode) || record["method"] != http.MethodPost || record["path"] != auth.ProtectedResourceMetadataPath {
+		t.Errorf("metadata SDK log = %v, want POST %s with status %d", record, auth.ProtectedResourceMetadataPath, response.StatusCode)
+	}
+	if record["level"] != "warn" {
+		t.Errorf("metadata SDK level = %v, want warn", record["level"])
+	}
+}
+
+// TestServerErrorLogUsesAnErrorEvent drives the adapter without an http.Server:
+// the server's own diagnostics need a real level and an explicit origin before
+// net/http has a reason to write one.
+func TestServerErrorLogUsesAnErrorEvent(t *testing.T) {
+	var captured bytes.Buffer
+	adapter := httplog.NewServerErrorLogWriter(zerolog.New(&captured))
+	if _, err := adapter.Write([]byte("net/http diagnostic\n")); err != nil {
+		t.Fatalf("ServerErrorLog.Write: %v", err)
+	}
+
+	// oneLogLine is package-private to authflow, so this keeps the established
+	// one-line assertion inline instead of adding a third general-purpose helper.
+	lines := strings.Split(strings.TrimSpace(captured.String()), "\n")
+	if len(lines) != 1 || lines[0] == "" {
+		t.Fatalf("ErrorLog output = %q, want exactly one line", captured.String())
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("decode ErrorLog output: %v", err)
+	}
+	if record["level"] != "error" || record["source"] != "net/http" || record["message"] != "net/http diagnostic" {
+		t.Errorf("ErrorLog record = %v, want error event from net/http", record)
+	}
+}
+
+// TestMCPResponseFlushesBeforeTheRouteHandlerReturns holds the route handler
+// open after the SDK has produced its response, proving the real /mcp route
+// answers before its outer handler returns. TestSmallResponseFlushesBeforeTheHandlerReturns
+// binds the status-line writer's Unwrap chain.
+func TestMCPResponseFlushesBeforeTheRouteHandlerReturns(t *testing.T) {
+	sdkReturned := make(chan struct{}, 1)
+	handlerReturned := make(chan struct{})
+	release := make(chan struct{})
+
+	srv, err := New(Deps{
+		Config:   Config{Address: "127.0.0.1:0", Path: "/mcp", ShutdownTimeout: time.Second},
+		Executor: unreachableExecutor(t),
+		Log:      zerolog.New(io.Discard),
+		Audit:    NewAuditor(io.Discard),
+		Middleware: func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				next.ServeHTTP(w, r)
+				sdkReturned <- struct{}{}
+				<-release
+				close(handlerReturned)
+			})
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	httpServer := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpServer.Close)
+	// Registered after Close so it runs first: httptest waits for active handlers
+	// while this one is intentionally waiting on release.
+	t.Cleanup(func() { close(release) })
+	request, err := http.NewRequest(http.MethodPost, httpServer.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	type result struct {
+		response *http.Response
+		err      error
+	}
+	responded := make(chan result, 1)
+	go func() {
+		response, err := http.DefaultClient.Do(request)
+		responded <- result{response: response, err: err}
+	}()
+
+	select {
+	case <-sdkReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the SDK handler did not produce its response")
+	}
+	select {
+	case got := <-responded:
+		if got.err != nil {
+			t.Fatalf("POST /mcp: %v", got.err)
+		}
+		defer func() { _ = got.response.Body.Close() }()
+		read := make(chan struct {
+			n   int
+			err error
+		}, 1)
+		go func() {
+			buffer := make([]byte, 1)
+			n, err := got.response.Body.Read(buffer)
+			read <- struct {
+				n   int
+				err error
+			}{n: n, err: err}
+		}()
+		select {
+		case got := <-read:
+			if got.n == 0 {
+				t.Fatalf("read %d bytes before handler return: %v", got.n, got.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no /mcp response byte arrived before the route handler returned")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client did not receive headers before the route handler returned")
+	}
+
+	select {
+	case <-handlerReturned:
+		t.Fatal("the route handler returned before the streaming assertion")
+	default:
+	}
+}
+
+// TestSmallResponseFlushesBeforeTheHandlerReturns uses fewer bytes than
+// net/http's pre-chunking buffer so arriving before the handler returns depends
+// on ResponseController following the status writer's Unwrap chain.
+func TestSmallResponseFlushesBeforeTheHandlerReturns(t *testing.T) {
+	bodyWritten := make(chan struct{}, 1)
+	handlerReturned := make(chan struct{})
+	release := make(chan struct{})
+	handler := httplog.WithPanicRecovery(
+		httplog.WithStatusLine(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, "ok")
+			_ = http.NewResponseController(w).Flush()
+			bodyWritten <- struct{}{}
+			<-release
+			close(handlerReturned)
+		}), zerolog.New(io.Discard)),
+		zerolog.New(io.Discard),
+	)
+
+	httpServer := httptest.NewServer(handler)
+	t.Cleanup(httpServer.Close)
+	// Registered after Close so it runs first: httptest waits for active handlers
+	// while this one is intentionally waiting on release.
+	t.Cleanup(func() { close(release) })
+	responded := make(chan struct {
+		response *http.Response
+		err      error
+	}, 1)
+	go func() {
+		response, err := http.Get(httpServer.URL)
+		responded <- struct {
+			response *http.Response
+			err      error
+		}{response: response, err: err}
+	}()
+
+	select {
+	case <-bodyWritten:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wrapped handler did not write its small response")
+	}
+	select {
+	case got := <-responded:
+		if got.err != nil {
+			t.Fatalf("GET small response: %v", got.err)
+		}
+		defer func() { _ = got.response.Body.Close() }()
+		if got.response.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want %d", got.response.StatusCode, http.StatusOK)
+		}
+		read := make(chan struct {
+			body string
+			err  error
+		}, 1)
+		go func() {
+			body := make([]byte, len("ok"))
+			_, err := io.ReadFull(got.response.Body, body)
+			read <- struct {
+				body string
+				err  error
+			}{body: string(body), err: err}
+		}()
+		select {
+		case got := <-read:
+			if got.err != nil || got.body != "ok" {
+				t.Fatalf("small response = %q, %v; want %q", got.body, got.err, "ok")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("no small response bytes arrived before the handler returned")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client did not receive small-response headers before the handler returned")
+	}
+
+	select {
+	case <-handlerReturned:
+		t.Fatal("the wrapped handler returned before the streaming assertion")
+	default:
+	}
+}
+
+// existingAuthRefusalValues reads the two existing values from the handlers
+// which own them, rather than repeating those labels as this SDK test's own
+// expectation. A label is an operator-facing distinction, not a transport
+// constant this package gets to define.
+func existingAuthRefusalValues(t *testing.T) (string, string) {
+	t.Helper()
+	_, files := parseRepositoryFiles(t)
+	identity := authRefusalValueFromSource(t, files[path.Join(repoDir, "internal/auth/middleware.go")])
+	renewal := authRefusalValueFromSource(t, files[path.Join(repoDir, "internal/authflow/flow.go")])
+	return identity, renewal
+}
+
+func authRefusalValueFromSource(t *testing.T, file *ast.File) string {
+	t.Helper()
+	if file == nil {
+		t.Fatal("the auth_refusal source scan did not parse its named handler")
+	}
+	var values []string
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.KeyValueExpr:
+			key, ok := node.Key.(*ast.Ident)
+			literal, isLiteral := node.Value.(*ast.BasicLit)
+			if ok && key.Name == "AuthRefusal" && isLiteral && literal.Kind == gotoken.STRING {
+				value, err := strconv.Unquote(literal.Value)
+				if err == nil {
+					values = append(values, value)
+				}
+			}
+		case *ast.AssignStmt:
+			if len(node.Lhs) != 1 || len(node.Rhs) != 1 {
+				return true
+			}
+			name, isName := node.Lhs[0].(*ast.Ident)
+			literal, isLiteral := node.Rhs[0].(*ast.BasicLit)
+			if isName && name.Name == "authRefusal" && isLiteral && literal.Kind == gotoken.STRING {
+				value, err := strconv.Unquote(literal.Value)
+				if err == nil && value != "" {
+					values = append(values, value)
+				}
+			}
+		}
+		return true
+	})
+	if len(values) != 1 {
+		t.Fatalf("auth_refusal source values = %q, want one value from the named handler", values)
+	}
+	return values[0]
 }
 
 // TestANonLoopbackListenerDoesNotRefuseAForeignHostHeader is the complement to

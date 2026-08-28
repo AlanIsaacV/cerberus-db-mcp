@@ -63,6 +63,7 @@ var requiredWholeModuleSources = []string{
 	path.Join(repoDir, "internal/authflow/config.go"),
 	path.Join(repoDir, "internal/db/config.go"),
 	path.Join(repoDir, "internal/gate/engine.go"),
+	path.Join(repoDir, "internal/httplog/httplog.go"),
 	path.Join(repoDir, "internal/mcp/audit.go"),
 	path.Join(repoDir, "internal/refuse/refuse.go"),
 	path.Join(repoDir, "tools/reachability/main.go"),
@@ -109,6 +110,9 @@ var allowedImports = map[string]bool{
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth": true,
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db":   true,
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate": true,
+	// internal/httplog observes dependency-owned handler responses and recovers
+	// panics without changing this package's own refusal behaviour.
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/httplog": true,
 	// internal/refuse is the shared refusal seam this boundary reaches for the
 	// responses its mux writes itself.
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse": true,
@@ -652,10 +656,11 @@ type refusalSeamViolation struct {
 // source guards cannot prove a selector's type without becoming a second type
 // checker, and a false positive is answered by naming the file, not by making a
 // universal guard quieter.
-func refusalSeamViolations(fset *gotoken.FileSet, filePath, exemptPath string, file *ast.File) []refusalSeamViolation {
+func refusalSeamViolations(fset *gotoken.FileSet, repositoryRoot, filePath, exemptPath string, file *ast.File) []refusalSeamViolation {
 	if filepath.Clean(filePath) == filepath.Clean(exemptPath) {
 		return nil
 	}
+	transparentForwards := transparentResponseWriterForwards(repositoryRoot, filePath, file)
 	violations := []refusalSeamViolation{}
 	ast.Inspect(file, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
@@ -679,6 +684,9 @@ func refusalSeamViolations(fset *gotoken.FileSet, filePath, exemptPath string, f
 				Rule: "calls http.Error outside the refusal seam",
 			})
 		case "WriteHeader":
+			if transparentForwards[call] {
+				return true
+			}
 			if len(call.Args) == 1 && allowedResponseStatus(call.Args[0]) {
 				return true
 			}
@@ -691,6 +699,75 @@ func refusalSeamViolations(fset *gotoken.FileSet, filePath, exemptPath string, f
 		return true
 	})
 	return violations
+}
+
+// transparentResponseWriterForwards identifies the one WriteHeader form that
+// does not select a response: the recorder passes its caller's status through
+// to the original writer from its own WriteHeader method. The refusal guard
+// stays intentionally hostile to every other unknown WriteHeader call, because
+// a status selected anywhere else still needs the refusal seam's log line.
+func transparentResponseWriterForwards(repositoryRoot, filePath string, file *ast.File) map[*ast.CallExpr]bool {
+	forwards := map[*ast.CallExpr]bool{}
+	if !isHTTPLogRecorderPath(repositoryRoot, filePath) {
+		return forwards
+	}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "WriteHeader" || !responseWriterMethod(function) {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if ok && isTransparentResponseWriterForward(call) {
+				forwards[call] = true
+			}
+			return true
+		})
+	}
+	return forwards
+}
+
+// isHTTPLogRecorderPath holds the exception to the one package that owns the
+// recorder. It compares paths relative to the root being scanned so copied-tree
+// demonstrations retain the exception without granting it to a nested lookalike.
+func isHTTPLogRecorderPath(repositoryRoot, filePath string) bool {
+	relative, err := filepath.Rel(repositoryRoot, filePath)
+	if err != nil {
+		return false
+	}
+	return filepath.ToSlash(relative) == "internal/httplog/httplog.go"
+}
+
+func responseWriterMethod(function *ast.FuncDecl) bool {
+	if function.Recv == nil || len(function.Recv.List) != 1 || len(function.Recv.List[0].Names) != 1 || function.Type.Params == nil || len(function.Type.Params.List) != 1 || len(function.Type.Params.List[0].Names) != 1 {
+		return false
+	}
+	receiverType := function.Recv.List[0].Type
+	if pointer, ok := receiverType.(*ast.StarExpr); ok {
+		receiverType = pointer.X
+	}
+	receiver, ok := receiverType.(*ast.Ident)
+	return ok && receiver.Name == "ResponseWriter" && function.Type.Params.List[0].Names[0].Name == "status"
+}
+
+func isTransparentResponseWriterForward(call *ast.CallExpr) bool {
+	if len(call.Args) != 1 {
+		return false
+	}
+	status, ok := call.Args[0].(*ast.Ident)
+	if !ok || status.Name != "status" {
+		return false
+	}
+	method, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || method.Sel.Name != "WriteHeader" {
+		return false
+	}
+	original, ok := method.X.(*ast.SelectorExpr)
+	if !ok || original.Sel.Name != "ResponseWriter" {
+		return false
+	}
+	receiver, ok := original.X.(*ast.Ident)
+	return ok && receiver.Name == "w"
 }
 
 // allowedResponseStatus keeps only statuses that can complete a normal or
@@ -741,7 +818,7 @@ func reply(w interface{}) {
 	if err != nil {
 		t.Fatalf("parse synthetic source: %v", err)
 	}
-	violations := refusalSeamViolations(fset, "candidate.go", "internal/refuse/refuse.go", file)
+	violations := refusalSeamViolations(fset, repoDir, "candidate.go", "internal/refuse/refuse.go", file)
 	if got, want := len(violations), 3; got != want {
 		t.Fatalf("violations = %v, want %d violations", violations, want)
 	}
@@ -750,8 +827,39 @@ func reply(w interface{}) {
 			t.Errorf("violation %d line = %d, want %d", index, got, wantLine)
 		}
 	}
-	if exempted := refusalSeamViolations(fset, "internal/refuse/refuse.go", "internal/refuse/refuse.go", file); len(exempted) != 0 {
+	if exempted := refusalSeamViolations(fset, repoDir, "internal/refuse/refuse.go", "internal/refuse/refuse.go", file); len(exempted) != 0 {
 		t.Errorf("exempt seam file violations = %v, want none", exempted)
+	}
+}
+
+// TestRefusalSeamAllowsOnlyTheRecorderForwardingForm proves the WriteHeader
+// exception cannot become a way for another handler to select an error status
+// outside refuse.Write.
+func TestRefusalSeamAllowsOnlyTheRecorderForwardingForm(t *testing.T) {
+	const source = `package candidate
+type ResponseWriter struct { http.ResponseWriter }
+func (w *ResponseWriter) WriteHeader(status int) { w.ResponseWriter.WriteHeader(status) }
+func reply(w interface{}) { w.WriteHeader(http.StatusInternalServerError) }
+`
+	fset := gotoken.NewFileSet()
+	file, err := parser.ParseFile(fset, "candidate.go", source, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic source: %v", err)
+	}
+	violations := refusalSeamViolations(fset, repoDir, "candidate.go", "internal/refuse/refuse.go", file)
+	if got, want := len(violations), 2; got != want {
+		t.Fatalf("violations = %v, want %d spoofed and external WriteHeader violations", violations, want)
+	}
+	for index, wantLine := range []int{3, 4} {
+		if got := violations[index].Line; got != wantLine {
+			t.Errorf("violation %d line = %d, want %d", index, got, wantLine)
+		}
+	}
+	if violations := refusalSeamViolations(fset, repoDir, path.Join(repoDir, "internal/httplog/httplog.go"), "internal/refuse/refuse.go", file); len(violations) != 1 {
+		t.Errorf("real httplog path violations = %v, want the external WriteHeader only", violations)
+	}
+	if violations := refusalSeamViolations(fset, repoDir, path.Join(repoDir, "tools/something/internal/httplog/httplog.go"), "internal/refuse/refuse.go", file); len(violations) != 2 {
+		t.Errorf("nested httplog path violations = %v, want both WriteHeader calls", violations)
 	}
 }
 
@@ -762,6 +870,8 @@ func TestRefusalSeamGuardFindsAnInjectedResponse(t *testing.T) {
 	copy := t.TempDir()
 	copyRepositoryTree(t, copy)
 	injectedPath := filepath.Join(copy, "internal", "mcp", "config.go")
+	recorderPath := filepath.Join(copy, "internal", "httplog", "httplog.go")
+	nestedRecorderPath := filepath.Join(copy, "tools", "something", "internal", "httplog", "httplog.go")
 	original, err := os.ReadFile(injectedPath)
 	if err != nil {
 		t.Fatalf("read injection target: %v", err)
@@ -771,19 +881,51 @@ func TestRefusalSeamGuardFindsAnInjectedResponse(t *testing.T) {
 		t.Fatalf("inject http.Error: %v", err)
 	}
 	wantLine := strings.Count(injected[:strings.Index(injected, "http.Error")], "\n") + 1
+	_, initialFiles := parseRepositoryFilesAt(t, copy)
+	required := anchorsAt(t, copy, requiredWholeModuleSources)
+	requireScanned(t, initialFiles, required)
+	requirePackageDirectoryAnchors(t, copy, initialFiles, required)
+	if err := os.MkdirAll(filepath.Dir(nestedRecorderPath), 0o755); err != nil {
+		t.Fatalf("make nested recorder directory: %v", err)
+	}
+	const nestedRecorder = `package httplog
+import "net/http"
+type ResponseWriter struct { http.ResponseWriter }
+func (w *ResponseWriter) WriteHeader(status int) { w.ResponseWriter.WriteHeader(status) }
+`
+	if err := os.WriteFile(nestedRecorderPath, []byte(nestedRecorder), 0o644); err != nil {
+		t.Fatalf("write nested recorder: %v", err)
+	}
+	nestedWantLine := strings.Count(nestedRecorder[:strings.Index(nestedRecorder, "w.ResponseWriter.WriteHeader")], "\n") + 1
 	fset, files := parseRepositoryFilesAt(t, copy)
-	requireScanned(t, files, anchorsAt(t, copy, requiredWholeModuleSources))
-	requirePackageDirectoryAnchors(t, copy, files, anchorsAt(t, copy, requiredWholeModuleSources))
+	requireScanned(t, files, required)
 	var violations []refusalSeamViolation
 	for name, file := range files {
-		violations = append(violations, refusalSeamViolations(fset, name, filepath.Join(copy, "internal", "refuse", "refuse.go"), file)...)
+		violations = append(violations, refusalSeamViolations(fset, copy, name, filepath.Join(copy, "internal", "refuse", "refuse.go"), file)...)
 	}
+	var recorderViolations []refusalSeamViolation
+	foundInjected := false
+	foundNestedRecorder := false
 	for _, violation := range violations {
+		if violation.Path == recorderPath {
+			recorderViolations = append(recorderViolations, violation)
+		}
 		if violation.Path == injectedPath && violation.Line == wantLine {
-			return
+			foundInjected = true
+		}
+		if violation.Path == nestedRecorderPath && violation.Line == nestedWantLine {
+			foundNestedRecorder = true
 		}
 	}
-	t.Errorf("injected response %s:%d was not reported; violations = %v", injectedPath, wantLine, violations)
+	if len(recorderViolations) != 0 {
+		t.Errorf("copied recorder forwarding violations = %v, want none", recorderViolations)
+	}
+	if !foundInjected {
+		t.Errorf("injected response %s:%d was not reported; violations = %v", injectedPath, wantLine, violations)
+	}
+	if !foundNestedRecorder {
+		t.Errorf("nested recorder forwarding %s:%d was not reported; violations = %v", nestedRecorderPath, nestedWantLine, violations)
+	}
 }
 
 // TestPackageAnchorDerivationFindsAnUnanchoredPackage demonstrates the stale
@@ -822,8 +964,156 @@ func TestNoSourceWritesErrorResponseOutsideRefusalSeam(t *testing.T) {
 	requireScanned(t, files, requiredWholeModuleSources)
 	requirePackageDirectoryAnchors(t, repoDir, files, requiredWholeModuleSources)
 	for name, file := range files {
-		for _, violation := range refusalSeamViolations(fset, name, path.Join(repoDir, "internal/refuse/refuse.go"), file) {
+		for _, violation := range refusalSeamViolations(fset, repoDir, name, path.Join(repoDir, "internal/refuse/refuse.go"), file) {
 			t.Errorf("%s:%d %s", violation.Path, violation.Line, violation.Rule)
 		}
 	}
+}
+
+// TestEveryResponseWriterWrapperUnwraps keeps ResponseController's traversal
+// intact. A wrapper can observe WriteHeader and Write without implementing
+// http.Flusher, so the only portable way for the SDK's best-effort flush to
+// reach the original writer is the Unwrap chain this test requires.
+func TestEveryResponseWriterWrapperUnwraps(t *testing.T) {
+	fset, files := parseRepositoryFiles(t)
+	requireScanned(t, files, requiredWholeModuleSources)
+	requirePackageDirectoryAnchors(t, repoDir, files, requiredWholeModuleSources)
+
+	wrappers := map[string]int{}
+	for name, file := range files {
+		for typeName, line := range responseWriterWrapperTypes(fset, file) {
+			wrappers[name+":"+typeName] = line
+		}
+	}
+	if len(wrappers) == 0 {
+		t.Fatal("the ResponseWriter wrapper scan resolved no wrapper types; it cannot establish the flush invariant")
+	}
+	for qualified, line := range wrappers {
+		name := qualified[strings.LastIndex(qualified, ":")+1:]
+		fileName := qualified[:strings.LastIndex(qualified, ":")]
+		if !declaresResponseWriterUnwrap(files[fileName], name) {
+			t.Errorf("%s:%d type %s wraps http.ResponseWriter but does not declare Unwrap() http.ResponseWriter", fileName, line, name)
+		}
+	}
+}
+
+// responseWriterWrapperTypes finds the direct wrappers a source review can
+// establish. It intentionally does not infer interfaces: the property at stake
+// is the concrete declaration that embeds or holds http.ResponseWriter.
+func responseWriterWrapperTypes(fset *gotoken.FileSet, file *ast.File) map[string]int {
+	wrappers := map[string]int{}
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != gotoken.TYPE {
+			continue
+		}
+		for _, specification := range general.Specs {
+			typeSpec, ok := specification.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			structType, ok := typeSpec.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+			for _, field := range structType.Fields.List {
+				if isHTTPResponseWriter(field.Type) {
+					wrappers[typeSpec.Name.Name] = fset.Position(typeSpec.Pos()).Line
+					break
+				}
+			}
+		}
+	}
+	return wrappers
+}
+
+func isHTTPResponseWriter(expression ast.Expr) bool {
+	selector, ok := expression.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "ResponseWriter" {
+		return false
+	}
+	receiver, ok := selector.X.(*ast.Ident)
+	return ok && receiver.Name == "http"
+}
+
+func declaresResponseWriterUnwrap(file *ast.File, typeName string) bool {
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "Unwrap" || function.Recv == nil || len(function.Recv.List) != 1 || function.Type.Results == nil || len(function.Type.Results.List) != 1 {
+			continue
+		}
+		receiverType := function.Recv.List[0].Type
+		if pointer, ok := receiverType.(*ast.StarExpr); ok {
+			receiverType = pointer.X
+		}
+		receiver, ok := receiverType.(*ast.Ident)
+		if !ok || receiver.Name != typeName || !isHTTPResponseWriter(function.Type.Results.List[0].Type) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// TestServerRunConfiguresErrorLog is deliberately source based: handlers built
+// for httptest bypass Run, so an integration test could pass while production's
+// http.Server still sent its diagnostics to stderr.
+func TestServerRunConfiguresErrorLog(t *testing.T) {
+	_, files := parseObjectiveFiles(t)
+	server, ok := files["server.go"]
+	if !ok {
+		t.Fatal("the ErrorLog source scan did not parse server.go")
+	}
+
+	configured := false
+	ast.Inspect(server, func(node ast.Node) bool {
+		function, ok := node.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "Run" {
+			return true
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			literal, ok := node.(*ast.CompositeLit)
+			if !ok || !isHTTPServerLiteral(literal) {
+				return true
+			}
+			for _, element := range literal.Elts {
+				field, ok := element.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				key, ok := field.Key.(*ast.Ident)
+				if ok && key.Name == "ErrorLog" && isServerErrorLogAdapter(field.Value) {
+					configured = true
+				}
+			}
+			return true
+		})
+		return false
+	})
+	if !configured {
+		t.Error("Server.Run's http.Server literal does not set ErrorLog from httplog.NewServerErrorLog")
+	}
+}
+
+func isHTTPServerLiteral(literal *ast.CompositeLit) bool {
+	selector, ok := literal.Type.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Server" {
+		return false
+	}
+	receiver, ok := selector.X.(*ast.Ident)
+	return ok && receiver.Name == "http"
+}
+
+func isServerErrorLogAdapter(expression ast.Expr) bool {
+	adapter, ok := expression.(*ast.CallExpr)
+	return ok && isSelectorCall(adapter.Fun, "httplog", "NewServerErrorLog")
+}
+
+func isSelectorCall(expression ast.Expr, receiverName, methodName string) bool {
+	selector, ok := expression.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != methodName {
+		return false
+	}
+	receiver, ok := selector.X.(*ast.Ident)
+	return ok && receiver.Name == receiverName
 }

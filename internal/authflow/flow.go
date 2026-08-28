@@ -183,6 +183,7 @@ func (h *Handlers) IssuanceHandler() http.Handler { return http.HandlerFunc(h.is
 func (h *Handlers) authorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		refuse.Write(w, r, h.log, refuse.Params{
+			Level:        zerolog.WarnLevel,
 			Status:       http.StatusMethodNotAllowed,
 			Body:         "method not allowed",
 			FailureClass: "method_not_allowed",
@@ -199,6 +200,7 @@ func (h *Handlers) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	if !accepts(h.redirectURIs, client.redirectURI) {
 		refuse.Write(w, r, h.log, refuse.Params{
+			Level:        zerolog.WarnLevel,
 			Status:       http.StatusBadRequest,
 			Body:         "invalid redirect URI",
 			FailureClass: "redirect_uri_unregistered",
@@ -208,6 +210,7 @@ func (h *Handlers) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	if client.challenge == "" || client.challengeMethod != "S256" {
 		refuse.Write(w, r, h.log, refuse.Params{
+			Level:        zerolog.WarnLevel,
 			Status:       http.StatusBadRequest,
 			Body:         "invalid PKCE challenge",
 			FailureClass: "pkce_challenge_invalid",
@@ -218,6 +221,7 @@ func (h *Handlers) authorize(w http.ResponseWriter, r *http.Request) {
 	state, challenge, err := h.flow.start(client)
 	if err != nil {
 		refuse.Write(w, r, h.log, refuse.Params{
+			Level:        zerolog.WarnLevel,
 			Status:       http.StatusServiceUnavailable,
 			Body:         "authorization is unavailable",
 			FailureClass: "flow_unavailable",
@@ -228,6 +232,7 @@ func (h *Handlers) authorize(w http.ResponseWriter, r *http.Request) {
 	target, err := url.Parse(h.authorizeURL)
 	if err != nil {
 		refuse.Write(w, r, h.log, refuse.Params{
+			Level:        zerolog.WarnLevel,
 			Status:       http.StatusServiceUnavailable,
 			Body:         "authorization is unavailable",
 			FailureClass: "flow_unavailable",
@@ -252,6 +257,7 @@ func (h *Handlers) authorize(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) callback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		refuse.Write(w, r, h.log, refuse.Params{
+			Level:        zerolog.WarnLevel,
 			Status:       http.StatusMethodNotAllowed,
 			Body:         "method not allowed",
 			FailureClass: "method_not_allowed",
@@ -265,6 +271,7 @@ func (h *Handlers) callback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		message, status := refusal(err)
 		refuse.Write(w, r, h.log, refuse.Params{
+			Level:        zerolog.WarnLevel,
 			Status:       status,
 			Body:         message,
 			FailureClass: message,
@@ -289,6 +296,7 @@ func (h *Handlers) callback(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) issuance(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		refuse.Write(w, r, h.log, refuse.Params{
+			Level:        zerolog.WarnLevel,
 			Status:       http.StatusMethodNotAllowed,
 			Body:         "method not allowed",
 			FailureClass: "method_not_allowed",
@@ -315,6 +323,7 @@ func (h *Handlers) issuance(w http.ResponseWriter, r *http.Request) {
 			authRefusal = "renewal_identity_allowlist"
 		}
 		refuse.Write(w, r, h.log, refuse.Params{
+			Level:        zerolog.WarnLevel,
 			Status:       status,
 			OAuth:        true,
 			Body:         failure,

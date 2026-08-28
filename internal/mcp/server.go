@@ -42,6 +42,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/httplog"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse"
 )
 
@@ -172,7 +173,7 @@ func New(deps Deps) (*Server, error) {
 // what this package registers is what a client actually sees.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	return s.withMuxRefusals(mux, s.registerRoutes(mux))
+	return httplog.WithPanicRecovery(s.withMuxRefusals(mux, s.registerRoutes(mux)), s.log)
 }
 
 // registerRoutes mounts every endpoint this server serves and returns the
@@ -192,7 +193,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) []string {
 		mux.Handle(route.Pattern, route.Handler)
 		patterns = append(patterns, route.Pattern)
 	}
-	mux.Handle(s.cfg.Path, s.middlewareOrPassThrough()(s.mcpHandler()))
+	mux.Handle(s.cfg.Path, s.middlewareOrPassThrough()(httplog.WithStatusLine(s.mcpHandler(), s.log)))
 	patterns = append(patterns, s.cfg.Path)
 	return patterns
 }
@@ -204,7 +205,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) []string {
 // nothing, so canonicity is part of that distinction. In particular, it decorates
 // the handler rather than the ResponseWriter: the MCP SDK reaches the original
 // writer's flusher through a ResponseController, and substituting a writer here
-// would silently break streaming.
+// would silently break streaming unless it declares Unwrap() http.ResponseWriter,
+// as internal/httplog does.
 func (s *Server) withMuxRefusals(mux *http.ServeMux, patterns []string) http.Handler {
 	methods := map[string]struct{}{"HEAD": {}}
 	for _, pattern := range patterns {
@@ -218,6 +220,7 @@ func (s *Server) withMuxRefusals(mux *http.ServeMux, patterns []string) http.Han
 		// does not reach it, so delegation preserves the mux's status and headers.
 		if r.RequestURI == "*" {
 			refuse.Log(r, s.log, refuse.Params{
+				Level:        zerolog.WarnLevel,
 				Status:       http.StatusBadRequest,
 				FailureClass: failureClassAsteriskRequestTarget,
 			})
@@ -243,6 +246,7 @@ func (s *Server) withMuxRefusals(mux *http.ServeMux, patterns []string) http.Han
 			sort.Strings(allowed)
 			w.Header().Set("Allow", strings.Join(allowed, ", "))
 			refuse.Write(w, r, s.log, refuse.Params{
+				Level:        zerolog.WarnLevel,
 				Status:       http.StatusMethodNotAllowed,
 				OAuth:        false,
 				Body:         "Method Not Allowed",
@@ -252,6 +256,7 @@ func (s *Server) withMuxRefusals(mux *http.ServeMux, patterns []string) http.Han
 		}
 
 		refuse.Write(w, r, s.log, refuse.Params{
+			Level:        zerolog.WarnLevel,
 			Status:       http.StatusNotFound,
 			OAuth:        false,
 			Body:         "404 page not found",
@@ -389,6 +394,7 @@ func (s *Server) Run(ctx context.Context) error {
 	httpServer := &http.Server{
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: readHeaderTimeout,
+		ErrorLog:          httplog.NewServerErrorLog(s.log),
 	}
 
 	serveErr := make(chan error, 1)

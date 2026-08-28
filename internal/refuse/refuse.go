@@ -8,6 +8,9 @@ import (
 )
 
 type Params struct {
+	// Level has no implicit default: its zero value is DebugLevel, and a Warn
+	// fallback would make Debug unreachable while silently demoting omitted callers.
+	Level        zerolog.Level
 	Status       int
 	OAuth        bool
 	Body         string
@@ -23,7 +26,7 @@ type Params struct {
 // zerolog event at that site would duplicate the shape this package exists to
 // keep in one place.
 func Log(r *http.Request, log zerolog.Logger, p Params) {
-	event := log.Warn().
+	event := log.WithLevel(p.Level).
 		Str("failure_class", p.FailureClass).
 		Int("status", p.Status).
 		Str("method", r.Method).

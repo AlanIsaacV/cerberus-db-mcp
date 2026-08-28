@@ -269,6 +269,7 @@ func unauthorized(w http.ResponseWriter, r *http.Request, log zerolog.Logger, ch
 		challengeForRefusal = challenge
 	}
 	refuse.Write(w, r, log, refuse.Params{
+		Level:        zerolog.WarnLevel,
 		Status:       http.StatusUnauthorized,
 		Body:         "unauthorized",
 		Challenge:    challengeForRefusal,
@@ -338,6 +339,7 @@ func challengesTheCredential(class string) bool {
 // the refusals within this package.
 func forbidden(w http.ResponseWriter, r *http.Request, log zerolog.Logger, class string, caller claims, sealed bool) {
 	refuse.Write(w, r, log, refuse.Params{
+		Level:        zerolog.WarnLevel,
 		Status:       http.StatusForbidden,
 		Body:         "forbidden: this identity is not allowed on this server",
 		FailureClass: class,

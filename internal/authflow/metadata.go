@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/httplog"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse"
 )
 
@@ -139,7 +140,7 @@ func authorizationServerMetadata(publicBaseURL string) authorizationServerDocume
 // the same code the SDK's clients expect to have produced it, including the CORS
 // headers a browser-based client needs before it will read anything here at all.
 func (d documents) resourceHandler() http.Handler {
-	return sdkauth.ProtectedResourceMetadataHandler(d.resource)
+	return httplog.WithStatusLine(sdkauth.ProtectedResourceMetadataHandler(d.resource), d.log)
 }
 
 // authorizationServerHandler serves the authorization-server document.
@@ -160,6 +161,7 @@ func (d documents) authorizationServerHandler() http.Handler {
 		}
 		if r.Method != http.MethodGet {
 			refuse.Write(w, r, d.log, refuse.Params{
+				Level:        zerolog.WarnLevel,
 				Status:       http.StatusMethodNotAllowed,
 				Body:         "method not allowed",
 				FailureClass: "method_not_allowed",
