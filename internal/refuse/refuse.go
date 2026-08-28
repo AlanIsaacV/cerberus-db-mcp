@@ -18,7 +18,11 @@ type Params struct {
 	Fields       func(*zerolog.Event) *zerolog.Event
 }
 
-func Write(w http.ResponseWriter, r *http.Request, log zerolog.Logger, p Params) {
+// Log records a refusal whose response bytes may be written by net/http itself,
+// so it still leaves this repository's application log line. Building a second
+// zerolog event at that site would duplicate the shape this package exists to
+// keep in one place.
+func Log(r *http.Request, log zerolog.Logger, p Params) {
 	event := log.Warn().
 		Str("failure_class", p.FailureClass).
 		Int("status", p.Status).
@@ -31,6 +35,10 @@ func Write(w http.ResponseWriter, r *http.Request, log zerolog.Logger, p Params)
 		event = p.Fields(event)
 	}
 	event.Msg(p.Message)
+}
+
+func Write(w http.ResponseWriter, r *http.Request, log zerolog.Logger, p Params) {
+	Log(r, log, p)
 
 	if p.Challenge != "" {
 		w.Header().Set("WWW-Authenticate", p.Challenge)

@@ -905,6 +905,207 @@ func TestHealthzIsUnauthenticatedAndDoesNotAudit(t *testing.T) {
 	}
 }
 
+func TestServeMuxRefusalsAreLogged(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		method       string
+		path         string
+		requestURI   string
+		status       int
+		failureClass string
+	}{
+		{
+			name:         "not found",
+			method:       http.MethodGet,
+			path:         "/not-registered",
+			status:       http.StatusNotFound,
+			failureClass: failureClassRouteNotFound,
+		},
+		{
+			name:         "method not allowed",
+			method:       http.MethodPost,
+			path:         healthPath,
+			status:       http.StatusMethodNotAllowed,
+			failureClass: failureClassMethodNotAllowed,
+		},
+		{
+			name:         "asterisk request target",
+			method:       http.MethodOptions,
+			path:         "/",
+			requestURI:   "*",
+			status:       http.StatusBadRequest,
+			failureClass: failureClassAsteriskRequestTarget,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var log bytes.Buffer
+			srv := &Server{
+				cfg: Config{Path: "/mcp"},
+				log: zerolog.New(&log),
+			}
+			if tt.requestURI == "*" {
+				response := httptest.NewRecorder()
+				request := httptest.NewRequest(tt.method, tt.path, nil)
+				request.RequestURI = tt.requestURI
+				srv.Handler().ServeHTTP(response, request)
+			} else {
+				httpServer := httptest.NewServer(srv.Handler())
+				t.Cleanup(httpServer.Close)
+
+				request, err := http.NewRequest(tt.method, httpServer.URL+tt.path, nil)
+				if err != nil {
+					t.Fatalf("new request: %v", err)
+				}
+				response, err := http.DefaultClient.Do(request)
+				if err != nil {
+					t.Fatalf("%s %s: %v", tt.method, tt.path, err)
+				}
+				_ = response.Body.Close()
+			}
+
+			lines := strings.Split(strings.TrimSuffix(log.String(), "\n"), "\n")
+			if len(lines) != 1 {
+				t.Fatalf("application log lines = %d, want exactly 1: %q", len(lines), log.String())
+			}
+			var event map[string]any
+			if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+				t.Fatalf("decode application log line %q: %v", lines[0], err)
+			}
+			if got := event["status"]; got != float64(tt.status) {
+				t.Errorf("logged status = %v, want %d", got, tt.status)
+			}
+			if got := event["method"]; got != tt.method {
+				t.Errorf("logged method = %v, want %q", got, tt.method)
+			}
+			if got := event["path"]; got != tt.path {
+				t.Errorf("logged path = %v, want %q", got, tt.path)
+			}
+			if got := event["failure_class"]; got != tt.failureClass {
+				t.Errorf("logged failure_class = %v, want %q", got, tt.failureClass)
+			}
+		})
+	}
+}
+
+func TestMuxRefusalWireResponsesMatchBareServeMux(t *testing.T) {
+	srv := &Server{
+		cfg: Config{Path: "/mcp"},
+		log: zerolog.New(io.Discard),
+	}
+	bareMux := http.NewServeMux()
+	srv.registerRoutes(bareMux)
+
+	bareServer := httptest.NewServer(bareMux)
+	t.Cleanup(bareServer.Close)
+	wrappedHandler := srv.Handler()
+	wrappedServer := httptest.NewServer(wrappedHandler)
+	t.Cleanup(wrappedServer.Close)
+
+	for _, tt := range []struct {
+		name       string
+		method     string
+		path       string
+		requestURI string
+	}{
+		{name: "not found", method: http.MethodGet, path: "/not-registered"},
+		{name: "method not allowed", method: http.MethodPost, path: healthPath},
+		{name: "non-canonical missing path", method: http.MethodGet, path: "//not-registered"},
+		{name: "non-canonical path with parent segment", method: http.MethodGet, path: "/a/../b"},
+		{name: "non-canonical path with current segment", method: http.MethodGet, path: "/foo/."},
+		{name: "non-canonical path with doubled middle slash", method: http.MethodGet, path: "/health//z"},
+		{name: "non-canonical path that cleans to health", method: http.MethodGet, path: "/healthz/."},
+		{name: "percent-encoded parent segment", method: http.MethodGet, path: "/%2e%2e/healthz"},
+		{name: "asterisk request target", method: http.MethodOptions, requestURI: "*"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var bareStatus, wrappedStatus int
+			var bareBody, wrappedBody []byte
+			var bareHeaders, wrappedHeaders http.Header
+			if tt.requestURI == "*" {
+				bareResponse := httptest.NewRecorder()
+				bareRequest := httptest.NewRequest(tt.method, "/", nil)
+				bareRequest.RequestURI = tt.requestURI
+				bareMux.ServeHTTP(bareResponse, bareRequest)
+				bareResult := bareResponse.Result()
+				bareStatus = bareResult.StatusCode
+				bareHeaders = bareResult.Header
+				var err error
+				bareBody, err = io.ReadAll(bareResult.Body)
+				_ = bareResult.Body.Close()
+				if err != nil {
+					t.Fatalf("read bare response: %v", err)
+				}
+
+				wrappedResponse := httptest.NewRecorder()
+				wrappedRequest := httptest.NewRequest(tt.method, "/", nil)
+				wrappedRequest.RequestURI = tt.requestURI
+				wrappedHandler.ServeHTTP(wrappedResponse, wrappedRequest)
+				wrappedResult := wrappedResponse.Result()
+				wrappedStatus = wrappedResult.StatusCode
+				wrappedHeaders = wrappedResult.Header
+				wrappedBody, err = io.ReadAll(wrappedResult.Body)
+				_ = wrappedResult.Body.Close()
+				if err != nil {
+					t.Fatalf("read wrapped response: %v", err)
+				}
+			} else {
+				client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+					return http.ErrUseLastResponse
+				}}
+				bareRequest, err := http.NewRequest(tt.method, bareServer.URL+tt.path, nil)
+				if err != nil {
+					t.Fatalf("new bare request: %v", err)
+				}
+				bareResponse, err := client.Do(bareRequest)
+				if err != nil {
+					t.Fatalf("bare %s %s: %v", tt.method, tt.path, err)
+				}
+				bareStatus = bareResponse.StatusCode
+				bareHeaders = bareResponse.Header
+				bareBody, err = io.ReadAll(bareResponse.Body)
+				_ = bareResponse.Body.Close()
+				if err != nil {
+					t.Fatalf("read bare response: %v", err)
+				}
+
+				wrappedRequest, err := http.NewRequest(tt.method, wrappedServer.URL+tt.path, nil)
+				if err != nil {
+					t.Fatalf("new wrapped request: %v", err)
+				}
+				wrappedResponse, err := client.Do(wrappedRequest)
+				if err != nil {
+					t.Fatalf("wrapped %s %s: %v", tt.method, tt.path, err)
+				}
+				wrappedStatus = wrappedResponse.StatusCode
+				wrappedHeaders = wrappedResponse.Header
+				wrappedBody, err = io.ReadAll(wrappedResponse.Body)
+				_ = wrappedResponse.Body.Close()
+				if err != nil {
+					t.Fatalf("read wrapped response: %v", err)
+				}
+			}
+
+			if got, want := wrappedStatus, bareStatus; got != want {
+				t.Errorf("status = %d, want bare ServeMux status %d", got, want)
+			}
+			if !bytes.Equal(wrappedBody, bareBody) {
+				t.Errorf("body = %q, want bare ServeMux body %q", wrappedBody, bareBody)
+			}
+			if !reflect.DeepEqual(wrappedHeaders, bareHeaders) {
+				wrappedHeaders := wrappedHeaders.Clone()
+				bareHeaders := bareHeaders.Clone()
+				if !reflect.DeepEqual(wrappedHeaders.Values("Date"), bareHeaders.Values("Date")) {
+					wrappedHeaders.Del("Date")
+					bareHeaders.Del("Date")
+				}
+				if !reflect.DeepEqual(wrappedHeaders, bareHeaders) {
+					t.Errorf("headers = %#v, want bare ServeMux headers %#v", wrappedHeaders, bareHeaders)
+				}
+			}
+		})
+	}
+}
+
 // TestNewRefusesToBuildWithoutItsGuarantees covers the construction mistakes
 // that would leave a guarantee unenforced: no executor is a server with nothing
 // to serve, no auditor is a server that answers calls without recording them,

@@ -32,6 +32,9 @@ import (
 	"net"
 	"net/http"
 	"os/signal"
+	"path"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -39,6 +42,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse"
 )
 
 // serverName and serverVersion identify this implementation in the MCP
@@ -48,6 +52,14 @@ const (
 	serverVersion = "0.1.0"
 	healthPath    = "/healthz"
 	healthBody    = "ok\n"
+
+	// ServeMux owns these refusals before a registered handler runs. They
+	// need distinct names because an operator investigating a bad path needs a
+	// different answer from one investigating a method that an existing path does
+	// not accept, or from one investigating an HTTP/1.1 asterisk request target.
+	failureClassRouteNotFound         = "route_not_found"
+	failureClassMethodNotAllowed      = "method_not_allowed"
+	failureClassAsteriskRequestTarget = "asterisk_request_target"
 )
 
 // readHeaderTimeout bounds how long a client may take to send its request
@@ -160,17 +172,114 @@ func New(deps Deps) (*Server, error) {
 // what this package registers is what a client actually sees.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	return s.withMuxRefusals(mux, s.registerRoutes(mux))
+}
+
+// registerRoutes mounts every endpoint this server serves and returns the
+// patterns in registration order so the refusal wrapper can discover the
+// methods the mux accepts.
+func (s *Server) registerRoutes(mux *http.ServeMux) []string {
+	patterns := make([]string, 0, len(s.unauthenticatedRoutes)+2)
 	// Health only says that this HTTP server can answer. It deliberately avoids
 	// the MCP handler and its middleware, so a probe never authenticates, opens a
 	// database connection, or adds an audit event.
-	mux.HandleFunc("GET "+healthPath, func(w http.ResponseWriter, _ *http.Request) {
+	healthPattern := "GET " + healthPath
+	mux.HandleFunc(healthPattern, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, healthBody)
 	})
+	patterns = append(patterns, healthPattern)
 	for _, route := range s.unauthenticatedRoutes {
 		mux.Handle(route.Pattern, route.Handler)
+		patterns = append(patterns, route.Pattern)
 	}
 	mux.Handle(s.cfg.Path, s.middlewareOrPassThrough()(s.mcpHandler()))
-	return mux
+	patterns = append(patterns, s.cfg.Path)
+	return patterns
+}
+
+// withMuxRefusals preserves ServeMux's decision for every registered pattern and
+// every redirect, and observes only the two canonical-path cases where the mux
+// would synthesize a refusal without entering application code. An empty matched
+// pattern can also describe a non-canonical clean-path redirect that matched
+// nothing, so canonicity is part of that distinction. In particular, it decorates
+// the handler rather than the ResponseWriter: the MCP SDK reaches the original
+// writer's flusher through a ResponseController, and substituting a writer here
+// would silently break streaming.
+func (s *Server) withMuxRefusals(mux *http.ServeMux, patterns []string) http.Handler {
+	methods := map[string]struct{}{"HEAD": {}}
+	for _, pattern := range patterns {
+		if method, _, found := strings.Cut(pattern, " "); found {
+			methods[method] = struct{}{}
+		}
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ServeMux.ServeHTTP owns this HTTP/1.1 request-target special case. Handler
+		// does not reach it, so delegation preserves the mux's status and headers.
+		if r.RequestURI == "*" {
+			refuse.Log(r, s.log, refuse.Params{
+				Status:       http.StatusBadRequest,
+				FailureClass: failureClassAsteriskRequestTarget,
+			})
+			mux.ServeHTTP(w, r)
+			return
+		}
+
+		handler, pattern := mux.Handler(r)
+		if pattern != "" || (r.Method != http.MethodConnect && r.URL.EscapedPath() != serveMuxCleanPath(r.URL.EscapedPath())) {
+			handler.ServeHTTP(w, r)
+			return
+		}
+
+		allowed := make([]string, 0, len(methods))
+		for method := range methods {
+			candidate := *r
+			candidate.Method = method
+			if _, matchedPattern := mux.Handler(&candidate); matchedPattern != "" {
+				allowed = append(allowed, method)
+			}
+		}
+		if len(allowed) != 0 {
+			sort.Strings(allowed)
+			w.Header().Set("Allow", strings.Join(allowed, ", "))
+			refuse.Write(w, r, s.log, refuse.Params{
+				Status:       http.StatusMethodNotAllowed,
+				OAuth:        false,
+				Body:         "Method Not Allowed",
+				FailureClass: failureClassMethodNotAllowed,
+			})
+			return
+		}
+
+		refuse.Write(w, r, s.log, refuse.Params{
+			Status:       http.StatusNotFound,
+			OAuth:        false,
+			Body:         "404 page not found",
+			FailureClass: failureClassRouteNotFound,
+		})
+	})
+}
+
+// serveMuxCleanPath mirrors net/http's unexported cleanPath behavior. The
+// refusal wrapper needs the same canonicalization to distinguish a missing route
+// from the mux's own clean-path redirect, because both can have an empty pattern.
+func serveMuxCleanPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	np := path.Clean(p)
+	// path.Clean removes trailing slash except for root; put it back if necessary.
+	if p[len(p)-1] == '/' && np != "/" {
+		if len(p) == len(np)+1 && strings.HasPrefix(p, np) {
+			np = p
+		} else {
+			np += "/"
+		}
+	}
+	return np
 }
 
 func (s *Server) middlewareOrPassThrough() func(http.Handler) http.Handler {

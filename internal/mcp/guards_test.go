@@ -1,9 +1,11 @@
 package mcp
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	gotoken "go/token"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -51,16 +53,18 @@ var requiredSources = []string{
 	path.Join(cmdDir, "main.go"),
 }
 
-// requiredGlobalLevelSources anchors TestNoSourceSetsZerologGlobalLevel's root
-// walk. Naming these paths makes a moved or narrowed root fail instead of
-// silently asserting an empty or partial scan.
-var requiredGlobalLevelSources = []string{
+// requiredWholeModuleSources anchors both whole-module guards' root walks to
+// the same set. One readable literal is safer than two byte-identical lists:
+// an update cannot leave one absolute claim scanning less of the module, while
+// each package remains explicit for review when it is added.
+var requiredWholeModuleSources = []string{
 	path.Join(repoDir, "cmd/cerberus-db-mcp/main.go"),
 	path.Join(repoDir, "internal/auth/config.go"),
 	path.Join(repoDir, "internal/authflow/config.go"),
 	path.Join(repoDir, "internal/db/config.go"),
 	path.Join(repoDir, "internal/gate/engine.go"),
 	path.Join(repoDir, "internal/mcp/audit.go"),
+	path.Join(repoDir, "internal/refuse/refuse.go"),
 	path.Join(repoDir, "tools/reachability/main.go"),
 	path.Join(repoDir, "tools/wide-schema/main.go"),
 }
@@ -85,7 +89,9 @@ var allowedImports = map[string]bool{
 	"net/http":                    true,
 	"os":                          true,
 	"os/signal":                   true,
+	"path":                        true, // the wrapper must decide path canonicity as net/http does, or it turns ServeMux's 307 redirect into a 404
 	"reflect":                     true,
+	"sort":                        true, // the wrapper must match net/http's sorted-set Allow value byte for byte
 	"strconv":                     true,
 	"strings":                     true,
 	"sync":                        true, // for the lock that keeps one audit record one line
@@ -103,6 +109,9 @@ var allowedImports = map[string]bool{
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth": true,
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db":   true,
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate": true,
+	// internal/refuse is the shared refusal seam this boundary reaches for the
+	// responses its mux writes itself.
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse": true,
 }
 
 // forbiddenImportSubstrings names what must never appear here whatever the
@@ -156,18 +165,35 @@ func parseFiles(t *testing.T, dirs ...string) (*gotoken.FileSet, map[string]*ast
 
 func parseRepositoryFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 	t.Helper()
+	return parseRepositoryFilesAt(t, repoDir)
+}
+
+// excludedRepositoryDirectory reports whether entry is a directory excluded from
+// module-owned buildable source: any dot-prefixed directory, vendor, or deploy.
+// Those directories hold editor metadata, vendored third-party code, or
+// deployment assets; parsing them would make the guard depend on those inputs
+// and could report third-party code as this repository's violation. The root is never
+// excluded, because a relative root such as "../.." has a dotted base name and
+// excluding it would prevent the walk from scanning anything.
+func excludedRepositoryDirectory(root, name string, entry os.DirEntry) bool {
+	return name != root && entry.IsDir() && (strings.HasPrefix(entry.Name(), ".") || entry.Name() == "vendor" || entry.Name() == "deploy")
+}
+
+// parseRepositoryFilesAt is parseRepositoryFiles with its root made explicit so
+// a guard demonstration can inspect a real copied tree. The guard reads source
+// from disk; an overlay changes what Go compiles, not what this walk parses.
+func parseRepositoryFilesAt(t *testing.T, root string) (*gotoken.FileSet, map[string]*ast.File) {
+	t.Helper()
 	fset := gotoken.NewFileSet()
 	files := make(map[string]*ast.File)
-	err := filepath.WalkDir(repoDir, func(name string, entry os.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(root, func(name string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
+		if excludedRepositoryDirectory(root, name, entry) {
+			return filepath.SkipDir
+		}
 		if entry.IsDir() {
-			// These directories are not module-owned source; parsing them would make
-			// the guard depend on editor metadata or vendored code.
-			if name != repoDir && (strings.HasPrefix(entry.Name(), ".") || entry.Name() == "vendor" || entry.Name() == "deploy") {
-				return filepath.SkipDir
-			}
 			return nil
 		}
 		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -181,7 +207,7 @@ func parseRepositoryFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("walk non-test source under %s: %v", repoDir, err)
+		t.Fatalf("walk non-test source under %s: %v", root, err)
 	}
 	return fset, files
 }
@@ -220,6 +246,121 @@ func requireScanned(t *testing.T, files map[string]*ast.File, required []string)
 		}
 	}
 	t.Logf("scanned %d files: %v", len(scanned), scanned)
+}
+
+type fatalReporter interface {
+	Helper()
+	Fatalf(string, ...any)
+}
+
+// requirePackageDirectoryAnchors makes the readable anchor literals prove they
+// cover every package the root walk found. requireScanned catches a stale named
+// file; this catches the opposite failure, where a newly added package has no
+// name in the list and the guard would otherwise say nothing about it.
+func requirePackageDirectoryAnchors(t fatalReporter, root string, files map[string]*ast.File, anchors []string) {
+	t.Helper()
+	missing := unanchoredPackageDirectories(t, root, files, anchors)
+	if len(missing) != 0 {
+		t.Fatalf("the source scan found package directories with no required anchor: %v", missing)
+	}
+}
+
+func unanchoredPackageDirectories(t fatalReporter, root string, files map[string]*ast.File, anchors []string) []string {
+	t.Helper()
+	packages := map[string]bool{}
+	for name := range files {
+		relative, err := filepath.Rel(root, name)
+		if err != nil {
+			t.Fatalf("make %s relative to %s: %v", name, root, err)
+		}
+		packages[filepath.Dir(relative)] = true
+	}
+	anchored := map[string]bool{}
+	for _, anchor := range anchors {
+		relative, err := filepath.Rel(root, anchor)
+		if err != nil {
+			t.Fatalf("make anchor %s relative to %s: %v", anchor, root, err)
+		}
+		anchored[filepath.Dir(relative)] = true
+	}
+	missing := make([]string, 0)
+	for directory := range packages {
+		if !anchored[directory] {
+			missing = append(missing, directory)
+		}
+	}
+	slices.Sort(missing)
+	return missing
+}
+
+// packageAnchorFailureRecorder lets the real guard report its failure against a
+// copied tree without ending this demonstration test at the first Fatalf.
+type packageAnchorFailureRecorder struct {
+	message string
+}
+
+func (*packageAnchorFailureRecorder) Helper() {}
+
+func (r *packageAnchorFailureRecorder) Fatalf(format string, arguments ...any) {
+	r.message = fmt.Sprintf(format, arguments...)
+}
+
+func anchorsAt(t *testing.T, root string, anchors []string) []string {
+	t.Helper()
+	out := make([]string, 0, len(anchors))
+	for _, anchor := range anchors {
+		relative, err := filepath.Rel(repoDir, anchor)
+		if err != nil {
+			t.Fatalf("make anchor %s relative to %s: %v", anchor, repoDir, err)
+		}
+		out = append(out, filepath.Join(root, relative))
+	}
+	return out
+}
+
+// copyRepositoryTree copies the source tree on disk for demonstrations that a
+// root-walk guard can fail. It shares the walk's exclusions so editor metadata,
+// vendor trees and deployment assets cannot make either a copy or the guard
+// depend on files this module does not own.
+func copyRepositoryTree(t *testing.T, destination string) {
+	t.Helper()
+	err := filepath.WalkDir(repoDir, func(name string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if excludedRepositoryDirectory(repoDir, name, entry) {
+			return filepath.SkipDir
+		}
+		relative, err := filepath.Rel(repoDir, name)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		input, err := os.Open(name)
+		if err != nil {
+			return err
+		}
+		defer input.Close()
+		output, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(output, input)
+		closeErr := output.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+	if err != nil {
+		t.Fatalf("copy repository tree: %v", err)
+	}
 }
 
 // TestPackageImportsNothingItShouldNot is scoped to this package's own
@@ -458,7 +599,8 @@ func TestNoOtherListenAddressDefaultExists(t *testing.T) {
 // logger configuration suppress audit records without touching the auditor.
 func TestNoSourceSetsZerologGlobalLevel(t *testing.T) {
 	fset, files := parseRepositoryFiles(t)
-	requireScanned(t, files, requiredGlobalLevelSources)
+	requireScanned(t, files, requiredWholeModuleSources)
+	requirePackageDirectoryAnchors(t, repoDir, files, requiredWholeModuleSources)
 	for name, f := range files {
 		zerologNames := map[string]bool{}
 		dotImported := false
@@ -496,5 +638,192 @@ func TestNoSourceSetsZerologGlobalLevel(t *testing.T) {
 			}
 			return true
 		})
+	}
+}
+
+type refusalSeamViolation struct {
+	Path string
+	Line int
+	Rule string
+}
+
+// refusalSeamViolations finds response writes that bypass the one place which
+// logs a refusal before it reaches the client. It is deliberately name-based:
+// source guards cannot prove a selector's type without becoming a second type
+// checker, and a false positive is answered by naming the file, not by making a
+// universal guard quieter.
+func refusalSeamViolations(fset *gotoken.FileSet, filePath, exemptPath string, file *ast.File) []refusalSeamViolation {
+	if filepath.Clean(filePath) == filepath.Clean(exemptPath) {
+		return nil
+	}
+	violations := []refusalSeamViolation{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		line := fset.Position(call.Pos()).Line
+		switch selector.Sel.Name {
+		case "Error":
+			receiver, ok := selector.X.(*ast.Ident)
+			if !ok || receiver.Name != "http" {
+				return true
+			}
+			violations = append(violations, refusalSeamViolation{
+				Path: filePath,
+				Line: line,
+				Rule: "calls http.Error outside the refusal seam",
+			})
+		case "WriteHeader":
+			if len(call.Args) == 1 && allowedResponseStatus(call.Args[0]) {
+				return true
+			}
+			violations = append(violations, refusalSeamViolation{
+				Path: filePath,
+				Line: line,
+				Rule: "writes a status outside the success and redirect allowlist",
+			})
+		}
+		return true
+	})
+	return violations
+}
+
+// allowedResponseStatus keeps only statuses that can complete a normal or
+// redirect response outside the refusal seam. Everything else belongs to the
+// seam because it must leave the refusal's log line before reaching a client.
+func allowedResponseStatus(argument ast.Expr) bool {
+	if literal, ok := argument.(*ast.BasicLit); ok && literal.Kind == gotoken.INT {
+		status, err := strconv.ParseInt(literal.Value, 0, 64)
+		return err == nil && status < 400
+	}
+	selector, ok := argument.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	receiver, ok := selector.X.(*ast.Ident)
+	if !ok || receiver.Name != "http" {
+		return false
+	}
+	return map[string]bool{
+		"StatusOK":               true,
+		"StatusCreated":          true,
+		"StatusAccepted":         true,
+		"StatusNoContent":        true,
+		"StatusFound":            true,
+		"StatusSeeOther":         true,
+		"StatusMovedPermanently": true,
+		"StatusNotModified":      true,
+	}[selector.Sel.Name]
+}
+
+// TestRefusalSeamPredicate pins the syntactic boundary the root walk enforces.
+// These sources are parsed rather than compiled so this exercises exactly what
+// a future source file presents to the guard, including selectors the type
+// checker cannot resolve in isolation.
+func TestRefusalSeamPredicate(t *testing.T) {
+	const source = `package candidate
+func reply(w interface{}) {
+	http.Error(nil, "failed", http.StatusInternalServerError)
+	w.WriteHeader(http.StatusInternalServerError)
+	w.WriteHeader(500)
+	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusOK)
+	http.Redirect(nil, nil, "/next", http.StatusFound)
+}
+`
+	fset := gotoken.NewFileSet()
+	file, err := parser.ParseFile(fset, "candidate.go", source, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic source: %v", err)
+	}
+	violations := refusalSeamViolations(fset, "candidate.go", "internal/refuse/refuse.go", file)
+	if got, want := len(violations), 3; got != want {
+		t.Fatalf("violations = %v, want %d violations", violations, want)
+	}
+	for index, wantLine := range []int{3, 4, 5} {
+		if got := violations[index].Line; got != wantLine {
+			t.Errorf("violation %d line = %d, want %d", index, got, wantLine)
+		}
+	}
+	if exempted := refusalSeamViolations(fset, "internal/refuse/refuse.go", "internal/refuse/refuse.go", file); len(exempted) != 0 {
+		t.Errorf("exempt seam file violations = %v, want none", exempted)
+	}
+}
+
+// TestRefusalSeamGuardFindsAnInjectedResponse proves the guard can fail where
+// it matters: over a real copy of the tree. An overlay would change compilation
+// inputs but not the source files parseRepositoryFilesAt reads from disk.
+func TestRefusalSeamGuardFindsAnInjectedResponse(t *testing.T) {
+	copy := t.TempDir()
+	copyRepositoryTree(t, copy)
+	injectedPath := filepath.Join(copy, "internal", "mcp", "config.go")
+	original, err := os.ReadFile(injectedPath)
+	if err != nil {
+		t.Fatalf("read injection target: %v", err)
+	}
+	injected := string(original) + "\nfunc refusalSeamGuardDemonstration() {\n\thttp.Error(nil, \"injected\", http.StatusInternalServerError)\n}\n"
+	if err := os.WriteFile(injectedPath, []byte(injected), 0o644); err != nil {
+		t.Fatalf("inject http.Error: %v", err)
+	}
+	wantLine := strings.Count(injected[:strings.Index(injected, "http.Error")], "\n") + 1
+	fset, files := parseRepositoryFilesAt(t, copy)
+	requireScanned(t, files, anchorsAt(t, copy, requiredWholeModuleSources))
+	requirePackageDirectoryAnchors(t, copy, files, anchorsAt(t, copy, requiredWholeModuleSources))
+	var violations []refusalSeamViolation
+	for name, file := range files {
+		violations = append(violations, refusalSeamViolations(fset, name, filepath.Join(copy, "internal", "refuse", "refuse.go"), file)...)
+	}
+	for _, violation := range violations {
+		if violation.Path == injectedPath && violation.Line == wantLine {
+			return
+		}
+	}
+	t.Errorf("injected response %s:%d was not reported; violations = %v", injectedPath, wantLine, violations)
+}
+
+// TestPackageAnchorDerivationFindsAnUnanchoredPackage demonstrates the stale
+// list failure on a disk copy. The list remains a readable literal; deriving it
+// would hide the package a reviewer needs to notice when it is added.
+func TestPackageAnchorDerivationFindsAnUnanchoredPackage(t *testing.T) {
+	copy := t.TempDir()
+	copyRepositoryTree(t, copy)
+	packageDirectory := filepath.Join(copy, "internal", "seamguardfixture")
+	if err := os.MkdirAll(packageDirectory, 0o755); err != nil {
+		t.Fatalf("make unanchored package directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packageDirectory, "fixture.go"), []byte("package seamguardfixture\n"), 0o644); err != nil {
+		t.Fatalf("write unanchored package file: %v", err)
+	}
+	_, files := parseRepositoryFilesAt(t, copy)
+	anchors := anchorsAt(t, copy, requiredWholeModuleSources)
+	requireScanned(t, files, anchors)
+	reporter := &packageAnchorFailureRecorder{}
+	requirePackageDirectoryAnchors(reporter, copy, files, anchors)
+	want := filepath.Join("internal", "seamguardfixture")
+	if reporter.message == "" {
+		t.Fatal("the package-anchor derivation did not fail for the unanchored package")
+	}
+	if !strings.Contains(reporter.message, want) {
+		t.Errorf("package-anchor failure = %q, want it to name %s", reporter.message, want)
+	}
+}
+
+// TestNoSourceWritesErrorResponseOutsideRefusalSeam is the whole-module claim:
+// every repository-owned error response first reaches refuse.Write, which logs
+// it. The exemption is the named seam file, not its directory, so another file
+// added beside it cannot write a response without this guard seeing it.
+func TestNoSourceWritesErrorResponseOutsideRefusalSeam(t *testing.T) {
+	fset, files := parseRepositoryFiles(t)
+	requireScanned(t, files, requiredWholeModuleSources)
+	requirePackageDirectoryAnchors(t, repoDir, files, requiredWholeModuleSources)
+	for name, file := range files {
+		for _, violation := range refusalSeamViolations(fset, name, path.Join(repoDir, "internal/refuse/refuse.go"), file) {
+			t.Errorf("%s:%d %s", violation.Path, violation.Line, violation.Rule)
+		}
 	}
 }
