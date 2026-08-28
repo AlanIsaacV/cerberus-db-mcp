@@ -44,6 +44,8 @@ const cmdDir = "../../cmd/cerberus-db-mcp"
 // which are about rules that are internal/auth's own.
 const mcpDir = "../mcp"
 
+const refuseDir = "../refuse"
+
 // authflowDir is the authorization-server half of this process, resolved the same
 // way and for the same reason.
 //
@@ -121,6 +123,7 @@ var requiredTokenScanSources = append([]string{
 	path.Join(mcpDir, "server.go"),
 	path.Join(mcpDir, "tools.go"),
 	path.Join(mcpDir, "audit.go"),
+	path.Join(refuseDir, "refuse.go"),
 }, requiredSources...)
 
 // tokenFile is the one file that holds a bearer token presented to the MCP
@@ -158,28 +161,29 @@ const configFile = "config.go"
 // and the binary must stay a static linux/arm64 build with CGO_ENABLED=0, which no
 // dependency with a cgo edge survives.
 var allowedImports = map[string]bool{
-	"container/list":              true, // the LRU, so that a cache needs no dependency
-	"context":                     true,
-	"crypto/aes":                  true,
-	"crypto/cipher":               true,
-	"crypto/hkdf":                 true,
-	"crypto/rand":                 true,
-	"crypto/sha256":               true, // the cache key, and the only lasting form of a token
-	"encoding/base64":             true,
-	"encoding/hex":                true,
-	"encoding/json":               true,
-	"errors":                      true,
-	"fmt":                         true,
-	"io":                          true,
-	"net/http":                    true,
-	"net/url":                     true,
-	"os":                          true,
-	"strconv":                     true,
-	"strings":                     true,
-	"sync":                        true,
-	"time":                        true,
-	"github.com/caarlos0/env/v11": true,
-	"github.com/rs/zerolog":       true,
+	"container/list":  true, // the LRU, so that a cache needs no dependency
+	"context":         true,
+	"crypto/aes":      true,
+	"crypto/cipher":   true,
+	"crypto/hkdf":     true,
+	"crypto/rand":     true,
+	"crypto/sha256":   true, // the cache key, and the only lasting form of a token
+	"encoding/base64": true,
+	"encoding/hex":    true,
+	"encoding/json":   true,
+	"errors":          true,
+	"fmt":             true,
+	"io":              true,
+	"net/http":        true,
+	"net/url":         true,
+	"os":              true,
+	"strconv":         true,
+	"strings":         true,
+	"sync":            true,
+	"time":            true,
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse": true,
+	"github.com/caarlos0/env/v11":                           true,
+	"github.com/rs/zerolog":                                 true,
 }
 
 // forbiddenImportSubstrings names what must never appear here whatever the
@@ -334,7 +338,7 @@ func parseObjectiveFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) 
 // internal/mcp, which is everything a credential could have travelled into.
 func parseTokenScanFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 	t.Helper()
-	fset, files := parseFiles(t, ".", cmdDir, mcpDir, authflowDir)
+	fset, files := parseFiles(t, ".", cmdDir, mcpDir, authflowDir, refuseDir)
 	requireScanned(t, files, requiredTokenScanSources)
 	return fset, files
 }

@@ -291,12 +291,23 @@ func TestTheTokenEndpointRefusesARequestThatIsNotOne(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			fake := newFakeGoogle(t, consentingIdentity(), testRefreshToken)
-			handlers := testHandlers(t, fake, io.Discard)
+			var captured bytes.Buffer
+			handlers := testHandlers(t, fake, &captured)
 			before := fake.requestCount()
 
 			response := post(t, handlers, tt.form)
 
 			assertOAuthRefusal(t, response, tt.status, tt.oauthError)
+			record := oneLogLine(t, captured.String())
+			if record["level"] != "warn" || record["failure_class"] != tt.oauthError || record["status"] != float64(tt.status) {
+				t.Errorf("refusal log = %v, want warn %q with status %d", record, tt.oauthError, tt.status)
+			}
+			if record["method"] != http.MethodPost || record["path"] != TokenPath {
+				t.Errorf("refusal location = (%v, %v), want (POST, %q)", record["method"], record["path"], TokenPath)
+			}
+			if _, present := record["auth_refusal"]; present {
+				t.Errorf("auth_refusal = %v, want it absent", record["auth_refusal"])
+			}
 			if got := fake.requestCount(); got != before {
 				t.Errorf("Google received %d requests for a request that is not a token request, want none", got-before)
 			}
@@ -306,13 +317,36 @@ func TestTheTokenEndpointRefusesARequestThatIsNotOne(t *testing.T) {
 
 func TestTheTokenEndpointAnswersOnlyPOST(t *testing.T) {
 	fake := newFakeGoogle(t, consentingIdentity(), testRefreshToken)
-	handlers := testHandlers(t, fake, io.Discard)
+	var captured bytes.Buffer
+	handlers := testHandlers(t, fake, &captured)
 	request := httptest.NewRequest(http.MethodGet, TokenPath+"?"+codeGrant("a-code").Encode(), nil)
 	recorder := httptest.NewRecorder()
 	mounted(t, handlers, TokenPath).ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want %d: a grant presented in a URL is one in a proxy log and a browser history",
 			recorder.Code, http.StatusMethodNotAllowed)
+	}
+	if got := recorder.Body.String(); got != "method not allowed\n" {
+		t.Errorf("body = %q, want method not allowed\\n", got)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", got)
+	}
+	if got := recorder.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := recorder.Header().Get("WWW-Authenticate"); got != "" {
+		t.Errorf("WWW-Authenticate = %q, want it absent", got)
+	}
+	record := oneLogLine(t, captured.String())
+	if record["level"] != "warn" || record["failure_class"] != "method_not_allowed" || record["status"] != float64(http.StatusMethodNotAllowed) {
+		t.Errorf("refusal log = %v, want warn method_not_allowed with status %d", record, http.StatusMethodNotAllowed)
+	}
+	if record["method"] != http.MethodGet || record["path"] != TokenPath {
+		t.Errorf("refusal location = (%v, %v), want (GET, %q)", record["method"], record["path"], TokenPath)
+	}
+	if _, present := record["auth_refusal"]; present {
+		t.Errorf("auth_refusal = %v, want it absent", record["auth_refusal"])
 	}
 }
 
@@ -390,9 +424,12 @@ func TestTheRefreshGrantSpendsTheGoogleGrantAndRechecksTheIdentity(t *testing.T)
 
 		assertOAuthRefusal(t, response, http.StatusForbidden, "access_denied")
 		assertNoCredentialInBody(t, response)
-		record := lastLogLine(t, afterward.String())
-		if record["auth_refusal"] != "renewal_identity_allowlist" {
-			t.Errorf("auth_refusal = %v, want renewal_identity_allowlist: two other things at this listener answer 403 and this field is what tells them apart", record["auth_refusal"])
+		record := oneLogLine(t, afterward.String())
+		if record["level"] != "warn" || record["failure_class"] != "access_denied" || record["status"] != float64(http.StatusForbidden) || record["auth_refusal"] != "renewal_identity_allowlist" {
+			t.Errorf("refusal log = %v, want warn access_denied with renewal_identity_allowlist and status %d", record, http.StatusForbidden)
+		}
+		if record["method"] != http.MethodPost || record["path"] != TokenPath {
+			t.Errorf("refusal location = (%v, %v), want (POST, %q)", record["method"], record["path"], TokenPath)
 		}
 	})
 
@@ -687,6 +724,18 @@ func assertOAuthRefusal(t *testing.T, response *httptest.ResponseRecorder, statu
 	t.Helper()
 	if response.Code != status {
 		t.Errorf("status = %d, want %d: %s", response.Code, status, response.Body)
+	}
+	if got, want := response.Body.String(), `{"error":"`+oauthError+`"}`; got != want {
+		t.Errorf("body = %q, want %q", got, want)
+	}
+	if got := response.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	if got := response.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+	if got := response.Header().Get("WWW-Authenticate"); got != "" {
+		t.Errorf("WWW-Authenticate = %q, want it absent", got)
 	}
 	var refusal map[string]any
 	if err := json.Unmarshal(response.Body.Bytes(), &refusal); err != nil {

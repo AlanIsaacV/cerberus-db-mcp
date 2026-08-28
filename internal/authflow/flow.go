@@ -9,6 +9,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse"
 )
 
 // This file is the half of the package that writes where a person can read: the
@@ -115,7 +116,7 @@ func newHandlers(config Config, authentication auth.Config, resourcePath string,
 	// normalises the value it was given, and the copy it normalised is the one
 	// inside the flow. A document built from the unvalidated form here would
 	// publish an issuer with a trailing slash that no other URL in the process has.
-	papers, err := newDocuments(flow.publicBaseURL, resourcePath)
+	papers, err := newDocuments(flow.publicBaseURL, resourcePath, log)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +182,12 @@ func (h *Handlers) IssuanceHandler() http.Handler { return http.HandlerFunc(h.is
 
 func (h *Handlers) authorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		refuse.Write(w, r, h.log, refuse.Params{
+			Status:       http.StatusMethodNotAllowed,
+			Body:         "method not allowed",
+			FailureClass: "method_not_allowed",
+			Message:      "the authorize endpoint refused a non-GET request",
+		})
 		return
 	}
 	query := r.URL.Query()
@@ -192,21 +198,41 @@ func (h *Handlers) authorize(w http.ResponseWriter, r *http.Request) {
 		challengeMethod: query.Get("code_challenge_method"),
 	}
 	if !accepts(h.redirectURIs, client.redirectURI) {
-		http.Error(w, "invalid redirect URI", http.StatusBadRequest)
+		refuse.Write(w, r, h.log, refuse.Params{
+			Status:       http.StatusBadRequest,
+			Body:         "invalid redirect URI",
+			FailureClass: "redirect_uri_unregistered",
+			Message:      "the authorize endpoint refused an unregistered redirect URI",
+		})
 		return
 	}
 	if client.challenge == "" || client.challengeMethod != "S256" {
-		http.Error(w, "invalid PKCE challenge", http.StatusBadRequest)
+		refuse.Write(w, r, h.log, refuse.Params{
+			Status:       http.StatusBadRequest,
+			Body:         "invalid PKCE challenge",
+			FailureClass: "pkce_challenge_invalid",
+			Message:      "the authorize endpoint refused an invalid PKCE challenge",
+		})
 		return
 	}
 	state, challenge, err := h.flow.start(client)
 	if err != nil {
-		http.Error(w, "authorization is unavailable", http.StatusServiceUnavailable)
+		refuse.Write(w, r, h.log, refuse.Params{
+			Status:       http.StatusServiceUnavailable,
+			Body:         "authorization is unavailable",
+			FailureClass: "flow_unavailable",
+			Message:      "the authorize endpoint could not start a Google sign-in flow",
+		})
 		return
 	}
 	target, err := url.Parse(h.authorizeURL)
 	if err != nil {
-		http.Error(w, "authorization is unavailable", http.StatusServiceUnavailable)
+		refuse.Write(w, r, h.log, refuse.Params{
+			Status:       http.StatusServiceUnavailable,
+			Body:         "authorization is unavailable",
+			FailureClass: "flow_unavailable",
+			Message:      "the authorize endpoint could not parse its Google URL",
+		})
 		return
 	}
 	values := target.Query()
@@ -225,7 +251,12 @@ func (h *Handlers) authorize(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) callback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		refuse.Write(w, r, h.log, refuse.Params{
+			Status:       http.StatusMethodNotAllowed,
+			Body:         "method not allowed",
+			FailureClass: "method_not_allowed",
+			Message:      "the authorization callback refused a non-GET request",
+		})
 		return
 	}
 	// finish writes the redirect on success, because its Location carries the
@@ -233,11 +264,15 @@ func (h *Handlers) callback(w http.ResponseWriter, r *http.Request) {
 	finished, err := h.flow.finish(w, r)
 	if err != nil {
 		message, status := refusal(err)
-		http.Error(w, message, status)
-		googleFailureFields(h.log.Warn().
-			Str("failure_class", message).
-			Int("status", status), err).
-			Msg("the authorization callback refused a response")
+		refuse.Write(w, r, h.log, refuse.Params{
+			Status:       status,
+			Body:         message,
+			FailureClass: message,
+			Message:      "the authorization callback refused a response",
+			Fields: func(event *zerolog.Event) *zerolog.Event {
+				return googleFailureFields(event, err)
+			},
+		})
 		return
 	}
 	// The two lengths are what acceptance criterion 4 is graded on against real
@@ -253,7 +288,12 @@ func (h *Handlers) callback(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) issuance(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		refuse.Write(w, r, h.log, refuse.Params{
+			Status:       http.StatusMethodNotAllowed,
+			Body:         "method not allowed",
+			FailureClass: "method_not_allowed",
+			Message:      "the token endpoint refused a non-POST request",
+		})
 		return
 	}
 	// issue writes the 200 itself, because the body it writes is the credential
@@ -262,11 +302,7 @@ func (h *Handlers) issuance(w http.ResponseWriter, r *http.Request) {
 	result, err := h.flow.issue(w, r)
 	if err != nil {
 		status, failure := tokenRefusal(err)
-		oauthRefusal(w, status, failure)
-		event := h.log.Warn().
-			Str("grant", result.grant).
-			Str("failure_class", failure).
-			Int("status", status)
+		authRefusal := ""
 		if status == http.StatusForbidden {
 			// Three things at this listener now answer 403, and the auth_refusal
 			// field is the only thing that tells them apart: the go-sdk's own
@@ -276,9 +312,19 @@ func (h *Handlers) issuance(w http.ResponseWriter, r *http.Request) {
 			// not the middleware's value: an operator filtering on that one is
 			// looking at requests refused at the MCP endpoint, and a renewal refused
 			// here is a different event with a different remedy.
-			event = event.Str("auth_refusal", "renewal_identity_allowlist")
+			authRefusal = "renewal_identity_allowlist"
 		}
-		googleFailureFields(event, err).Msg("the token endpoint refused a request")
+		refuse.Write(w, r, h.log, refuse.Params{
+			Status:       status,
+			OAuth:        true,
+			Body:         failure,
+			FailureClass: failure,
+			AuthRefusal:  authRefusal,
+			Message:      "the token endpoint refused a request",
+			Fields: func(event *zerolog.Event) *zerolog.Event {
+				return googleFailureFields(event.Str("grant", result.grant), err)
+			},
+		})
 		return
 	}
 	// Lengths and the grant, and nothing else. Both figures are the measurement the
@@ -326,16 +372,6 @@ func tokenRefusal(err error) (status int, oauthError string) {
 	default:
 		return http.StatusServiceUnavailable, "temporarily_unavailable"
 	}
-}
-
-// oauthRefusal writes RFC 6749 section 5.2's body: one member, assembled from a
-// code this file chose. Nothing of what was presented, and nothing of what Google
-// said, is in it.
-func oauthRefusal(w http.ResponseWriter, status int, oauthError string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	_, _ = w.Write([]byte(`{"error":"` + oauthError + `"}`))
 }
 
 // refusal is how a failure inside the exchange becomes a response. The messages

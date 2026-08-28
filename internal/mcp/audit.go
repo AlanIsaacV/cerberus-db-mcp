@@ -139,11 +139,9 @@ func NewAuditor(w io.Writer) *Auditor {
 // outcome happens to fill. The exception is Pending, which is a list and is
 // meaningless when empty.
 func (a *Auditor) Record(e AuditEvent) {
-	// Info rather than zerolog's level-less Log, so that an audit stream pointed
-	// at the same file descriptor as the application log is still made of
-	// well-formed records of the same shape. The stream field is what tells the
-	// two apart when they do share a destination, which is the default.
-	ev := a.log.Info().
+	// The audit stream records what happened rather than application diagnostics,
+	// so application log levels must not silence it; its events are level-less.
+	ev := a.log.Log().
 		Str("stream", "audit").
 		Str("tool", e.Tool).
 		Str("identity", e.Identity).

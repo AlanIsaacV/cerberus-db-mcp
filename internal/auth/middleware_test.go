@@ -235,10 +235,11 @@ func (h *authHarness) assertRejected(t *testing.T, resp *http.Response, status i
 	}
 }
 
-// assertRefusalShape is the byte-identity check behind
-// [TestTheRefusalShapesAreTheOnesFromBeforeTheAuthorizationServer]: the status, the
-// WWW-Authenticate header values whole rather than joined, the class in the log,
-// and the auth_refusal field that says which of this listener's 403s this is.
+// assertRefusalShape keeps every refusal byte-identical to its pre-authorization-
+// server shape: its status, exact body, Content-Type and X-Content-Type-Options,
+// no Cache-Control value, and its WWW-Authenticate header values whole rather than
+// joined. Its exactly one log line carries the failure class, method, and path; an
+// auth_refusal is absent, rather than blank, unless the refusal is an allowlist 403.
 //
 // It compares the header as a slice because "no challenge" and "one challenge" are
 // not the only two states a header can be in: a second Set somewhere would produce
@@ -268,6 +269,32 @@ func (h *authHarness) assertRefusalShape(t *testing.T, resp *http.Response, stat
 			status, got)
 	case authRefusal != "" && got != authRefusal:
 		t.Errorf("auth_refusal = %v, want %q", got, authRefusal)
+	}
+	if got, want := resp.Header.Get("Content-Type"), "text/plain; charset=utf-8"; got != want {
+		t.Errorf("Content-Type = %q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("X-Content-Type-Options"), "nosniff"; got != want {
+		t.Errorf("X-Content-Type-Options = %q, want %q", got, want)
+	}
+	if got := resp.Header.Values("Cache-Control"); len(got) != 0 {
+		t.Errorf("Cache-Control = %q, want no value on a plain-text refusal", got)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read refusal body: %v", err)
+	}
+	wantBody := "unauthorized\n"
+	if status == http.StatusForbidden {
+		wantBody = "forbidden: this identity is not allowed on this server\n"
+	}
+	if got := string(body); got != wantBody {
+		t.Errorf("body = %q, want %q", got, wantBody)
+	}
+	if got := records[0]["method"]; got != http.MethodPost {
+		t.Errorf("method = %v, want %q", got, http.MethodPost)
+	}
+	if got := records[0]["path"]; got != "/refusal-shape" {
+		t.Errorf("path = %v, want %q", got, "/refusal-shape")
 	}
 }
 
@@ -1018,6 +1045,7 @@ func TestTheRefusalShapesAreTheOnesFromBeforeTheAuthorizationServer(t *testing.T
 			t.Run(tt.name, func(t *testing.T) {
 				f := newFakeTokeninfo(t, tt.tokeninfo)
 				h := serveBehindAuth(t, allowlistOf("one@example.test"), f)
+				h.url += "/refusal-shape"
 
 				resp := h.get(t, tt.authorization...)
 				h.assertRefusalShape(t, resp, tt.status, tt.class, tt.challenge, tt.authRefusal)
@@ -1068,6 +1096,7 @@ func TestTheRefusalShapesAreTheOnesFromBeforeTheAuthorizationServer(t *testing.T
 				f := newFakeTokeninfo(t, respondWith(http.StatusInternalServerError, ""))
 				cfg := allowlistOf("one@example.test")
 				h := serveBehindAuthAt(t, cfg, f, clock.now)
+				h.url += "/refusal-shape"
 				sealed, err := tt.seal(testSealer(t, cfg.SealingSecret), clock.now())
 				if err != nil {
 					t.Fatalf("seal: %v", err)

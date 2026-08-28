@@ -8,8 +8,10 @@ import (
 
 	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
+	"github.com/rs/zerolog"
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse"
 )
 
 // This file is on the writer half of this package: it holds no credential and
@@ -39,6 +41,7 @@ var errNoResourcePath = errors.New("authflow: no MCP resource path was supplied 
 type documents struct {
 	authorizationServer []byte
 	resource            *oauthex.ProtectedResourceMetadata
+	log                 zerolog.Logger
 	// suffixedResourcePath is the protected-resource document's second location:
 	// the well-known path with the resource's own path appended, which is what RFC
 	// 9728 section 3.1 has a client construct when the resource is not at the
@@ -46,7 +49,7 @@ type documents struct {
 	suffixedResourcePath string
 }
 
-func newDocuments(publicBaseURL, resourcePath string) (documents, error) {
+func newDocuments(publicBaseURL, resourcePath string, log zerolog.Logger) (documents, error) {
 	if !strings.HasPrefix(resourcePath, "/") {
 		return documents{}, errNoResourcePath
 	}
@@ -56,6 +59,7 @@ func newDocuments(publicBaseURL, resourcePath string) (documents, error) {
 	}
 	return documents{
 		authorizationServer: rendered,
+		log:                 log,
 		resource: &oauthex.ProtectedResourceMetadata{
 			Resource:             publicBaseURL + resourcePath,
 			AuthorizationServers: []string{publicBaseURL},
@@ -155,7 +159,12 @@ func (d documents) authorizationServerHandler() http.Handler {
 			return
 		}
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			refuse.Write(w, r, d.log, refuse.Params{
+				Status:       http.StatusMethodNotAllowed,
+				Body:         "method not allowed",
+				FailureClass: "method_not_allowed",
+				Message:      "the metadata endpoint refused a non-GET request",
+			})
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

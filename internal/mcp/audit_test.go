@@ -68,7 +68,6 @@ func TestAuditEventCarriesEveryFieldItPromises(t *testing.T) {
 	delete(event, "time")
 
 	want := map[string]any{
-		"level":      "info",
 		"stream":     "audit",
 		"tool":       ToolExecuteQuery,
 		"identity":   "analyst@example.com",
@@ -91,6 +90,30 @@ func TestAuditEventCarriesEveryFieldItPromises(t *testing.T) {
 		got, _ := json.Marshal(event)
 		wantJSON, _ := json.Marshal(want)
 		t.Errorf("the audit record =\n%s\nwant\n%s", got, wantJSON)
+	}
+}
+
+func TestAuditStreamIsUnaffectedByGlobalLogLevel(t *testing.T) {
+	event := AuditEvent{Tool: ToolExecuteQuery, Statement: "SELECT 1", Outcome: OutcomeAllowed}
+	previous := zerolog.GlobalLevel()
+	defer zerolog.SetGlobalLevel(previous)
+
+	recordAt := func(level zerolog.Level) map[string]any {
+		t.Helper()
+		zerolog.SetGlobalLevel(level)
+		var buf bytes.Buffer
+		NewAuditor(&buf).Record(event)
+		record := decodeOneEvent(t, buf.String())
+		delete(record, "time")
+		return record
+	}
+
+	want := recordAt(zerolog.TraceLevel)
+	got := recordAt(zerolog.ErrorLevel)
+	if !reflect.DeepEqual(got, want) {
+		gotJSON, _ := json.Marshal(got)
+		wantJSON, _ := json.Marshal(want)
+		t.Errorf("the audit record at the global error level =\n%s\nwant\n%s", gotJSON, wantJSON)
 	}
 }
 

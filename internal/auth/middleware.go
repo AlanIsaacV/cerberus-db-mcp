@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse"
 	"github.com/rs/zerolog"
 )
 
@@ -120,7 +121,7 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 			r.Header.Del("Authorization")
 			token, class := bearerToken(values)
 			if class != "" {
-				unauthorized(w, log, challenge, class)
+				unauthorized(w, r, log, challenge, class)
 				return
 			}
 			if IsSealedCredential(token) {
@@ -129,7 +130,7 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 					// about the credential. Unsealing has no upstream, so once a sealer
 					// exists every sealed-credential failure is local and credential
 					// specific; a missing one cannot be repaired by reauthorizing.
-					unauthorized(w, log, challenge, failureNoSealedCredentialValidation)
+					unauthorized(w, r, log, challenge, failureNoSealedCredentialValidation)
 					return
 				}
 				sealed, err := sealer.UnsealAccess(token)
@@ -143,24 +144,24 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 					// place, every refusal here is therefore a statement about the
 					// credential and is challenged; there is no sealed counterpart to
 					// validation_unavailable.
-					unauthorized(w, log, challenge, class)
+					unauthorized(w, r, log, challenge, class)
 					return
 				}
 				if !sealed.ExpiresAt.After(now()) {
-					unauthorized(w, log, challenge, failureSealedCredentialExpired)
+					unauthorized(w, r, log, challenge, failureSealedCredentialExpired)
 					return
 				}
 				caller := claims{subject: sealed.Subject, email: sealed.Email, emailVerified: sealed.Verified}
 				if caller.subject == "" || normaliseEmail(caller.email) == "" {
-					forbidden(w, log, failureNoEmailInToken, caller, true)
+					forbidden(w, r, log, failureNoEmailInToken, caller, true)
 					return
 				}
 				if !allowed[normaliseEmail(caller.email)] {
-					forbidden(w, log, failureNotAllowlisted, caller, true)
+					forbidden(w, r, log, failureNotAllowlisted, caller, true)
 					return
 				}
 				if !caller.emailVerified {
-					forbidden(w, log, failureEmailUnverified, caller, true)
+					forbidden(w, r, log, failureEmailUnverified, caller, true)
 					return
 				}
 				log.Debug().
@@ -178,7 +179,7 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 				// A middleware with no validator would admit every caller, so it admits
 				// none. Unreachable through [NewMiddleware]; here because the failure
 				// mode of the alternative is silent.
-				unauthorized(w, log, challenge, failureNoTokenValidation)
+				unauthorized(w, r, log, challenge, failureNoTokenValidation)
 				return
 			}
 			caller, err := v.validate(r.Context(), token)
@@ -187,7 +188,7 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 				if errors.Is(err, errTokenRejected) {
 					class = failureTokenRejected
 				}
-				unauthorized(w, log, challenge, class)
+				unauthorized(w, r, log, challenge, class)
 				return
 			}
 			// Before the allowlist, because the two are different problems with
@@ -198,7 +199,7 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 			// caller arrives here, and this class is what keeps the first hour of
 			// diagnosis off an allowlist that was already right.
 			if normaliseEmail(caller.email) == "" {
-				forbidden(w, log, failureNoEmailInToken, caller, false)
+				forbidden(w, r, log, failureNoEmailInToken, caller, false)
 				return
 			}
 			// Membership before verification, so that a stranger's rejection reads as
@@ -206,11 +207,11 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 			// produce the narrower "their email is not verified" — which is the one an
 			// operator has to do something unusual about.
 			if !allowed[normaliseEmail(caller.email)] {
-				forbidden(w, log, failureNotAllowlisted, caller, false)
+				forbidden(w, r, log, failureNotAllowlisted, caller, false)
 				return
 			}
 			if !caller.emailVerified {
-				forbidden(w, log, failureEmailUnverified, caller, false)
+				forbidden(w, r, log, failureEmailUnverified, caller, false)
 				return
 			}
 			log.Debug().
@@ -257,20 +258,23 @@ func bearerToken(values []string) (token, failureClass string) {
 // of credential this endpoint wants, which is the difference between an agent
 // that can prompt for a login and one that reports a broken server. When it is
 // not sent, see [challengesTheCredential].
-func unauthorized(w http.ResponseWriter, log zerolog.Logger, challenge, class string) {
+func unauthorized(w http.ResponseWriter, r *http.Request, log zerolog.Logger, challenge, class string) {
 	// The application log, never the audit stream. An AuditEvent is shaped around a
 	// tool call — tool, alias, statement, verdict — and a request refused here
 	// reached no tool, so every one of those fields would be empty. What was
 	// attempted against somebody else's database is the audit stream's subject;
 	// who failed to get in is this one's.
-	log.Warn().
-		Str("failure_class", class).
-		Int("status", http.StatusUnauthorized).
-		Msg("request refused before any tool: no usable bearer token")
+	challengeForRefusal := ""
 	if challengesTheCredential(class) {
-		w.Header().Set("WWW-Authenticate", challenge)
+		challengeForRefusal = challenge
 	}
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
+	refuse.Write(w, r, log, refuse.Params{
+		Status:       http.StatusUnauthorized,
+		Body:         "unauthorized",
+		Challenge:    challengeForRefusal,
+		FailureClass: class,
+		Message:      "request refused before any tool: no usable bearer token",
+	})
 }
 
 // challengeValue is the whole WWW-Authenticate a challenged 401 carries.
@@ -327,24 +331,25 @@ func challengesTheCredential(class string) bool {
 // guessing at the address to add. An email that Google vouched for is not a
 // credential, and the token that carried it is not in this line in any form.
 //
-// The auth_refusal field exists to be told apart from the other 403 this process
-// can answer: the go-sdk turns on DNS-rebinding protection by itself when the
-// listener is loopback, and answers 403 to any request whose Host header is not
-// loopback either. That refusal happens inside the wrapped handler, after this
-// middleware has already admitted the request, and produces no line from this
-// package — so a 403 with an auth_refusal field is this one, and a 403 without any
-// log line from here is that one. Which of this package's own 403s it is, the
-// failure_class says.
-func forbidden(w http.ResponseWriter, log zerolog.Logger, class string, caller claims, sealed bool) {
-	log.Warn().
-		Str("failure_class", class).
-		Str("auth_refusal", "identity_allowlist").
-		Str("email", caller.email).
-		Str("subject", caller.subject).
-		Bool("email_verified", caller.emailVerified).
-		Int("status", http.StatusForbidden).
-		Msg(refusalMessage(class, sealed))
-	http.Error(w, "forbidden: this identity is not allowed on this server", http.StatusForbidden)
+// Three things at this listener answer 403. The go-sdk's DNS-rebinding refusal
+// writes no line from this repository; this package writes identity_allowlist; the
+// issuance endpoint writes renewal_identity_allowlist. The auth_refusal field
+// distinguishes the two logged allowlist refusals, and failure_class distinguishes
+// the refusals within this package.
+func forbidden(w http.ResponseWriter, r *http.Request, log zerolog.Logger, class string, caller claims, sealed bool) {
+	refuse.Write(w, r, log, refuse.Params{
+		Status:       http.StatusForbidden,
+		Body:         "forbidden: this identity is not allowed on this server",
+		FailureClass: class,
+		AuthRefusal:  "identity_allowlist",
+		Message:      refusalMessage(class, sealed),
+		Fields: func(event *zerolog.Event) *zerolog.Event {
+			return event.
+				Str("email", caller.email).
+				Str("subject", caller.subject).
+				Bool("email_verified", caller.emailVerified)
+		},
+	})
 }
 
 // refusalMessage is what each 403 tells the operator reading it to do next, which

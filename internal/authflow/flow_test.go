@@ -352,6 +352,120 @@ func TestAuthorizationRefusesUnregisteredRedirectURIsBeforeGoogle(t *testing.T) 
 	}
 }
 
+func TestSilentHandlerRefusalsKeepTheirWireShapeAndWriteOneWarning(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		method       string
+		path         string
+		body         string
+		status       int
+		failureClass string
+		prepare      func(*Handlers)
+		handler      func(*Handlers) http.Handler
+		cors         bool
+	}{
+		{
+			name:         "authorize rejects a non-GET request",
+			method:       http.MethodPost,
+			path:         AuthorizationPath,
+			body:         "method not allowed\n",
+			status:       http.StatusMethodNotAllowed,
+			failureClass: "method_not_allowed",
+			handler:      func(h *Handlers) http.Handler { return h.AuthorizationHandler() },
+		},
+		{
+			name:         "authorize rejects an unregistered redirect URI",
+			method:       http.MethodGet,
+			path:         AuthorizationPath + "?redirect_uri=https%3A%2F%2Fattacker.example.test%2Fcallback&code_challenge=challenge&code_challenge_method=S256",
+			body:         "invalid redirect URI\n",
+			status:       http.StatusBadRequest,
+			failureClass: "redirect_uri_unregistered",
+			handler:      func(h *Handlers) http.Handler { return h.AuthorizationHandler() },
+		},
+		{
+			name:         "authorize rejects an invalid PKCE challenge",
+			method:       http.MethodGet,
+			path:         AuthorizationPath + "?redirect_uri=" + url.QueryEscape(testRedirectURI),
+			body:         "invalid PKCE challenge\n",
+			status:       http.StatusBadRequest,
+			failureClass: "pkce_challenge_invalid",
+			handler:      func(h *Handlers) http.Handler { return h.AuthorizationHandler() },
+		},
+		{
+			name:         "authorize reports unavailable when its Google URL is malformed",
+			method:       http.MethodGet,
+			path:         AuthorizationPath + "?redirect_uri=" + url.QueryEscape(testRedirectURI) + "&code_challenge=challenge&code_challenge_method=S256",
+			body:         "authorization is unavailable\n",
+			status:       http.StatusServiceUnavailable,
+			failureClass: "flow_unavailable",
+			prepare: func(h *Handlers) {
+				h.authorizeURL = ":"
+			},
+			handler: func(h *Handlers) http.Handler { return h.AuthorizationHandler() },
+		},
+		{
+			name:         "callback rejects a non-GET request",
+			method:       http.MethodPost,
+			path:         CallbackPath,
+			body:         "method not allowed\n",
+			status:       http.StatusMethodNotAllowed,
+			failureClass: "method_not_allowed",
+			handler:      func(h *Handlers) http.Handler { return h.CallbackHandler() },
+		},
+		{
+			name:         "metadata rejects a non-GET request",
+			method:       http.MethodPost,
+			path:         AuthorizationServerMetadataPath,
+			body:         "method not allowed\n",
+			status:       http.StatusMethodNotAllowed,
+			failureClass: "method_not_allowed",
+			handler:      func(h *Handlers) http.Handler { return mounted(t, h, AuthorizationServerMetadataPath) },
+			cors:         true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := newFakeGoogle(t, consentingIdentity(), testRefreshToken)
+			var captured bytes.Buffer
+			handlers := testHandlers(t, fake, &captured)
+			if tt.prepare != nil {
+				tt.prepare(handlers)
+			}
+			request := httptest.NewRequest(tt.method, tt.path, nil)
+			recorder := httptest.NewRecorder()
+			tt.handler(handlers).ServeHTTP(recorder, request)
+
+			if recorder.Code != tt.status {
+				t.Errorf("status = %d, want %d", recorder.Code, tt.status)
+			}
+			if got := recorder.Body.String(); got != tt.body {
+				t.Errorf("body = %q, want %q", got, tt.body)
+			}
+			if got := recorder.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+				t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", got)
+			}
+			if got := recorder.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+			}
+			if got := recorder.Header().Get("WWW-Authenticate"); got != "" {
+				t.Errorf("WWW-Authenticate = %q, want it absent", got)
+			}
+			if tt.cors && recorder.Header().Get("Access-Control-Allow-Origin") != "*" {
+				t.Errorf("Access-Control-Allow-Origin = %q, want *", recorder.Header().Get("Access-Control-Allow-Origin"))
+			}
+			record := oneLogLine(t, captured.String())
+			if record["level"] != "warn" || record["failure_class"] != tt.failureClass || record["status"] != float64(tt.status) {
+				t.Errorf("refusal log = %v, want warn %q with status %d", record, tt.failureClass, tt.status)
+			}
+			if record["method"] != tt.method || record["path"] != request.URL.Path {
+				t.Errorf("refusal location = (%v, %v), want (%q, %q)", record["method"], record["path"], tt.method, request.URL.Path)
+			}
+			if _, present := record["auth_refusal"]; present {
+				t.Errorf("auth_refusal = %v, want it absent", record["auth_refusal"])
+			}
+		})
+	}
+}
+
 func TestAuthorizationSendsGoogleTheOfflineConsentPKCERequest(t *testing.T) {
 	fake := newFakeGoogle(t, googleIdentity{}, "refresh")
 	handlers := testHandlers(t, fake, io.Discard)
@@ -504,12 +618,14 @@ func TestCallbackWritesOneFailureLineForEveryRefusal(t *testing.T) {
 		setup func(*fakeGoogle)
 		state func(t *testing.T, handlers *Handlers) string
 		want  int
+		body  string
 	}{
 		{
 			name:  "an authorization response this server cannot open",
 			setup: func(*fakeGoogle) {},
 			state: func(*testing.T, *Handlers) string { return "not-a-state" },
 			want:  http.StatusBadRequest,
+			body:  "invalid authorization response\n",
 		},
 		{
 			name: "a refused authorization-code exchange",
@@ -518,6 +634,7 @@ func TestCallbackWritesOneFailureLineForEveryRefusal(t *testing.T) {
 			},
 			state: callbackStateForTest,
 			want:  http.StatusBadGateway,
+			body:  "authorization exchange failed\n",
 		},
 		{
 			name: "an unusable identity response",
@@ -526,12 +643,14 @@ func TestCallbackWritesOneFailureLineForEveryRefusal(t *testing.T) {
 			},
 			state: callbackStateForTest,
 			want:  http.StatusBadGateway,
+			body:  "identity verification failed\n",
 		},
 		{
 			name:  "an identity that is not verified",
 			setup: func(fake *fakeGoogle) { fake.identity.Verified = false },
 			state: callbackStateForTest,
 			want:  http.StatusForbidden,
+			body:  "forbidden\n",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -545,9 +664,27 @@ func TestCallbackWritesOneFailureLineForEveryRefusal(t *testing.T) {
 			if response.Code != tt.want {
 				t.Errorf("status = %d, want %d", response.Code, tt.want)
 			}
+			if got := response.Body.String(); got != tt.body {
+				t.Errorf("body = %q, want %q", got, tt.body)
+			}
+			if got := response.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+				t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", got)
+			}
+			if got := response.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+			}
+			if got := response.Header().Get("WWW-Authenticate"); got != "" {
+				t.Errorf("WWW-Authenticate = %q, want it absent", got)
+			}
 			record := oneLogLine(t, captured.String())
-			if record["status"] != float64(tt.want) {
-				t.Errorf("logged status = %v, want %d", record["status"], tt.want)
+			if record["level"] != "warn" || record["failure_class"] != strings.TrimSuffix(tt.body, "\n") || record["status"] != float64(tt.want) {
+				t.Errorf("refusal log = %v, want warn %q with status %d", record, strings.TrimSuffix(tt.body, "\n"), tt.want)
+			}
+			if record["method"] != http.MethodGet || record["path"] != CallbackPath {
+				t.Errorf("refusal location = (%v, %v), want (GET, %q)", record["method"], record["path"], CallbackPath)
+			}
+			if _, present := record["auth_refusal"]; present {
+				t.Errorf("auth_refusal = %v, want it absent", record["auth_refusal"])
 			}
 		})
 	}
@@ -574,9 +711,24 @@ func TestCallbackWritesOneFailureLineWhenFlowIsUnavailable(t *testing.T) {
 	if response.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
 	}
+	if got := response.Body.String(); got != "authorization is unavailable\n" {
+		t.Errorf("body = %q, want authorization is unavailable\\n", got)
+	}
+	if got := response.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", got)
+	}
+	if got := response.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
 	record := oneLogLine(t, captured.String())
-	if record["status"] != float64(http.StatusServiceUnavailable) {
-		t.Errorf("logged status = %v, want %d", record["status"], http.StatusServiceUnavailable)
+	if record["level"] != "warn" || record["failure_class"] != "authorization is unavailable" || record["status"] != float64(http.StatusServiceUnavailable) {
+		t.Errorf("refusal log = %v, want warn authorization is unavailable with status %d", record, http.StatusServiceUnavailable)
+	}
+	if record["method"] != http.MethodGet || record["path"] != CallbackPath {
+		t.Errorf("refusal location = (%v, %v), want (GET, %q)", record["method"], record["path"], CallbackPath)
+	}
+	if _, present := record["auth_refusal"]; present {
+		t.Errorf("auth_refusal = %v, want it absent", record["auth_refusal"])
 	}
 }
 
