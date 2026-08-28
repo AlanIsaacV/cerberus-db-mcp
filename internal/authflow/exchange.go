@@ -96,10 +96,15 @@ type credentialFlow struct {
 	redirectURIs  []string
 	allowed       map[string]bool
 	sealer        *auth.Sealer
-	stateAEAD     cipher.AEAD
-	httpClient    *http.Client
-	tokenURL      string
-	tokeninfoURL  string
+	// sealAuthorizationCode is this flow's testable code sealer. It exists apart
+	// from sealer because the failure exit below is the kind of thing a test has to
+	// stand on, and calling sealer directly would leave it unreachable; sealer is
+	// still here because token.go needs it for the other seal and unseal calls.
+	sealAuthorizationCode func(auth.AuthorizationCodeCredential) (string, error)
+	stateAEAD             cipher.AEAD
+	httpClient            *http.Client
+	tokenURL              string
+	tokeninfoURL          string
 	// now is this flow's clock. It exists for the reason internal/auth's
 	// newMiddlewareWithSealer takes one: both expiry boundaries this package owns —
 	// the authorization code's five minutes and the access credential's hour — are
@@ -152,18 +157,19 @@ func newCredentialFlow(config Config, authentication auth.Config, google endpoin
 		return nil, errRedirectingHTTPClient
 	}
 	return &credentialFlow{
-		clientID:      authentication.ClientID,
-		clientSecret:  config.ClientSecret,
-		publicBaseURL: config.PublicBaseURL,
-		callbackURL:   config.PublicBaseURL + CallbackPath,
-		redirectURIs:  config.ClientRedirectURIs,
-		allowed:       allowed,
-		sealer:        sealer,
-		stateAEAD:     stateAEAD,
-		httpClient:    client,
-		tokenURL:      google.tokenURL,
-		tokeninfoURL:  google.tokeninfoURL,
-		now:           time.Now,
+		clientID:              authentication.ClientID,
+		clientSecret:          config.ClientSecret,
+		publicBaseURL:         config.PublicBaseURL,
+		callbackURL:           config.PublicBaseURL + CallbackPath,
+		redirectURIs:          config.ClientRedirectURIs,
+		allowed:               allowed,
+		sealer:                sealer,
+		sealAuthorizationCode: sealer.SealAuthorizationCode,
+		stateAEAD:             stateAEAD,
+		httpClient:            client,
+		tokenURL:              google.tokenURL,
+		tokeninfoURL:          google.tokeninfoURL,
+		now:                   time.Now,
 	}, nil
 }
 
@@ -313,7 +319,7 @@ func (f *credentialFlow) finish(w http.ResponseWriter, r *http.Request) (complet
 	if !bool(identity.Verified) || !f.allows(identity.Email) {
 		return completion{}, errIdentityRefused
 	}
-	sealedCredential, err := f.sealer.SealAuthorizationCode(auth.AuthorizationCodeCredential{
+	sealedCredential, err := f.sealAuthorizationCode(auth.AuthorizationCodeCredential{
 		UpstreamSecret:      token.RefreshToken,
 		Subject:             identity.Subject,
 		Email:               identity.Email,
@@ -323,11 +329,11 @@ func (f *credentialFlow) finish(w http.ResponseWriter, r *http.Request) (complet
 		ExpiresAt:           f.now().Add(codeLifetime),
 	})
 	if err != nil {
-		return completion{}, errFlowUnavailable
+		return completion{}, errors.Join(errFlowUnavailable, &flowFailure{stage: "authorization_code_seal"})
 	}
 	target, err := url.Parse(state.ClientRedirectURI)
 	if err != nil {
-		return completion{}, errFlowUnavailable
+		return completion{}, errors.Join(errFlowUnavailable, &flowFailure{stage: "redirect_uri_parse"})
 	}
 	values := target.Query()
 	values.Set("code", sealedCredential)

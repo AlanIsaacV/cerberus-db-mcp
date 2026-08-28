@@ -46,6 +46,14 @@ func (f *googleFailure) Error() string {
 	return fmt.Sprintf("Google %s failed during %s", f.call, f.stage)
 }
 
+type flowFailure struct {
+	stage string
+}
+
+func (f *flowFailure) Error() string {
+	return fmt.Sprintf("authorization flow failed during %s", f.stage)
+}
+
 // googleFailureFields keeps the response independent from Google's wording:
 // those facts help an operator diagnose an outbound call, but giving them to a
 // client would disclose what an upstream service said about its request.
@@ -54,10 +62,25 @@ func googleFailureFields(event *zerolog.Event, err error) *zerolog.Event {
 	if !errors.As(err, &failure) {
 		return event
 	}
-	return event.
+	event = event.
 		Str("google_call", failure.call).
-		Str("google_stage", failure.stage).
-		Int("google_status", failure.status).
-		Str("google_error", failure.oauth).
-		Str("google_error_description", failure.description)
+		Str("google_stage", failure.stage)
+	if failure.status != 0 {
+		event = event.Int("google_status", failure.status)
+	}
+	if failure.oauth != "" {
+		event = event.Str("google_error", failure.oauth)
+	}
+	if failure.description != "" {
+		event = event.Str("google_error_description", failure.description)
+	}
+	return event
+}
+
+func flowFailureFields(event *zerolog.Event, err error) *zerolog.Event {
+	var failure *flowFailure
+	if !errors.As(err, &failure) {
+		return event
+	}
+	return event.Str("flow_stage", failure.stage)
 }

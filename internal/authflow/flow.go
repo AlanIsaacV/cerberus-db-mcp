@@ -270,7 +270,7 @@ func (h *Handlers) callback(w http.ResponseWriter, r *http.Request) {
 			FailureClass: message,
 			Message:      "the authorization callback refused a response",
 			Fields: func(event *zerolog.Event) *zerolog.Event {
-				return googleFailureFields(event, err)
+				return flowFailureFields(googleFailureFields(event, err), err)
 			},
 		})
 		return

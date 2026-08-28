@@ -62,10 +62,11 @@ type fakeGoogle struct {
 	// tokenStatus and tokenBody, when set, are what the token endpoint answers
 	// instead of a token: Google refusing a grant it will not honour any more.
 	// They are set before the fake is used and read-only after.
-	tokenStatus     int
-	tokenBody       string
-	tokeninfoStatus int
-	tokeninfoBody   string
+	tokenStatus             int
+	tokenBody               string
+	tokeninfoStatus         int
+	tokeninfoBody           string
+	tokeninfoTransportError bool
 	// rotatedRefresh is the refresh token the *refresh* grant answers with. Empty
 	// is the normal case and the default: Google's answer to a refresh grant
 	// carries an access token and no new refresh token.
@@ -141,7 +142,9 @@ func (f *fakeGoogle) RoundTrip(r *http.Request) (*http.Response, error) {
 			body = `{"access_token":"` + f.accessToken + `","refresh_token":"` + f.refresh + `"}`
 		}
 	case "/tokeninfo":
-		if f.tokeninfoStatus != 0 {
+		if f.tokeninfoTransportError {
+			return nil, errors.New("tokeninfo transport unavailable")
+		} else if f.tokeninfoStatus != 0 {
 			status, body = f.tokeninfoStatus, f.tokeninfoBody
 		} else if f.tokeninfoBody != "" {
 			body = f.tokeninfoBody
@@ -602,13 +605,51 @@ func TestCallbackNamesTheGoogleFailureThatRefusedIt(t *testing.T) {
 			if got, ok := record["google_status"].(float64); !ok || int(got) != tt.status {
 				t.Errorf("google_status = %v, want %d", record["google_status"], tt.status)
 			}
-			if record["google_error"] != tt.oauth || record["google_error_description"] != tt.description {
-				t.Errorf("Google OAuth detail = (%v, %v), want (%q, %q)", record["google_error"], record["google_error_description"], tt.oauth, tt.description)
+			if tt.oauth != "" {
+				for _, key := range []string{"google_error", "google_error_description"} {
+					if _, present := record[key]; !present {
+						t.Errorf("%s is absent, want it present", key)
+					}
+				}
+				if record["google_error"] != tt.oauth || record["google_error_description"] != tt.description {
+					t.Errorf("Google OAuth detail = (%v, %v), want (%q, %q)", record["google_error"], record["google_error_description"], tt.oauth, tt.description)
+				}
+			} else {
+				for _, key := range []string{"google_error", "google_error_description"} {
+					if value, present := record[key]; present {
+						t.Errorf("%s = %v, want it absent", key, value)
+					}
+				}
 			}
 			if (tt.description != "" && strings.Contains(response.Body.String(), tt.description)) || (tt.oauth != "" && strings.Contains(response.Body.String(), tt.oauth)) {
 				t.Error("the callback response carries Google's refusal detail")
 			}
 		})
+	}
+}
+
+func TestCallbackOmitsUnsetGoogleFailureDetailsAfterTransportFailure(t *testing.T) {
+	fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: true}, testRefreshToken)
+	fake.tokeninfoTransportError = true
+	var captured bytes.Buffer
+	handlers := testHandlers(t, fake, &captured)
+
+	response := callbackRequest(t, handlers, callbackStateForTest(t, handlers))
+
+	if response.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusBadGateway)
+	}
+	record := oneLogLine(t, captured.String())
+	if record["google_call"] != "tokeninfo_endpoint" || record["google_stage"] != "transport" {
+		t.Errorf("Google failure = call %v, stage %v, want tokeninfo_endpoint at transport", record["google_call"], record["google_stage"])
+	}
+	for _, key := range []string{"google_status", "google_error", "google_error_description"} {
+		if value, present := record[key]; present {
+			t.Errorf("%s = %v, want it absent", key, value)
+		}
+	}
+	if strings.Contains(captured.String(), fake.accessToken) {
+		t.Errorf("transport failure log contains access token %q", fake.accessToken)
 	}
 }
 
@@ -729,6 +770,31 @@ func TestCallbackWritesOneFailureLineWhenFlowIsUnavailable(t *testing.T) {
 	}
 	if _, present := record["auth_refusal"]; present {
 		t.Errorf("auth_refusal = %v, want it absent", record["auth_refusal"])
+	}
+	if record["flow_stage"] != "redirect_uri_parse" {
+		t.Errorf("flow_stage = %v, want redirect_uri_parse", record["flow_stage"])
+	}
+}
+
+func TestCallbackNamesSealAuthorizationCodeFailure(t *testing.T) {
+	fake := newFakeGoogle(t, googleIdentity{Subject: "sub-1", Email: "one@example.test", Verified: true}, testRefreshToken)
+	var captured bytes.Buffer
+	handlers := testHandlers(t, fake, &captured)
+	handlers.flow.sealAuthorizationCode = func(auth.AuthorizationCodeCredential) (string, error) {
+		return "", errors.New("authorization code sealing unavailable")
+	}
+
+	response := callbackRequest(t, handlers, callbackStateForTest(t, handlers))
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if got := response.Body.String(); got != "authorization is unavailable\n" {
+		t.Errorf("body = %q, want authorization is unavailable\\n", got)
+	}
+	record := oneLogLine(t, captured.String())
+	if record["flow_stage"] != "authorization_code_seal" {
+		t.Errorf("flow_stage = %v, want authorization_code_seal", record["flow_stage"])
 	}
 }
 
