@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.6.0 - 2026-08-28
+
+
+### Features
+
+- Log by level
+
+- Improve responses
+
+- The seam guard and the mux's own two refusals
+
+- The two gaps in exchange.go
+
+- Add level
+
+
+### Fixes
+
+- Token exchange flow
+
+
 ## v0.5.0 - 2026-08-25
 
 
