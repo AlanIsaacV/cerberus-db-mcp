@@ -161,6 +161,26 @@ func TestDateTimeBuiltins(t *testing.T) {
 		{name: "mysql time", engine: MySQL, statement: "SELECT TIME(created_at) FROM t"},
 		{name: "mysql timestamp with one argument", engine: MySQL, statement: "SELECT TIMESTAMP(created_at) FROM t"},
 		{name: "mysql timestamp with two arguments", engine: MySQL, statement: "SELECT TIMESTAMP(created_at, '01:00:00') FROM t"},
+		{
+			name: "postgresql day in Bogota by timezone", engine: PostgreSQL,
+			statement: "SELECT date_trunc('day', timezone('America/Bogota', created_at)) AS day, COUNT(*) FROM t GROUP BY day",
+		},
+		{
+			name: "postgresql day in Bogota by date_bin", engine: PostgreSQL,
+			statement: "SELECT date_bin('1 day', created_at, TIMESTAMPTZ '2026-01-01 00:00:00-05') AS day, COUNT(*) FROM t GROUP BY day",
+		},
+		{name: "postgresql timezone", engine: PostgreSQL, statement: "SELECT timezone('America/Bogota', created_at) FROM t"},
+		{name: "postgresql date_bin", engine: PostgreSQL, statement: "SELECT date_bin('1 day', created_at, TIMESTAMP '2026-01-01') FROM t"},
+		{name: "postgresql date_subtract", engine: PostgreSQL, statement: "SELECT date_subtract(created_at, INTERVAL '1 day') FROM t"},
+		{name: "postgresql make_date", engine: PostgreSQL, statement: "SELECT make_date(2026, 1, 31)"},
+		{name: "postgresql make_time", engine: PostgreSQL, statement: "SELECT make_time(8, 30, 0)"},
+		{name: "postgresql make_timestamp", engine: PostgreSQL, statement: "SELECT make_timestamp(2026, 1, 31, 8, 30, 0)"},
+		{name: "postgresql make_timestamptz", engine: PostgreSQL, statement: "SELECT make_timestamptz(2026, 1, 31, 8, 30, 0, 'America/Bogota')"},
+		{name: "postgresql make_interval", engine: PostgreSQL, statement: "SELECT make_interval(0, 0, 0, 1)"},
+		{name: "postgresql justify_days", engine: PostgreSQL, statement: "SELECT justify_days(INTERVAL '35 days')"},
+		{name: "postgresql justify_hours", engine: PostgreSQL, statement: "SELECT justify_hours(INTERVAL '27 hours')"},
+		{name: "postgresql justify_interval", engine: PostgreSQL, statement: "SELECT justify_interval(INTERVAL '1 mon -1 hour')"},
+		{name: "postgresql isfinite", engine: PostgreSQL, statement: "SELECT isfinite(created_at) FROM t"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got := g.Validate(tt.engine, tt.statement, nil)
@@ -177,6 +197,10 @@ func TestDateTimeBuiltins(t *testing.T) {
 		{engine: MySQL, names: []string{
 			"convert_tz", "adddate", "subdate", "addtime", "subtime", "time_format",
 			"to_days", "to_seconds", "period_add", "period_diff", "get_format",
+		}},
+		{engine: PostgreSQL, names: []string{
+			"timezone", "date_bin", "date_subtract", "make_date", "make_time", "make_timestamp",
+			"make_timestamptz", "make_interval", "justify_days", "justify_hours", "justify_interval", "isfinite",
 		}},
 	} {
 		for _, engine := range []Engine{MySQL, PostgreSQL, SQLServer} {
@@ -200,6 +224,7 @@ func TestDateTimeBuiltins(t *testing.T) {
 		names  []string
 	}{
 		{engine: MySQL, names: []string{"sysdate"}},
+		{engine: PostgreSQL, names: []string{"clock_timestamp", "statement_timestamp", "timeofday", "transaction_timestamp"}},
 	} {
 		for _, name := range clock.names {
 			t.Run(fmt.Sprintf("%s clock reader %s escalates", clock.engine, name), func(t *testing.T) {

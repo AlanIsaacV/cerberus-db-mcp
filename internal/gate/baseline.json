@@ -248,6 +248,11 @@
       "reason": "PostgreSQL read-only builtins"
     },
     {
+      "engines": ["postgresql"],
+      "names": ["date_bin", "date_subtract", "isfinite", "justify_days", "justify_hours", "justify_interval", "make_date", "make_interval", "make_time", "make_timestamp", "make_timestamptz", "timezone"],
+      "reason": "PostgreSQL date and time builtins that are deterministic and have no side effect; timezone reads only read-only time-zone reference data, and date_subtract and make_timestamptz read the session TimeZone setting only when the zone argument is omitted, as the already-allowed date_add does"
+    },
+    {
       "engines": ["sqlserver"],
       "names": ["choose", "openjson", "parsename", "patindex", "sessionproperty"],
       "reason": "T-SQL read-only builtins"
