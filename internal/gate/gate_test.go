@@ -133,6 +133,53 @@ func TestValidateVerdicts(t *testing.T) {
 	}
 }
 
+func TestDateTimeBuiltins(t *testing.T) {
+	g := newTestGate(t)
+	for _, tt := range []struct {
+		name      string
+		engine    Engine
+		statement string
+	}{
+		{
+			name: "mysql day in Bogota by named zone", engine: MySQL,
+			statement: "SELECT DATE(CONVERT_TZ(created_at, '+00:00', 'America/Bogota')) AS day, COUNT(*) FROM t GROUP BY day",
+		},
+		{
+			name: "mysql day in Bogota by offset", engine: MySQL,
+			statement: "SELECT DATE(CONVERT_TZ(created_at, '+00:00', '-05:00')) AS day, COUNT(*) FROM t GROUP BY day",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := g.Validate(tt.engine, tt.statement, nil)
+			if got.Verdict != Allow || got.Reason != ReasonReadStatement || got.RuleID != "read-select" {
+				t.Fatalf("Validate = %s/%s/%s (%s), want %s/%s/read-select", got.Verdict, got.Reason, got.RuleID, got.Detail, Allow, ReasonReadStatement)
+			}
+		})
+	}
+
+	for _, only := range []struct {
+		engine Engine
+		names  []string
+	}{
+		{engine: MySQL, names: []string{"convert_tz"}},
+	} {
+		for _, engine := range []Engine{MySQL, PostgreSQL, SQLServer} {
+			if engine == only.engine {
+				continue
+			}
+			for _, name := range only.names {
+				t.Run(fmt.Sprintf("%s-only %s escalates on %s", only.engine, name, engine), func(t *testing.T) {
+					got := g.Validate(engine, fmt.Sprintf("SELECT %s(a) FROM t", strings.ToUpper(name)), nil)
+					want := []string{"function:" + name}
+					if got.Verdict != NeedsApproval || !slices.Equal(got.Pending, want) {
+						t.Fatalf("Validate = %s/%s pending %v (%s), want %s pending %v", got.Verdict, got.Reason, got.Pending, got.Detail, NeedsApproval, want)
+					}
+				})
+			}
+		}
+	}
+}
+
 // TestGrantIsRuleScoped covers the four halves of the grant contract: a grant
 // for the only obstacle allows, the same statement without it escalates, a
 // grant for a different rule changes nothing, and a grant naming a terminal

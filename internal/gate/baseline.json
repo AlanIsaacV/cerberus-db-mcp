@@ -238,6 +238,11 @@
       "reason": "MySQL builtins whose names are control-flow keywords or metadata elsewhere"
     },
     {
+      "engines": ["mysql"],
+      "names": ["convert_tz"],
+      "reason": "MySQL date and time builtins that are deterministic, have no side effect and read no session or server state beyond read-only time-zone reference data"
+    },
+    {
       "engines": ["postgresql"],
       "names": ["generate_series", "array_agg", "array_length", "array_position", "array_to_string", "age", "json_object_agg", "setseed"],
       "reason": "PostgreSQL read-only builtins"
