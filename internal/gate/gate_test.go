@@ -148,6 +148,19 @@ func TestDateTimeBuiltins(t *testing.T) {
 			name: "mysql day in Bogota by offset", engine: MySQL,
 			statement: "SELECT DATE(CONVERT_TZ(created_at, '+00:00', '-05:00')) AS day, COUNT(*) FROM t GROUP BY day",
 		},
+		{name: "mysql adddate", engine: MySQL, statement: "SELECT ADDDATE(created_at, INTERVAL 1 DAY) FROM t"},
+		{name: "mysql subdate", engine: MySQL, statement: "SELECT SUBDATE(created_at, INTERVAL 7 DAY) FROM t"},
+		{name: "mysql addtime", engine: MySQL, statement: "SELECT ADDTIME(created_at, '05:00:00') FROM t"},
+		{name: "mysql subtime", engine: MySQL, statement: "SELECT SUBTIME(created_at, '05:00:00') FROM t"},
+		{name: "mysql time_format", engine: MySQL, statement: "SELECT TIME_FORMAT(duration, '%H:%i') FROM t"},
+		{name: "mysql to_days", engine: MySQL, statement: "SELECT TO_DAYS(updated_at) - TO_DAYS(created_at) FROM t"},
+		{name: "mysql to_seconds", engine: MySQL, statement: "SELECT TO_SECONDS(created_at) FROM t"},
+		{name: "mysql period_add", engine: MySQL, statement: "SELECT PERIOD_ADD(202601, 3)"},
+		{name: "mysql period_diff", engine: MySQL, statement: "SELECT PERIOD_DIFF(202610, 202601)"},
+		{name: "mysql get_format", engine: MySQL, statement: "SELECT DATE_FORMAT(created_at, GET_FORMAT(DATE, 'EUR')) FROM t"},
+		{name: "mysql time", engine: MySQL, statement: "SELECT TIME(created_at) FROM t"},
+		{name: "mysql timestamp with one argument", engine: MySQL, statement: "SELECT TIMESTAMP(created_at) FROM t"},
+		{name: "mysql timestamp with two arguments", engine: MySQL, statement: "SELECT TIMESTAMP(created_at, '01:00:00') FROM t"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got := g.Validate(tt.engine, tt.statement, nil)
@@ -161,7 +174,10 @@ func TestDateTimeBuiltins(t *testing.T) {
 		engine Engine
 		names  []string
 	}{
-		{engine: MySQL, names: []string{"convert_tz"}},
+		{engine: MySQL, names: []string{
+			"convert_tz", "adddate", "subdate", "addtime", "subtime", "time_format",
+			"to_days", "to_seconds", "period_add", "period_diff", "get_format",
+		}},
 	} {
 		for _, engine := range []Engine{MySQL, PostgreSQL, SQLServer} {
 			if engine == only.engine {
@@ -176,6 +192,23 @@ func TestDateTimeBuiltins(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+
+	for _, clock := range []struct {
+		engine Engine
+		names  []string
+	}{
+		{engine: MySQL, names: []string{"sysdate"}},
+	} {
+		for _, name := range clock.names {
+			t.Run(fmt.Sprintf("%s clock reader %s escalates", clock.engine, name), func(t *testing.T) {
+				got := g.Validate(clock.engine, fmt.Sprintf("SELECT %s()", strings.ToUpper(name)), nil)
+				want := []string{"function:" + name}
+				if got.Verdict != NeedsApproval || !slices.Equal(got.Pending, want) {
+					t.Fatalf("Validate = %s/%s pending %v (%s), want %s pending %v", got.Verdict, got.Reason, got.Pending, got.Detail, NeedsApproval, want)
+				}
+			})
 		}
 	}
 }

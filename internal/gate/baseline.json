@@ -239,7 +239,7 @@
     },
     {
       "engines": ["mysql"],
-      "names": ["convert_tz"],
+      "names": ["adddate", "addtime", "convert_tz", "get_format", "period_add", "period_diff", "subdate", "subtime", "time_format", "to_days", "to_seconds"],
       "reason": "MySQL date and time builtins that are deterministic, have no side effect and read no session or server state beyond read-only time-zone reference data"
     },
     {
