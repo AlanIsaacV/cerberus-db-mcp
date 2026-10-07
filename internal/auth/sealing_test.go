@@ -19,6 +19,20 @@ func testSealer(t *testing.T, secret Secret) *Sealer {
 	return s
 }
 
+// tamperedSealed changes one character of a sealed credential's payload. It
+// edits the second-to-last character rather than the last: unpadded base64
+// leaves the last character's low bits unused and the decoder ignores them, so
+// an edit there decodes to the same bytes about one time in ten and the
+// "tampered" credential opens.
+func tamperedSealed(sealed string) string {
+	i := len(sealed) - 2
+	replacement := "A"
+	if sealed[i] == 'A' {
+		replacement = "B"
+	}
+	return sealed[:i] + replacement + sealed[i+1:]
+}
+
 func TestASealerIsRedactedByEveryOrdinaryRendering(t *testing.T) {
 	sealer := testSealer(t, testSealingSecret)
 	for _, tt := range []struct {

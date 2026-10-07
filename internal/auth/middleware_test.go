@@ -879,11 +879,7 @@ func TestASealedCredentialThatCannotAuthenticateIsChallenged(t *testing.T) {
 				if err != nil {
 					return "", err
 				}
-				last := "A"
-				if strings.HasSuffix(sealed, last) {
-					last = "B"
-				}
-				return sealed[:len(sealed)-1] + last, nil
+				return tamperedSealed(sealed), nil
 			},
 			class: failureSealedCredentialCorrupt,
 		},
@@ -1512,12 +1508,8 @@ func TestAChallengedRefusalPointsAtTheProtectedResourceDocument(t *testing.T) {
 					Subject: "sub-1", Email: "one@example.test", Verified: true,
 					ExpiresAt: time.Now().Add(time.Hour),
 				})
-				last := "A"
-				if strings.HasSuffix(sealed, last) {
-					last = "B"
-				}
 				return newMiddleware(cfg, testPublicBaseURL, discardLogger(), neverAsked(t)),
-					[]string{"Bearer " + sealed[:len(sealed)-1] + last}
+					[]string{"Bearer " + tamperedSealed(sealed)}
 			},
 		},
 		{
