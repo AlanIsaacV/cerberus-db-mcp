@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.7.0 - 2026-10-03
+
+
+### Features
+
+- Allow CONVERT_TZ on MySQL
+
+- Allow the remaining pure MySQL date and time builtins
+
+- Allow pure PostgreSQL date and time builtins
+
+
 ## v0.6.0 - 2026-08-28
 
 
@@ -72,6 +84,10 @@ All notable changes to this project are documented in this file.
 
 ### Features
 
+- Improve `list_database`
+
+- Wide schema
+
 - Add tool to search in schema
 
 
@@ -91,8 +107,4 @@ All notable changes to this project are documented in this file.
 - Add mcp auth and CI/CD
 
 - Replace `_DATABASE` by an optional `_DATABASES`
-
-- Improve `list_database`
-
-- Wide schema
 
