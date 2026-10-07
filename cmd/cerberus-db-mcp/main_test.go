@@ -21,6 +21,7 @@ import (
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/authflow"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 )
 
 // This file exists because this package reported "no test files" while holding the
@@ -330,6 +331,51 @@ func TestTheProcessRefusesToStartWithoutAClientRedirectRegistryBeforeItOpensAnyt
 	err := run(zerolog.New(&lockedBuffer{}))
 	if !errors.Is(err, authflow.ErrNoClientRedirectURIs) {
 		t.Fatalf("run() = %v, want an error wrapping authflow.ErrNoClientRedirectURIs", err)
+	}
+}
+
+func TestTheProcessRefusesAnUnusableGateOverlayBeforeItBinds(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+		want error
+	}{
+		{"malformed JSON", `{"version":1,`, gate.ErrInvalidRuleset},
+		{"an unknown field", `{"version":1,"unknown":true}`, gate.ErrInvalidRuleset},
+		{"a rule removal that fails validation", `{"version":1,"remove_rules":["no-such-rule"]}`, gate.ErrInvalidRuleset},
+		{"a configured path with no file", "", os.ErrNotExist},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			held, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("hold a port: %v", err)
+			}
+			defer func() { _ = held.Close() }()
+			testEnvironment(t, held.Addr().String())
+			t.Setenv("CERBERUS_AUTH_GOOGLE_CLIENT_ID", "1234567890-abcdefghijklmnop.apps.googleusercontent.com")
+			t.Setenv("CERBERUS_AUTH_ALLOWED_EMAILS", "one@example.test")
+			t.Setenv("CERBERUS_AUTH_SEALING_SECRET", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+
+			path := filepath.Join(t.TempDir(), "overlay.json")
+			if tt.body != "" {
+				if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+					t.Fatalf("write overlay: %v", err)
+				}
+			}
+			t.Setenv("CERBERUS_MCP_GATE_OVERLAY", path)
+
+			appLog := &lockedBuffer{}
+			err = run(zerolog.New(appLog))
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("run() = %v, want an error wrapping %v", err, tt.want)
+			}
+			if !strings.Contains(err.Error(), path) {
+				t.Errorf("run() = %v, want the error to name the overlay path", err)
+			}
+			if strings.Contains(appLog.String(), "serving MCP") || strings.Contains(appLog.String(), "gate ruleset loaded") {
+				t.Errorf("the process logged a load or a listener before refusing the overlay: %s", appLog.String())
+			}
+		})
 	}
 }
 

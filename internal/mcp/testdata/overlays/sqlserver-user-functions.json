@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "safe_functions": [
+    {
+      "engines": ["sqlserver"],
+      "names": ["dbo.fn_tblsaldosclientes", "dbo.fn_operacionesporcumplir"],
+      "reason": "user table-valued functions the login may read, reviewed for an investigation"
+    }
+  ]
+}

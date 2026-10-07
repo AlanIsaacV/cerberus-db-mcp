@@ -1,9 +1,7 @@
 package gate
 
 import (
-	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -79,8 +77,8 @@ type Gate struct {
 // whose rules failed to load or validate: a gate with no rules must be
 // impossible to construct.
 //
-// An overlayPath that does not exist is not an error — the baseline is then in
-// force. Any other read failure is.
+// An overlayPath that does not exist is an error, like any other read failure:
+// a configured overlay that cannot be read never falls back to the baseline.
 func New(overlayPath string) (*Gate, error) {
 	g := &Gate{overlayPath: overlayPath}
 	c, err := g.loadRules()
@@ -220,9 +218,6 @@ func (g *Gate) loadRules() (*compiled, error) {
 	}
 	ov, err := loadOverlay(g.overlayPath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return compile(base), nil
-		}
 		return nil, err
 	}
 	merged, err := merge(base, ov)

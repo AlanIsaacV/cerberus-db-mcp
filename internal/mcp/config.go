@@ -25,7 +25,8 @@ var (
 
 // Config is the whole of this package's configuration. Like internal/db's, it
 // comes from the environment and only from the environment: there is no
-// configuration file and nothing here reads one.
+// configuration file and nothing here reads one. The one path it carries,
+// GateOverlay, names a gate ruleset overlay that internal/gate reads.
 type Config struct {
 	// Address is where the HTTP listener binds.
 	//
@@ -60,6 +61,8 @@ type Config struct {
 	// LogLevel controls application logging. It deliberately does not control the
 	// audit stream, which builds and owns a separate logger.
 	LogLevel zerolog.Level `env:"CERBERUS_MCP_LOG_LEVEL" envDefault:"info"`
+
+	GateOverlay string `env:"CERBERUS_MCP_GATE_OVERLAY"`
 }
 
 // pathRejected are the characters [Config.Path] may not contain: every ASCII
@@ -118,6 +121,7 @@ func withoutEmptyValues(environ map[string]string) map[string]string {
 // TestVariableFormsCoverEveryField keeps it in step with the struct's tags.
 var variableForms = map[string]struct{ variable, form string }{
 	"Address":         {"CERBERUS_MCP_ADDRESS", "a host and port, such as 127.0.0.1:8080"},
+	"GateOverlay":     {"CERBERUS_MCP_GATE_OVERLAY", "the path of a gate ruleset overlay file, or empty for the baseline alone"},
 	"LogLevel":        {"CERBERUS_MCP_LOG_LEVEL", "one of debug, info, warn, or error"},
 	"Path":            {"CERBERUS_MCP_PATH", "an absolute path with no spaces or braces, such as /mcp"},
 	"ShutdownTimeout": {"CERBERUS_MCP_SHUTDOWN_TIMEOUT", "a duration with a unit, such as 30s"},

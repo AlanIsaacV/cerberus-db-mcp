@@ -647,17 +647,46 @@ func copyFixture(t *testing.T, name, dest string) {
 	}
 }
 
-func TestMissingOverlayLeavesTheBaselineInForce(t *testing.T) {
-	g, err := New(filepath.Join(t.TempDir(), "absent.json"))
-	if err != nil {
-		t.Fatalf("New(absent path) = %v", err)
-	}
-	if got := g.Validate(MySQL, "SELECT 1", nil); got.Verdict != Allow {
-		t.Fatalf("Validate = %s, want allow under the baseline", got.Verdict)
-	}
-	if got := g.Validate(MySQL, "DROP TABLE t", nil); got.Verdict != Deny {
-		t.Fatalf("Validate = %s, want deny under the baseline", got.Verdict)
-	}
+func TestMissingConfiguredOverlayIsAnError(t *testing.T) {
+	t.Run("at construction", func(t *testing.T) {
+		g, err := New(filepath.Join(t.TempDir(), "absent.json"))
+		if err == nil {
+			t.Fatalf("New(absent path) = nil error, want one")
+		}
+		if g != nil {
+			t.Fatalf("New(absent path) returned a gate alongside %v", err)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("New(absent path) = %v, want it to wrap os.ErrNotExist", err)
+		}
+	})
+
+	t.Run("at reload, keeping the previous ruleset", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "overlay.json")
+		copyFixture(t, "valid-overlay.json", path)
+		g, err := New(path)
+		if err != nil {
+			t.Fatalf("New = %v", err)
+		}
+		probes := []string{"SELECT dbo.CalcularSaldo(1)", "VALUES (1)", "SELECT 1", "DROP TABLE t"}
+		before := make([]Decision, len(probes))
+		for i, p := range probes {
+			before[i] = g.Validate(SQLServer, p, nil)
+		}
+
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove overlay: %v", err)
+		}
+		err = g.Reload()
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Reload() with the overlay deleted = %v, want an error wrapping os.ErrNotExist", err)
+		}
+		for i, p := range probes {
+			if got := g.Validate(SQLServer, p, nil); !sameDecision(got, before[i]) {
+				t.Fatalf("after reloading a deleted overlay %q = %+v, want %+v", p, got, before[i])
+			}
+		}
+	})
 }
 
 func TestFailedReloadLeavesThePreviousRulesetInForce(t *testing.T) {

@@ -43,8 +43,9 @@ and CI grades exactly the engines it graded before.
 ## Configuration
 
 Copy the root `.env.example` to an untracked `.env` and fill in the required
-values. Configuration is environment-only: no configuration file is read by the
-process, and the `.env` file must not be committed. The deployment compose file
+values. Configuration is environment-only: the one file the process reads is the
+gate overlay `CERBERUS_MCP_GATE_OVERLAY` names, which holds gate rules and never a
+credential, and the `.env` file must not be committed. The deployment compose file
 loads an `.env` beside it.
 
 ### Required
@@ -120,6 +121,9 @@ connect.
 - `CERBERUS_MCP_SHUTDOWN_TIMEOUT` defaults to `30s`.
 - `CERBERUS_MCP_LOG_LEVEL` defaults to `info`; accepted values are `debug`,
   `info`, `warn`, and `error`.
+- `CERBERUS_MCP_GATE_OVERLAY` is optional. Empty or unset, the gate runs the
+  ruleset embedded in the binary and nothing else; set, it is the path of an
+  overlay file applied on top of it — see "Gate overlay" below.
 
 The process also refuses to start when a configured PostgreSQL alias has a
 non-empty `PGSERVICE` or `PGSERVICEFILE`, or when a configured SQL Server alias
@@ -310,6 +314,112 @@ and SQL Server reads `sys.*`, neither of which filters the column list by
 privilege. MySQL reads `information_schema`, which does: a MySQL login without
 permission on a column receives a short column list with no error.
 
+### Gate overlay
+
+The statement gate's rules are embedded in the binary; that set is the baseline.
+`CERBERUS_MCP_GATE_OVERLAY` names a JSON file applied on top of it, which is how
+an exception to the gate is made by configuration rather than by publishing a
+release. An overlay is the only input that can widen the gate: it can remove a
+baseline rule, add a safe function, or raise `max_statement_bytes`. It is
+therefore the operator's alone. No MCP tool and no HTTP route reads it, changes
+it, or reloads it, and every load is logged.
+
+The format is strict JSON. `version` must be `1`, an unknown field is an error,
+and every other field is optional:
+
+- `safe_functions` adds groups of function names, each group with `names`, an
+  optional `engines` list (`mysql`, `postgresql`, `sqlserver`; empty means all
+  three), and a `reason`. A name called as a function and absent from the
+  allowlist holds the statement as `needs-approval`, and `execute_query` has no
+  approval path, so a function the agent needs to call has to be named here.
+- `remove_safe_functions` takes names off the baseline allowlist.
+- `read_statements`, `forbidden_statements`, and `forbidden_functions` add rules,
+  each with `id`, `match`, `reason`, and an optional `engines` list.
+- `remove_rules` drops baseline rules by ID. An ID that does not exist is an
+  error rather than a no-op. Removing an ID and adding a rule with the same ID
+  replaces that rule.
+- `non_function_keywords` adds words that may be followed by `(` without that
+  being a function call.
+- `max_statement_bytes` replaces the baseline's bound. It cannot go below `4096`.
+- `notes` is free text for whoever reviews the file.
+
+The merged result is validated whole before it takes effect. In particular, a
+safe function whose name is also a forbidden keyword is refused unless that
+keyword's rule carries a `safe_as_function` argument; when it does, the name
+lets that keyword through when it is called as a function, and the load event
+lists the declaration under `exemptions`.
+
+To let the agent read two SQL Server user table-valued functions:
+
+```json
+{
+  "version": 1,
+  "safe_functions": [
+    {
+      "engines": ["sqlserver"],
+      "names": ["dbo.fn_tblsaldosclientes", "dbo.fn_operacionesporcumplir"],
+      "reason": "user table-valued functions the login may read, reviewed for an investigation"
+    }
+  ]
+}
+```
+
+Names are written in lowercase and match case-insensitively. A schema-qualified
+name matches only that same qualification: `dbo.fn_tblsaldosclientes` allows
+`dbo.fn_tblSaldosClientes(...)` and `[dbo].[fn_tblSaldosClientes](...)`, but not
+the bare `fn_tblSaldosClientes(...)` nor the database-qualified
+`dbOyD.dbo.fn_tblSaldosClientes(...)`. Name each form the agent will write.
+
+#### What each load logs
+
+Startup and every reload write one event to the application log with
+`trigger` (`startup` or `reload`), `overlay_configured`, `overlay_path`, a `diff`
+against the baseline, and `exemptions`, the `safe_as_function` declarations in
+force. The event carries `"level":"info"`, but `CERBERUS_MCP_LOG_LEVEL` does
+not suppress it: at `warn` or `error` every load is still written. Its message is `gate ruleset loaded: no overlay is configured, so the
+baseline is in force` or `gate ruleset loaded: the overlay was applied on top of
+the baseline`. The `diff` always carries every category, empty when nothing
+changed:
+
+- `rules_added` and `rules_removed`, each entry with its `id`, `kind`
+  (`read_statement`, `forbidden_statement`, or `forbidden_function`), `match`,
+  `engines`, `prefix`, `safe_as_function`, and `reason`. `engines` always lists
+  the engines the rule applies to; a rule declared without `engines` is written
+  with all three;
+- `rules_replaced`, each entry with its `id` and the rule as it is in the
+  baseline under `baseline` and as it is now under `in_force`, both with the
+  fields above other than `id`. A replacement that narrows a forbidden rule's
+  `engines` stops forbidding it on the engines it dropped, and shows here as
+  `engines` differing between the two;
+- `safe_functions_added` and `safe_functions_removed`, keyed by engine;
+- `non_function_keywords_added`;
+- `max_statement_bytes_changed`, `null` unless the bound differs, and otherwise
+  `baseline` and `in_force`.
+
+An overlay of `{"version":1}` produces an empty diff.
+
+At startup, a configured overlay that is missing, unreadable, malformed, or
+fails validation stops the process before it listens. The log then reads
+`cerberus-db-mcp is exiting on an error` with the error `gate overlay "<path>"
+from CERBERUS_MCP_GATE_OVERLAY could not be loaded: <reason>`, and the process
+exits `1`. It never falls back to the baseline.
+
+#### Reloading and returning to the baseline
+
+`SIGHUP` re-reads the file at the same path and swaps the ruleset in place,
+without a restart and without dropping a session; see "Raspberry Pi deployment"
+below for the command. A reload that fails for any of the startup reasons
+leaves the previous ruleset entirely in force and writes one error event,
+`gate overlay rejected on reload; the previous ruleset remains in force`, with
+`overlay_path`, `error`, and `previous_ruleset_in_force: true`. A `SIGHUP` with
+no overlay configured changes nothing and writes a warning saying so. A changed
+path is not picked up by a reload; it takes a restart.
+
+To return to the baseline, replace the file's content with `{"version":1}` and
+reload, or empty `CERBERUS_MCP_GATE_OVERLAY` and restart. Deleting the file does
+not: a configured overlay that is missing is rejected on reload and refuses the
+next startup.
+
 ## Connecting an MCP client
 
 This server signs a client in once. It runs the Google flow itself, and hands the
@@ -441,6 +551,35 @@ compose up -d` can succeed.
 To roll back, pin an older release tag such as `:vX.Y.Z` in the compose file's
 `image:` value, then repeat `docker compose pull && docker compose up -d`.
 
+The compose file also bind-mounts the `gate` directory beside it, read-only, at
+`/etc/cerberus-db-mcp/gate`. It mounts the directory rather than one file so
+that an editor that replaces the file on save still leaves the container seeing
+the new one. The compose file does not set `CERBERUS_MCP_GATE_OVERLAY`; without
+it in `.env`, the service runs the baseline exactly as it would with no mount.
+Create the directory yourself rather than letting Docker create it as `root`:
+the image runs as uid `65532`, so the directory has to be traversable and the
+file readable by that user. To configure an overlay, from the stack directory:
+
+```sh
+mkdir -p gate && chmod 755 gate
+$EDITOR gate/overlay.json
+chmod 644 gate/overlay.json
+echo 'CERBERUS_MCP_GATE_OVERLAY=/etc/cerberus-db-mcp/gate/overlay.json' >> .env
+docker compose up -d
+```
+
+Changing the variable takes `docker compose up -d`, which recreates the
+container. Changing the file takes only a reload. The binary is the container's
+PID 1, so the signal reaches it directly:
+
+```sh
+docker compose kill -s HUP cerberus-db-mcp
+docker compose logs --since 1m cerberus-db-mcp | grep 'gate'
+```
+
+The log shows either the reload event with the new diff or the rejection with
+its reason; "Gate overlay" above describes both.
+
 The external SQL Server is reachable through a VPN that must be up on the Pi,
 not on a laptop. Startup does not ping databases, so the service can start while
 the VPN is down and only fail when the first query attempts to connect.
@@ -529,6 +668,14 @@ events carry `stream=audit`, the verified caller email in `Identity`, and the
 Google subject in `Subject`; container stdout therefore holds personal data.
 Permissions, retention, and rotation are the operator's responsibility to
 configure in Docker on the server.
+
+The application log also records which gate ruleset is in force: one event at
+startup and one on every `SIGHUP`, each with its diff against the baseline, or
+an error event when a reload was rejected. To see the latest:
+
+```sh
+docker compose logs cerberus-db-mcp | grep 'gate ruleset loaded\|gate overlay rejected'
+```
 
 ### Measure memory before tuning it
 

@@ -23,6 +23,8 @@ services:
       # The service must listen beyond container loopback for cloudflared on the
       # shared network; no host port makes that listener reachable only there.
       CERBERUS_MCP_ADDRESS: "0.0.0.0:8080"
+    volumes:
+      - ./gate:/etc/cerberus-db-mcp/gate:ro
     # Starting reservation and ceiling pending measurement on the 2GB Pi already
     # running six services; reserve 128m, cap at 256m, and tune both under load.
     mem_reservation: 128m

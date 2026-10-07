@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 
 	"github.com/rs/zerolog"
@@ -137,13 +138,24 @@ func run(log zerolog.Logger) error {
 		Strs("allowed_identities_normalised", authCfg.Allowlist()).
 		Msg("callers must present a Google credential this client issued, held by an allowlisted identity")
 
-	// The empty overlay path is the embedded baseline ruleset and nothing else.
-	// An overlay can remove a baseline rule and add a safe-function allowance, so
-	// it is an input capable of weakening this process — the argument internal/db
-	// makes about connection parameters in config.go:74-79 — and no variable in
-	// this objective supplies a path, so the binary cannot load one by accident.
-	g, err := gate.New("")
+	// CERBERUS_MCP_GATE_OVERLAY empty is the embedded baseline ruleset and nothing
+	// else. Set, it names an overlay that can remove a baseline rule and add a
+	// safe-function allowance, so it is an input capable of weakening this process
+	// — the argument internal/db makes about connection parameters in
+	// config.go:74-79 — and it is the operator's alone: no tool and no route reads
+	// or reloads it. An overlay that is missing, unreadable, malformed or invalid
+	// refuses startup here, before anything binds, rather than falling back to the
+	// baseline. Every load, here and on each SIGHUP that [mcp.Server.Run] turns into
+	// a reload, is logged with its diff against the baseline and the active
+	// exemptions; a rejected reload keeps the previous ruleset in force.
+	g, err := gate.New(cfg.GateOverlay)
+	if err != nil && cfg.GateOverlay != "" {
+		return fmt.Errorf("gate overlay %q from CERBERUS_MCP_GATE_OVERLAY could not be loaded: %w", cfg.GateOverlay, err)
+	}
 	if err != nil {
+		return err
+	}
+	if err := mcp.LogGateLoad(log, cfg.GateOverlay, g); err != nil {
 		return err
 	}
 
@@ -160,6 +172,7 @@ func run(log zerolog.Logger) error {
 	srv, err := mcp.New(mcp.Deps{
 		Config:   *cfg,
 		Executor: executor,
+		Gate:     g,
 		Log:      log,
 		Audit:    mcp.NewAuditor(os.Stdout),
 		// Wraps the MCP endpoint only, which is internal/mcp's own arrangement and

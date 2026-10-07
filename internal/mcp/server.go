@@ -31,6 +31,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"os/signal"
 	"path"
 	"sort"
@@ -42,6 +43,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/httplog"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse"
 )
@@ -86,6 +88,7 @@ type Deps struct {
 	// Executor is the database layer. [Server.Run] closes it on the way out; a
 	// caller that only builds a [Server.Handler] keeps that responsibility.
 	Executor *db.Executor
+	Gate     *gate.Gate
 	// Log is the application log: startup, shutdown, and the operator-facing side
 	// of every failure. It is not the audit stream — see [Auditor].
 	Log zerolog.Logger
@@ -125,6 +128,7 @@ type UnauthenticatedRoute struct {
 type Server struct {
 	cfg                   Config
 	executor              *db.Executor
+	gate                  *gate.Gate
 	log                   zerolog.Logger
 	audit                 *Auditor
 	middleware            func(http.Handler) http.Handler
@@ -157,6 +161,7 @@ func New(deps Deps) (*Server, error) {
 	return &Server{
 		cfg:                   deps.Config,
 		executor:              deps.Executor,
+		gate:                  deps.Gate,
 		log:                   deps.Log,
 		audit:                 deps.Audit,
 		middleware:            deps.Middleware,
@@ -366,6 +371,9 @@ func (s *Server) Run(ctx context.Context) error {
 	// kill the process with the default disposition.
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	hangup := make(chan os.Signal, 1)
+	signal.Notify(hangup, syscall.SIGHUP)
+	defer signal.Stop(hangup)
 
 	// The executor is this function's from here on, and this is what makes that
 	// unconditional: every return path below closes the pools, and a deferred
@@ -406,14 +414,20 @@ func (s *Server) Run(ctx context.Context) error {
 		serveErr <- err
 	}()
 
-	select {
-	case err := <-serveErr:
-		// Serve stopped on its own, which is a failure rather than a shutdown.
-		if err != nil {
-			return fmt.Errorf("mcp: serve: %w", err)
+serving:
+	for {
+		select {
+		case err := <-serveErr:
+			// Serve stopped on its own, which is a failure rather than a shutdown.
+			if err != nil {
+				return fmt.Errorf("mcp: serve: %w", err)
+			}
+			return nil
+		case <-hangup:
+			s.reloadGate()
+		case <-ctx.Done():
+			break serving
 		}
-		return nil
-	case <-ctx.Done():
 	}
 
 	s.log.Info().Dur("timeout_ms", s.cfg.ShutdownTimeout).Msg("shutting down")

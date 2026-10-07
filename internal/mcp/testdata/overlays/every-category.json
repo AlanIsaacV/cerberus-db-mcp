@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "max_statement_bytes": 131072,
+  "remove_rules": ["read-show", "fn-xp-regread"],
+  "remove_safe_functions": ["parsename"],
+  "forbidden_functions": [
+    {
+      "id": "fn-xp-regread",
+      "match": "xp_regread",
+      "engines": ["mysql"],
+      "reason": "replaced by the overlay with a reason of its own"
+    }
+  ],
+  "safe_functions": [
+    {
+      "engines": ["postgresql"],
+      "names": ["reporting.safe_total"],
+      "reason": "added on one engine only"
+    }
+  ],
+  "non_function_keywords": ["tablesample"]
+}
