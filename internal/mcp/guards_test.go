@@ -343,7 +343,7 @@ func copyRepositoryTree(t *testing.T, destination string) {
 		if entry.IsDir() {
 			return os.MkdirAll(target, 0o755)
 		}
-		if !entry.Type().IsRegular() {
+		if !entry.Type().IsRegular() || environmentFile(entry.Name()) {
 			return nil
 		}
 		input, err := os.Open(name)
@@ -365,6 +365,10 @@ func copyRepositoryTree(t *testing.T, destination string) {
 	if err != nil {
 		t.Fatalf("copy repository tree: %v", err)
 	}
+}
+
+func environmentFile(base string) bool {
+	return base != ".env.example" && (base == ".env" || strings.HasPrefix(base, ".env."))
 }
 
 // TestPackageImportsNothingItShouldNot is scoped to this package's own
