@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.8.0 - 2026-10-07
+
+
+### Features
+
+- Load an operator overlay and reload it on SIGHUP
+
+
 ## v0.7.0 - 2026-10-03
 
 
