@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.9.0 - 2026-10-08
+
+
+### Features
+
+- Bound execute_query by a byte budget and name the missing object
+
+
 ## v0.8.0 - 2026-10-07
 
 
