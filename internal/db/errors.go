@@ -32,8 +32,9 @@ import (
 type Kind string
 
 const (
-	// KindRefused is the gate's terminal no. It is the one class whose
-	// agent-facing text is not a fixed sentence: it carries the gate's own
+	// KindRefused is the gate's terminal no. It is one of the two classes whose
+	// agent-facing text is not only a fixed sentence, [KindObjectNotFound] being
+	// the other: it carries the gate's own
 	// verdict and reason, which is safe precisely because the gate is pure — its
 	// Decision is a function of the statement the agent itself submitted and of
 	// the ruleset, and it has never seen a credential.
@@ -180,6 +181,9 @@ type Error struct {
 	// sentinel instead, so errors.Is asks about the class and cannot accidentally
 	// reach the engine's words.
 	cause error
+
+	missing string
+	similar []string
 }
 
 // Error is the operator-facing rendering. It includes Detail, because an
@@ -212,7 +216,8 @@ func (e *Error) Unwrap() error {
 }
 
 // Agent is the agent-facing rendering: a sentence chosen from [agentMessages] by
-// [Error.Kind], plus the gate's own reason when the gate is what refused.
+// [Error.Kind], plus the gate's own reason when the gate is what refused, or the
+// missing identifier and similar catalog names when an object was not found.
 //
 // It never consults [Error.Detail], and there is deliberately no field that
 // could override the chosen sentence. That is the whole mechanism, and it is why
@@ -224,7 +229,16 @@ func (e *Error) Agent() string {
 		msg = agentMessages[KindInternal]
 	}
 	if e.Decision == nil {
-		return msg
+		if e.Kind != KindObjectNotFound || e.missing == "" {
+			return msg
+		}
+		var b strings.Builder
+		b.WriteString(msg)
+		b.WriteString(`. Missing: "` + e.missing + `".`)
+		if len(e.similar) > 0 {
+			fmt.Fprintf(&b, " Similar: %s.", strings.Join(e.similar, ", "))
+		}
+		return b.String()
 	}
 	// The gate's reason and rule ID are added because a refusal the agent cannot
 	// understand is a refusal it will retry verbatim. They are safe for the

@@ -314,6 +314,140 @@ and SQL Server reads `sys.*`, neither of which filters the column list by
 privilege. MySQL reads `information_schema`, which does: a MySQL login without
 permission on a column receives a short column list with no error.
 
+### What `execute_query` returns
+
+`execute_query` takes an alias and one statement and answers with a JSON object:
+
+```json
+{
+  "columns": ["id", "holder", "opened_at"],
+  "rows": [[1, "Ana", "2026-10-07T12:34:56.789-06:00"]],
+  "truncated": false,
+  "truncation": "none",
+  "row_cap": 1000,
+  "byte_budget": 32768
+}
+```
+
+- `columns` names the columns in the order their values appear in each row.
+- `rows` holds one array per row, aligned with `columns` and in the order the
+  statement returned them. Values are encoded by class:
+  - NULL is `null`, a boolean the driver decodes as one is `true` or `false`
+    (MySQL's `BOOLEAN` is an integer), and integers and finite floats are JSON
+    numbers.
+  - A decimal (`NUMERIC`, `DECIMAL`) is a string holding its exact digits, such
+    as `"123456789012345678901234.56789"`, so no client parser rounds it.
+  - A date or time is an RFC 3339 string with the fractional seconds the value
+    carries, in the offset the driver decoded rather than converted to UTC.
+  - A float JSON cannot express is the string `"NaN"`, `"Infinity"` or
+    `"-Infinity"`.
+  - Text is a string. A byte sequence that is not valid UTF-8 is an object with a
+    single key, `{"$base64": "//79"}`; one that is valid UTF-8 arrives as text.
+- `truncation` says which bound cut the answer: `none` means every row the
+  statement returned is here; `row_cap` means the statement had more rows than
+  `row_cap`; `byte_budget` means the next row would have taken the answer past
+  `byte_budget` bytes. When both bounds were reached it is `byte_budget`, the one
+  that cut what the agent holds.
+- `truncated` is `true` exactly when `truncation` is not `none`. It is kept for
+  clients written before `truncation` existed.
+- `row_cap` is `CERBERUS_DB_ROW_CAP`, and `byte_budget` is 32768.
+
+The byte budget is charged against the whole assembled result as JSON —
+`columns`, `rows` and the fixed fields included — and each row is measured as it
+is encoded on the wire. The fixed fields are priced as the answer will carry
+them: a result that fits whole under its own `truncation`, `none` or `row_cap`,
+is returned whole with that label. Only one that does not is cut, and then the
+fields are priced as `byte_budget` and rows are kept in order until the next one
+would not fit, so a cut answer is always a prefix of whole rows and never part of one; a first
+row that alone exceeds the budget yields no rows and `truncation: "byte_budget"`.
+The remedy for a cut answer is to name fewer or narrower columns, filter, or
+aggregate rather than to page. Like the schema tools' budget, it is a constant in
+the code and not a setting, and there is no argument that moves either bound.
+
+What a client receives is about twice that: the SDK sends a typed result both as
+`structuredContent` and as a duplicate JSON text block, as the MCP specification
+asks of a tool with structured output, so one answer at the budget costs a
+direct client about 64 KB. A client that reads only one of the two copies pays
+the budget once.
+
+A refused or failed statement comes back as an error result whose text is one of
+a fixed set of sentences; the engine's own message never reaches the agent. One
+refusal carries more: when the statement names a table or column that does not
+exist on PostgreSQL or MySQL, the sentence is followed by the identifier as the
+statement wrote it and, when the database's catalog holds close names, up to
+three of them:
+
+```text
+the statement names a table, view or column this database does not have. Missing: "cardz". Similar: cards.
+```
+
+The text is the sentence, then `. Missing: "` and the identifier and `".`, then,
+only when there are similar names, ` Similar: ` and the names separated by `, `
+and ended by `.`. Nothing in it is escaped. The identifier is exactly a
+substring of the statement, with a delimited identifier's own delimiters
+(`"…"`, `` `…` ``, `[…]`) removed, so `"Cardz"` is named `Missing: "Cardz".`. A
+qualified name written unquoted and without spaces, such as `c.holdr`, is named
+as written; any other qualified name is named by its last part alone. An
+identifier is named only when it contains no `"`, `'`, `` ` ``, `[`, `]`, `\`,
+`,`, whitespace, control or other non-printing character, and no `.` except
+between the parts of a qualified name; one that would is not named at all and
+the refusal is the bare sentence. A client can therefore read the identifier up to the next `"`. The
+similar names follow the same rule with no `.` at all, so splitting what follows
+`Similar: ` on `, ` after dropping the final `.` recovers them.
+
+The engine's message never decides what is shown; it only says which identifier
+of the statement to look for. The statement is read with the engine's rules for
+string literals, comments and delimited identifiers. Where a session setting
+could change those rules the text is taken as a literal, never as an identifier,
+so `"…"` is never searched on MySQL or SQL Server; MySQL's `--` is taken as a
+comment even without the space MySQL requires after it. A statement that cannot
+be read with certainty (an unterminated literal or comment, a backslash inside a
+MySQL string literal or inside a PostgreSQL one not written `E'…'`, a MySQL
+`/*!` comment) gets the bare sentence.
+
+On PostgreSQL the identifier is the one at the character position the engine
+reports, and it is named only when it matches the name the engine gives, part by
+part from the end, ignoring case for an unquoted part and exactly for a
+delimited one. When PostgreSQL reports no position into the statement — the
+missing name was met inside server-side code, such as the body of a function the
+statement calls, and the engine locates it in that code's own text instead — the
+refusal is the bare sentence and no catalog read is made, even when the
+statement happens to contain the same identifier. MySQL and SQL Server report no
+position at all, so there the name the engine gives is matched the
+same way against every identifier in the statement outside literals and
+comments, so MySQL's `Table 'shop.cardz' doesn't exist` for a statement that
+wrote `cardz` names `cardz`, not the database. When several identifiers match
+and were written differently, only their common last part is named. When they
+do not agree on it, when nothing matches, or when the engine's name holds a
+character the rule above excludes (`Unknown column 'it's'`), the refusal is the
+bare sentence. A name that occurs only inside a
+string literal or a comment is never named.
+
+The similar names come from the catalog of the database the alias is
+bound to. For a missing table they are table and view names. For a missing
+column they are first the column names of the tables the statement reads, when those
+can be identified: for a qualified column such as `c.holdr`, the one table the
+qualifier names, directly or through its alias; for an unqualified one, every
+table after a `FROM` or `JOIN`. A table the statement names without a schema
+stands for the table of that name in any schema of the database, or on MySQL in
+the alias's database. When that cannot be told — a subquery, a table
+function or a common table expression among the sources, an alias that names
+more than one table, or no table at all — the column names of the whole database
+are used instead. When the statement's tables were identified and none of their
+columns is close enough, a second read takes the column names of the whole
+database, so `a.batch_cod` on a table without it is still offered `batch_code`
+from another table. Each read considers names whose length is within three of the
+missing one and that share its first or last letter, at most 1000 of them
+nearest in length first whatever `CERBERUS_DB_ROW_CAP` is, and ranks them by
+edit distance; up to three
+close enough are offered. Each goes through the gate and runs under the same
+statement deadline as any other read. When a read fails, or the alias is not
+bound to one database, the refusal goes out without `Similar:`; a failed read of
+the statement's tables is not followed by the whole-database one. A missing
+function, schema or database keeps the bare sentence. SQL Server's invalid
+object and column names (errors 208 and 207) go through the same path, though no
+SQL Server run has exercised it.
+
 ### Gate overlay
 
 The statement gate's rules are embedded in the binary; that set is the baseline.

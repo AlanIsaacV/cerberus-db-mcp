@@ -472,7 +472,7 @@ func TestSanitisationAgainstRealErrorClasses(t *testing.T) {
 			})
 
 			t.Run("an object that does not exist", func(t *testing.T) {
-				_, err := h.Execute(context.Background(), h.alias, "SELECT * FROM cerberus_no_such_table_anywhere", nil)
+				_, err := h.Execute(context.Background(), h.alias, "SELECT * FROM no_such_table_anywhere", nil)
 				assertSanitised(t, err, h.spec, KindObjectNotFound)
 			})
 
@@ -560,6 +560,119 @@ func TestSanitisationAgainstRealErrorClasses(t *testing.T) {
 						t.Error("the operator-facing detail is empty: the error was discarded rather than sanitised")
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestObjectNotFoundNamesTheMissingIdentifier(t *testing.T) {
+	fixture := map[gate.Engine]struct{ archive, probe, quote string }{
+		gate.PostgreSQL: {"atelier.archive", "atelier.multi_index_probe", `"`},
+		gate.MySQL:      {"archive", "multi_index_probe", "`"},
+	}
+	for _, engine := range containerEngines {
+		t.Run(string(engine), func(t *testing.T) {
+			h := setUp(t, engine)
+			f := fixture[engine]
+			for _, tt := range []struct {
+				name      string
+				statement string
+				missing   string
+				similar   string
+			}{
+				{"a missing table", "SELECT * FROM canvaz", "canvaz", "canvas"},
+				{"a missing table written delimited", "SELECT * FROM " + f.quote + "Canvaz" + f.quote, "Canvaz", "canvas"},
+				{"a missing column qualified by its alias", "SELECT a.amout FROM " + f.archive + " AS a", "a.amout", "amount"},
+				{"a missing column written bare", "SELECT amout FROM " + f.archive, "amout", "amount"},
+				{"a missing column its own table has nothing close to", "SELECT a.batch_cod FROM " + f.archive + " AS a JOIN " + f.probe + " AS m ON m.id = a.id", "a.batch_cod", "batch_code"},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					_, err := h.Execute(context.Background(), h.alias, tt.statement, nil)
+					assertSanitised(t, err, h.spec, KindObjectNotFound)
+					agent := err.(*Error).Agent()
+					named := agentMessages[KindObjectNotFound] + ". Missing: \"" + tt.missing + "\"."
+					if tt.similar == "" {
+						if agent != named {
+							t.Errorf("Agent() = %q, want exactly %q", agent, named)
+						}
+						return
+					}
+					similar, ok := strings.CutPrefix(agent, named+" Similar: ")
+					if !ok {
+						t.Fatalf("Agent() = %q, want it to start with %q", agent, named+" Similar: ")
+					}
+					names := strings.Split(strings.TrimSuffix(similar, "."), ", ")
+					if !slices.Contains(names, tt.similar) || len(names) > 3 {
+						t.Errorf("Agent() = %q, want at most three similar names including %q", agent, tt.similar)
+					}
+				})
+			}
+
+			unnamed := map[string]string{
+				"an identifier with a quote inside it": "SELECT " + f.quote + "it's" + f.quote + " FROM " + f.archive,
+			}
+			if engine == gate.PostgreSQL {
+				unnamed["a name that occurs only inside a string literal"] = "SELECT CAST(s.x AS regclass) FROM (SELECT 'canvaz' AS x) AS s"
+			}
+			for name, statement := range unnamed {
+				t.Run(name, func(t *testing.T) {
+					_, err := h.Execute(context.Background(), h.alias, statement, nil)
+					assertSanitised(t, err, h.spec, KindObjectNotFound)
+					if got, want := err.(*Error).Agent(), agentMessages[KindObjectNotFound]; got != want {
+						t.Errorf("Agent() = %q, want exactly %q", got, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestANotFoundOtherThanATableOrColumnKeepsTheFixedSentence(t *testing.T) {
+	h := setUp(t, gate.PostgreSQL)
+	_, err := h.Execute(context.Background(), h.alias, "SELECT lower(42)", nil)
+	assertSanitised(t, err, h.spec, KindObjectNotFound)
+	if got, want := err.(*Error).Agent(), agentMessages[KindObjectNotFound]; got != want {
+		t.Errorf("Agent() = %q, want exactly %q", got, want)
+	}
+}
+
+func TestPostgresNamesNothingTheEngineFoundOutsideTheStatement(t *testing.T) {
+	h := setUp(t, gate.PostgreSQL)
+	obs := pgObserver(t, h.spec)
+	ctx := context.Background()
+	functions := map[string]string{
+		"body_miss_plpgsql": "CREATE FUNCTION public.body_miss_plpgsql() RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT count(*) FROM vanished_ledger); END $$",
+		"body_miss_sql":     "CREATE FUNCTION public.body_miss_sql() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM vanished_ledger'",
+		"body_miss_column":  "CREATE FUNCTION public.body_miss_column() RETURNS SETOF numeric LANGUAGE sql STABLE AS 'SELECT a.amout FROM atelier.archive AS a'",
+	}
+	if _, err := obs.Exec(ctx, "SET check_function_bodies = off"); err != nil {
+		t.Fatalf("set check_function_bodies: %v", err)
+	}
+	for name, create := range functions {
+		if _, err := obs.Exec(ctx, "DROP FUNCTION IF EXISTS public."+name+"()"); err != nil {
+			t.Fatalf("drop %s: %v", name, err)
+		}
+		if _, err := obs.Exec(ctx, create); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		t.Cleanup(func() {
+			cleanCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, _ = obs.Exec(cleanCtx, "DROP FUNCTION IF EXISTS public."+name+"()")
+		})
+	}
+	for _, tt := range []struct {
+		name, function, statement string
+	}{
+		{"a missing table inside a PL/pgSQL body", "body_miss_plpgsql", "SELECT body_miss_plpgsql() AS vanished_ledger"},
+		{"a missing table inside an inlined SQL body", "body_miss_sql", "SELECT body_miss_sql() AS vanished_ledger FROM atelier.archive"},
+		{"a missing column inside an inlined SQL body", "body_miss_column", "SELECT amout FROM body_miss_column() AS amout"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := h.Execute(ctx, h.alias, tt.statement, []gate.Grant{{RuleID: "function:" + tt.function}})
+			assertSanitised(t, err, h.spec, KindObjectNotFound)
+			if got, want := err.(*Error).Agent(), agentMessages[KindObjectNotFound]; got != want {
+				t.Errorf("Agent() = %q, want exactly %q", got, want)
 			}
 		})
 	}

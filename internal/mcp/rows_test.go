@@ -6,10 +6,14 @@ import (
 	"errors"
 	"math"
 	"math/big"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
 )
 
 // marshal is what the SDK does to a handler's output, so the assertions below
@@ -172,4 +176,105 @@ func TestJSONRowsHandlesAnEmptyResultSet(t *testing.T) {
 	if got := marshal(t, jsonRows([][]any{})); got != `[]` {
 		t.Errorf("an empty result set marshals to %s, want []", got)
 	}
+}
+
+func TestTheByteBudgetKeepsTheLongestPrefixOfWholeRows(t *testing.T) {
+	const budget = 1000
+	result := func(rows [][]any) ExecuteQueryResult {
+		return ExecuteQueryResult{Columns: []string{"n", "filler"}, Rows: rows, Truncation: db.NoTruncation, RowCap: 50, ByteBudget: budget}
+	}
+	rows := make([][]any, 20)
+	for i := range rows {
+		rows[i] = []any{i + 1, strings.Repeat("x", 90+i)}
+	}
+
+	t.Run("a result over the budget keeps the longest prefix that fits", func(t *testing.T) {
+		out, err := withinByteBudget(result(rows), budget)
+		if err != nil {
+			t.Fatalf("withinByteBudget() = %v", err)
+		}
+		kept := len(out.Rows)
+		if kept == 0 || kept == len(rows) {
+			t.Fatalf("kept %d of %d rows, want a proper non-empty prefix", kept, len(rows))
+		}
+		if !slices.EqualFunc(out.Rows, rows[:kept], func(a, b []any) bool { return marshal(t, a) == marshal(t, b) }) {
+			t.Errorf("the kept rows are not the first %d rows in order", kept)
+		}
+		if size := len(marshal(t, out)); size > budget {
+			t.Errorf("the result is %d bytes, over the budget of %d", size, budget)
+		}
+		if !out.Truncated || out.Truncation != db.ByteBudgetTruncation {
+			t.Errorf("truncated = %v, truncation = %q, want true and %q", out.Truncated, out.Truncation, db.ByteBudgetTruncation)
+		}
+		longer := out
+		longer.Rows = rows[:kept+1]
+		if kept+1 == len(rows) {
+			longer.Truncated = false
+			longer.Truncation = db.NoTruncation
+		}
+		if size := len(marshal(t, longer)); size <= budget {
+			t.Errorf("one more whole row fits in %d bytes, so %d rows is not the longest prefix", size, kept)
+		}
+	})
+
+	t.Run("a first row over the budget leaves no rows", func(t *testing.T) {
+		out, err := withinByteBudget(result([][]any{{1, strings.Repeat("x", 2*budget)}, {2, "small"}}), budget)
+		if err != nil {
+			t.Fatalf("withinByteBudget() = %v", err)
+		}
+		if len(out.Rows) != 0 || !out.Truncated || out.Truncation != db.ByteBudgetTruncation {
+			t.Errorf("got %d rows, truncated = %v, truncation = %q, want 0 rows, true and %q", len(out.Rows), out.Truncated, out.Truncation, db.ByteBudgetTruncation)
+		}
+		if got := marshal(t, out.Rows); got != "[]" {
+			t.Errorf("rows = %s, want []", got)
+		}
+	})
+
+	for _, label := range []struct {
+		truncated  bool
+		truncation db.Truncation
+	}{{false, db.NoTruncation}, {true, db.RowCapTruncation}} {
+		exact := result([][]any{{1, ""}})
+		exact.Truncated = label.truncated
+		exact.Truncation = label.truncation
+		exact.Rows[0][1] = strings.Repeat("x", budget-len(marshal(t, exact)))
+
+		t.Run("a result that fits exactly under "+string(label.truncation)+" is left whole with that label", func(t *testing.T) {
+			if size := len(marshal(t, exact)); size != budget {
+				t.Fatalf("the fixture is %d bytes, want exactly %d", size, budget)
+			}
+			out, err := withinByteBudget(exact, budget)
+			if err != nil {
+				t.Fatalf("withinByteBudget() = %v", err)
+			}
+			if len(out.Rows) != 1 || out.Truncated != label.truncated || out.Truncation != label.truncation {
+				t.Errorf("got %d rows, truncated = %v, truncation = %q, want 1, %v and %q", len(out.Rows), out.Truncated, out.Truncation, label.truncated, label.truncation)
+			}
+		})
+
+		t.Run("a result one byte over under "+string(label.truncation)+" is cut by the byte budget", func(t *testing.T) {
+			over := exact
+			over.Rows = [][]any{{1, exact.Rows[0][1].(string) + "x"}}
+			out, err := withinByteBudget(over, budget)
+			if err != nil {
+				t.Fatalf("withinByteBudget() = %v", err)
+			}
+			if len(out.Rows) != 0 || !out.Truncated || out.Truncation != db.ByteBudgetTruncation {
+				t.Errorf("got %d rows, truncated = %v, truncation = %q, want 0, true and %q", len(out.Rows), out.Truncated, out.Truncation, db.ByteBudgetTruncation)
+			}
+			if size := len(marshal(t, out)); size > budget {
+				t.Errorf("the result is %d bytes, over the budget of %d", size, budget)
+			}
+		})
+	}
+
+	t.Run("a result inside the budget is left whole", func(t *testing.T) {
+		out, err := withinByteBudget(result(rows[:3]), budget)
+		if err != nil {
+			t.Fatalf("withinByteBudget() = %v", err)
+		}
+		if len(out.Rows) != 3 || out.Truncated || out.Truncation != db.NoTruncation {
+			t.Errorf("got %d rows, truncated = %v, truncation = %q, want 3, false and %q", len(out.Rows), out.Truncated, out.Truncation, db.NoTruncation)
+		}
+	})
 }

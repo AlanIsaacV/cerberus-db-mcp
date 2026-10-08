@@ -172,6 +172,12 @@ const mysqlDescribePrimaryKey = "WITH target AS (SELECT ? AS table_name, ? AS sc
 // MySQL-specific polarity and reject every spelling other than the known 0/1.
 const mysqlDescribeIndexes = "WITH target AS (SELECT ? AS table_name, ? AS schema_name) SELECT s.table_schema, s.table_name, s.index_name, s.column_name, s.non_unique FROM information_schema.statistics AS s JOIN target ON 1 = 1 WHERE s.table_schema = DATABASE() AND s.table_name = target.table_name AND s.index_name <> 'PRIMARY' AND (target.schema_name = '' OR s.table_schema = target.schema_name) ORDER BY s.table_schema, s.table_name, s.index_name, s.seq_in_index"
 
+const mysqlSimilarTables = "WITH target AS (SELECT ? AS name) SELECT DISTINCT t.table_name AS candidate_name, ABS(CHAR_LENGTH(t.table_name) - CHAR_LENGTH(target.name)) AS length_gap FROM information_schema.tables AS t JOIN target ON 1 = 1 WHERE t.table_schema = DATABASE() AND ABS(CHAR_LENGTH(t.table_name) - CHAR_LENGTH(target.name)) <= 3 AND (LOWER(LEFT(t.table_name, 1)) = LOWER(LEFT(target.name, 1)) OR LOWER(RIGHT(t.table_name, 1)) = LOWER(RIGHT(target.name, 1))) ORDER BY length_gap, candidate_name"
+
+const mysqlSimilarColumns = "WITH target AS (SELECT ? AS name) SELECT DISTINCT t.column_name AS candidate_name, ABS(CHAR_LENGTH(t.column_name) - CHAR_LENGTH(target.name)) AS length_gap FROM information_schema.columns AS t JOIN target ON 1 = 1 WHERE t.table_schema = DATABASE() AND ABS(CHAR_LENGTH(t.column_name) - CHAR_LENGTH(target.name)) <= 3 AND (LOWER(LEFT(t.column_name, 1)) = LOWER(LEFT(target.name, 1)) OR LOWER(RIGHT(t.column_name, 1)) = LOWER(RIGHT(target.name, 1))) ORDER BY length_gap, candidate_name"
+
+const mysqlSimilarColumnsInTables = "WITH target AS (SELECT ? AS name, ? AS tables) SELECT DISTINCT t.column_name AS candidate_name, ABS(CHAR_LENGTH(t.column_name) - CHAR_LENGTH(target.name)) AS length_gap FROM information_schema.columns AS t JOIN target ON 1 = 1 WHERE ((t.table_schema = DATABASE() AND FIND_IN_SET(t.table_name, target.tables) > 0) OR FIND_IN_SET(CONCAT(t.table_schema, '.', t.table_name), target.tables) > 0) AND ABS(CHAR_LENGTH(t.column_name) - CHAR_LENGTH(target.name)) <= 3 AND (LOWER(LEFT(t.column_name, 1)) = LOWER(LEFT(target.name, 1)) OR LOWER(RIGHT(t.column_name, 1)) = LOWER(RIGHT(target.name, 1))) ORDER BY length_gap, candidate_name"
+
 // mysqlSystemDatabases are the schemas MySQL keeps for itself. They are excluded
 // because an agent asked to understand somebody's data model has no use for the
 // server's own bookkeeping, and four names of noise in a list is four names of

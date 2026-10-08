@@ -213,12 +213,16 @@ func (e *Executor) Execute(ctx context.Context, alias, statement string, grants 
 	}
 
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(ctx, e.settings.statementDeadline(spec.Engine))
+	queryCtx, cancel := context.WithTimeout(ctx, e.settings.statementDeadline(spec.Engine))
 	defer cancel()
 
-	rows, err := c.query(ctx, statement, e.settings.RowCap)
+	rows, err := c.query(queryCtx, statement, e.settings.RowCap)
 	if err != nil {
-		return nil, executionError(ctx, "execute", spec, err)
+		failure := executionError(queryCtx, "execute", spec, err)
+		if failure.Kind == KindObjectNotFound {
+			e.nameMissingObject(ctx, c, failure, statement, err)
+		}
+		return nil, failure
 	}
 	return &Result{
 		Alias:     alias,

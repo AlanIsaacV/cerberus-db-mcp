@@ -72,13 +72,17 @@ type ExecuteQueryInput struct {
 // a field repeated on every call for the rest of a session buys nothing.
 type ExecuteQueryResult struct {
 	Columns []string `json:"columns" jsonschema:"the column names, in the order the values appear in each row"`
-	Rows    [][]any  `json:"rows" jsonschema:"one array of values per row, aligned with columns; a byte sequence that is not text appears as an object with a $base64 key"`
+	Rows    [][]any  `json:"rows" jsonschema:"one array of values per row, aligned with columns and in the order the statement returned them; NULL is null, integers and finite floats are numbers, a decimal is a string holding its exact digits, a date or time is an RFC 3339 string in the offset the driver decoded it in, a float JSON cannot express is the string NaN, Infinity or -Infinity, and a byte sequence that is not text is an object with a single $base64 key"`
 	// Truncated is a field of its own rather than something the agent infers from
 	// the row count, because a result that is exactly the cap is not truncated and
 	// an agent told otherwise pages forever.
-	Truncated bool `json:"truncated" jsonschema:"true when the statement had more rows and the row cap stopped the read"`
-	RowCap    int  `json:"row_cap" jsonschema:"the row cap that applied to this result"`
+	Truncated  bool          `json:"truncated" jsonschema:"true when rows is only the beginning of what the statement returned, because the row cap or the byte budget stopped it; the same as truncation not being none"`
+	Truncation db.Truncation `json:"truncation" jsonschema:"which bound cut this answer: none means every row the statement returned is here; row_cap means the statement had more rows than the row cap; byte_budget means the next row would have taken this result past byte_budget bytes, and wins when both bounds were reached. Under either non-none value rows is a prefix of whole rows; narrow the columns, filter the rows or aggregate rather than paging"`
+	RowCap     int           `json:"row_cap" jsonschema:"the row cap that applied to this result"`
+	ByteBudget int           `json:"byte_budget" jsonschema:"the most bytes this result may occupy as JSON, columns, rows and these fields included; a wide row reaches this bound long before the row cap"`
 }
+
+const executeResultBudget = 32 << 10
 
 // ListDatabasesInput is list_databases' whole argument list: one alias.
 //
@@ -272,7 +276,8 @@ func (s *Server) registerTools(srv *sdk.Server) {
 		Name: ToolExecuteQuery,
 		Description: "Run one read-only SQL statement against one of the configured databases and return its rows. " +
 			"The statement is checked before it is sent: anything that is not provably a single read — a write, DDL, a permission change, a second statement, a write hidden in a CTE, or a construct the checker does not recognise — is refused and never reaches the database. " +
-			"Results are capped and the statement is stopped if it runs too long; call list_connections for the limits in force.",
+			"Results are capped at a number of rows and at a byte budget, and the statement is stopped if it runs too long; call list_connections for the row cap and the time limit, and read truncation on each answer for which bound cut it. " +
+			"A statement naming a table or column that does not exist is refused with the identifier it wrote and up to three similar names from the database's catalog.",
 		Annotations: &sdk.ToolAnnotations{ReadOnlyHint: true},
 	}, s.executeQuery)
 
@@ -404,6 +409,22 @@ func (s *Server) executeQuery(ctx context.Context, _ *sdk.CallToolRequest, in Ex
 		return nil, nil, s.refuseOrFail(ctx, attempt{tool: ToolExecuteQuery, alias: in.Alias, statement: in.Statement}, elapsed, err)
 	}
 
+	truncation := db.NoTruncation
+	if result.Truncated {
+		truncation = db.RowCapTruncation
+	}
+	out, err := withinByteBudget(ExecuteQueryResult{
+		Columns:    result.Columns,
+		Rows:       jsonRows(result.Rows),
+		Truncated:  result.Truncated,
+		Truncation: truncation,
+		RowCap:     result.RowCap,
+		ByteBudget: executeResultBudget,
+	}, executeResultBudget)
+	if err != nil {
+		return nil, nil, s.refuseOrFail(ctx, attempt{tool: ToolExecuteQuery, alias: in.Alias, statement: in.Statement}, elapsed, err)
+	}
+
 	email, subject := s.caller(ctx, ToolExecuteQuery)
 	s.audit.Record(AuditEvent{
 		Tool:      ToolExecuteQuery,
@@ -416,17 +437,12 @@ func (s *Server) executeQuery(ctx context.Context, _ *sdk.CallToolRequest, in Ex
 		Verdict:   result.Decision.Verdict,
 		Reason:    result.Decision.Reason,
 		RuleID:    result.Decision.RuleID,
-		Rows:      len(result.Rows),
-		Truncated: result.Truncated,
+		Rows:      len(out.Rows),
+		Truncated: out.Truncated,
 		Elapsed:   elapsed,
 	})
 
-	return nil, &ExecuteQueryResult{
-		Columns:   result.Columns,
-		Rows:      jsonRows(result.Rows),
-		Truncated: result.Truncated,
-		RowCap:    result.RowCap,
-	}, nil
+	return nil, &out, nil
 }
 
 func (s *Server) listDatabases(ctx context.Context, _ *sdk.CallToolRequest, in ListDatabasesInput) (*sdk.CallToolResult, *ListDatabasesResult, error) {

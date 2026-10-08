@@ -3,10 +3,13 @@ package mcp
 import (
 	"database/sql/driver"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"math"
 	"reflect"
 	"time"
+
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
 )
 
 // Binary is how a byte sequence that is not text reaches the agent.
@@ -177,4 +180,51 @@ func jsonComposite(v any) any {
 	// but it is a stable one, and it keeps an unrecognised column from failing the
 	// marshal of every other column in the row.
 	return fmt.Sprint(v)
+}
+
+func withinByteBudget(result ExecuteQueryResult, budget int) (ExecuteQueryResult, error) {
+	cut := result
+	cut.Truncated = true
+	cut.Truncation = db.ByteBudgetTruncation
+	whole, err := encodedSizeWithoutRows(result)
+	if err != nil {
+		return ExecuteQueryResult{}, err
+	}
+	spent, err := encodedSizeWithoutRows(cut)
+	if err != nil {
+		return ExecuteQueryResult{}, err
+	}
+	kept := 0
+	for i, row := range result.Rows {
+		if whole > budget {
+			break
+		}
+		encodedRow, err := json.Marshal(row)
+		if err != nil {
+			return ExecuteQueryResult{}, err
+		}
+		cost := len(encodedRow)
+		if i > 0 {
+			cost++
+		}
+		whole += cost
+		if kept == i && spent+cost <= budget {
+			spent += cost
+			kept++
+		}
+	}
+	if whole <= budget {
+		return result, nil
+	}
+	cut.Rows = result.Rows[:kept]
+	return cut, nil
+}
+
+func encodedSizeWithoutRows(result ExecuteQueryResult) (int, error) {
+	result.Rows = [][]any{}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return 0, err
+	}
+	return len(encoded), nil
 }

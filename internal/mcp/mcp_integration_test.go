@@ -424,6 +424,158 @@ func TestTruncationCrossesTheWire(t *testing.T) {
 	}
 }
 
+func TestExecuteQueryNamesTheBoundThatCutIt(t *testing.T) {
+	generators := map[gate.Engine]func(n, width int) string{
+		gate.PostgreSQL: func(n, width int) string {
+			return "SELECT i, repeat('x', " + strconv.Itoa(width) + ") AS filler FROM generate_series(1, " + strconv.Itoa(n) + ") AS i"
+		},
+		gate.MySQL: func(n, width int) string {
+			return "WITH RECURSIVE s AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM s WHERE i < " + strconv.Itoa(n) + ") SELECT i, REPEAT('x', " + strconv.Itoa(width) + ") AS filler FROM s"
+		},
+	}
+
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			h := setUpEngine(t, engine)
+			rowCap := h.settings.RowCap
+			if rowCap < 2 {
+				t.Fatalf("this test needs a row cap of at least 2, not %d", rowCap)
+			}
+			generate := generators[engine]
+			wide := 2*executeResultBudget/(rowCap-1) + 1
+
+			run := func(t *testing.T, statement string, want db.Truncation) (*sdk.CallToolResult, []any) {
+				t.Helper()
+				res := h.call(t, ToolExecuteQuery, map[string]any{"alias": h.alias, "statement": statement})
+				if res.IsError {
+					t.Fatalf("execute_query failed: %s", resultText(t, res))
+				}
+				out, ok := structured(t, res).(map[string]any)
+				if !ok {
+					t.Fatalf("execute_query returned no structured content: %+v", res)
+				}
+				for field, wantValue := range map[string]any{
+					"truncation":  string(want),
+					"truncated":   want != db.NoTruncation,
+					"row_cap":     float64(rowCap),
+					"byte_budget": float64(executeResultBudget),
+				} {
+					if got := out[field]; got != wantValue {
+						t.Errorf("%s = %#v, want %#v", field, got, wantValue)
+					}
+				}
+				if size := len(resultText(t, res)); size > executeResultBudget {
+					t.Errorf("the result is %d bytes, over the byte budget of %d", size, executeResultBudget)
+				}
+				rows, _ := out["rows"].([]any)
+				for i, row := range rows {
+					if got := row.([]any)[0]; got != float64(i+1) {
+						t.Fatalf("row %d starts with %v, want %d: the rows are not a prefix in statement order", i, got, i+1)
+					}
+				}
+				return res, rows
+			}
+
+			t.Run("rows wider than the byte budget under the row cap", func(t *testing.T) {
+				n := rowCap - 1
+				res, rows := run(t, generate(n, wide), db.ByteBudgetTruncation)
+				if len(rows) == 0 || len(rows) >= n {
+					t.Fatalf("got %d of %d rows, want a non-empty proper prefix", len(rows), n)
+				}
+				next, err := json.Marshal([]any{len(rows) + 1, strings.Repeat("x", wide)})
+				if err != nil {
+					t.Fatalf("marshal the next row: %v", err)
+				}
+				if size := len(resultText(t, res)) + 1 + len(next); size <= executeResultBudget {
+					t.Errorf("the next whole row would still fit in %d bytes, so %d rows is not the longest prefix", size, len(rows))
+				}
+			})
+
+			t.Run("the row cap before the byte budget", func(t *testing.T) {
+				if (len(strconv.Itoa(rowCap))+8)*rowCap+256 > executeResultBudget {
+					t.Skipf("a row cap of %d cannot be reached under the byte budget with these rows", rowCap)
+				}
+				_, rows := run(t, generate(rowCap*2, 1), db.RowCapTruncation)
+				if len(rows) != rowCap {
+					t.Errorf("got %d rows, want exactly the cap %d", len(rows), rowCap)
+				}
+			})
+
+			t.Run("both bounds reached", func(t *testing.T) {
+				_, rows := run(t, generate(rowCap*2, wide), db.ByteBudgetTruncation)
+				if len(rows) == 0 || len(rows) >= rowCap {
+					t.Errorf("got %d rows, want a non-empty prefix shorter than the cap %d", len(rows), rowCap)
+				}
+			})
+
+			t.Run("neither bound reached", func(t *testing.T) {
+				_, rows := run(t, generate(1, 1), db.NoTruncation)
+				if len(rows) != 1 {
+					t.Errorf("got %d rows, want 1", len(rows))
+				}
+			})
+		})
+	}
+}
+
+func TestObjectNotFoundReachesTheClientNamingWhatTheStatementWrote(t *testing.T) {
+	fixture := map[gate.Engine]struct{ archive, quote string }{
+		gate.PostgreSQL: {"atelier.archive", `"`},
+		gate.MySQL:      {"archive", "`"},
+	}
+	for _, engine := range testedEngines() {
+		t.Run(string(engine), func(t *testing.T) {
+			h := setUpEngine(t, engine)
+			f := fixture[engine]
+			for _, tt := range []struct {
+				name      string
+				statement string
+				missing   string
+				similar   string
+			}{
+				{"a missing table", "SELECT * FROM canvaz", "canvaz", "canvas"},
+				{"a missing table written delimited", "SELECT * FROM " + f.quote + "Canvaz" + f.quote, "Canvaz", "canvas"},
+				{"a missing column qualified by its alias", "SELECT a.amout FROM " + f.archive + " AS a", "a.amout", "amount"},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					res := h.call(t, ToolExecuteQuery, map[string]any{"alias": h.alias, "statement": tt.statement})
+					if !res.IsError {
+						t.Fatalf("%q succeeded", tt.statement)
+					}
+					text := resultText(t, res)
+					prefix := (&db.Error{Kind: db.KindObjectNotFound}).Agent() + ". Missing: \"" + tt.missing + "\". Similar: "
+					similar, ok := strings.CutPrefix(text, prefix)
+					if !ok {
+						t.Fatalf("the client was told %q, want it to start with %q", text, prefix)
+					}
+					names := strings.Split(strings.TrimSuffix(similar, "."), ", ")
+					if !slices.Contains(names, tt.similar) || len(names) > 3 {
+						t.Errorf("the client was told %q, want at most three similar names including %q", text, tt.similar)
+					}
+					h.assertNothingAboutTheConnection(t, text)
+					if !strings.Contains(h.appLog.String(), string(db.KindObjectNotFound)) {
+						t.Errorf("the application log does not record the failure:\n%s", h.appLog.String())
+					}
+				})
+			}
+
+			unnamed := map[string]string{
+				"an identifier with a quote inside it keeps the fixed sentence": "SELECT " + f.quote + "it's" + f.quote + " FROM " + f.archive,
+			}
+			if engine == gate.PostgreSQL {
+				unnamed["a missing function keeps the fixed sentence"] = "SELECT lower(42)"
+				unnamed["a name only inside a string literal keeps the fixed sentence"] = "SELECT CAST(s.x AS regclass) FROM (SELECT 'canvaz' AS x) AS s"
+			}
+			for name, statement := range unnamed {
+				t.Run(name, func(t *testing.T) {
+					res := h.call(t, ToolExecuteQuery, map[string]any{"alias": h.alias, "statement": statement})
+					h.assertAgentMessage(t, res, db.KindObjectNotFound)
+				})
+			}
+		})
+	}
+}
+
 // TestValueFormsCrossTheWireFromRealEngines is acceptance criterion 7: a NULL, a
 // timestamp, a decimal, a UTF-8 text column and a non-UTF-8 blob, selected from a
 // real engine and asserted as the exact JSON the client received.
@@ -522,11 +674,6 @@ func TestOnlyFixedAgentMessagesReachTheClient(t *testing.T) {
 	for _, engine := range testedEngines() {
 		t.Run(string(engine), func(t *testing.T) {
 			h := setUpEngine(t, engine)
-
-			t.Run("an object that does not exist", func(t *testing.T) {
-				res := h.call(t, ToolExecuteQuery, map[string]any{"alias": h.alias, "statement": "SELECT * FROM cerberus_no_such_table_anywhere"})
-				h.assertAgentMessage(t, res, db.KindObjectNotFound)
-			})
 
 			t.Run("a statement the engine rejects", func(t *testing.T) {
 				// The gate allows this: it begins with SELECT and names nothing

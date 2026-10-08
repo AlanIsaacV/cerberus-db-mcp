@@ -82,6 +82,7 @@ var allowedImports = map[string]bool{
 	"context":                     true,
 	"database/sql/driver":         true, // for the Valuer a decimal arrives as
 	"encoding/base64":             true,
+	"encoding/json":               true,
 	"errors":                      true,
 	"fmt":                         true,
 	"io":                          true,

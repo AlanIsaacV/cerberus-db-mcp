@@ -347,8 +347,8 @@ func TestPostgresDatabaseSetIsOneConnectionPerDatabaseAndABoundary(t *testing.T)
 	// in both there would be nothing for the second half to be denied: the read would
 	// succeed against the local copy and prove the opposite of what it looks like.
 	tables := map[string]string{
-		fixtureDatabase:       "cerberus_probe_" + fixtureDatabase,
-		fixtureSecondDatabase: "cerberus_probe_" + fixtureSecondDatabase,
+		fixtureDatabase:       "boundary_probe_" + fixtureDatabase,
+		fixtureSecondDatabase: "boundary_probe_" + fixtureSecondDatabase,
 	}
 	for database, table := range tables {
 		spec := h.spec
