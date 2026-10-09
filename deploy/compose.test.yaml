@@ -85,6 +85,16 @@ services:
     image: redis:7.4.2-alpine
     ports:
       - "56379:6379"
+    command:
+      - redis-server
+      - --user
+      - ro
+      - "on"
+      - ">cerberus-test-redis-ro"
+      - "~*"
+      - "&*"
+      - "+@read"
+      - "+select"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
