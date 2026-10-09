@@ -1,0 +1,3491 @@
+{
+  "notes": [
+    "Every entry is written by hand for this corpus and reviewed as data; no third-party payload file is vendored.",
+    "argv is a JSON array. An element that is a JSON string is the UTF-8 text of that argument. An element that is an object of the form {\"base64\": \"...\"} is the argument's raw bytes in standard base64 with padding, which is how an argument that is not valid UTF-8, or that should be read as bytes, is written. No other element form is accepted.",
+    "reason is the gate's own reason value, compared exactly. limits are the limits the corpus is evaluated under."
+  ],
+  "limits": {
+    "max_elements": 10,
+    "max_count": 20,
+    "max_args": 24,
+    "max_bytes": 256
+  },
+  "entries": [
+    {
+      "argv": [
+        "SCAN",
+        "0",
+        "COUNT",
+        "20"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/scan/"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "0",
+        "MATCH",
+        "user:*",
+        "COUNT",
+        "10",
+        "TYPE",
+        "string"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/scan/"
+    },
+    {
+      "argv": [
+        "scan",
+        "0",
+        "count",
+        "5"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/scan/ (names are case-insensitive)"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "missing-count",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "0",
+        "MATCH",
+        "*"
+      ],
+      "verdict": "deny",
+      "reason": "missing-count",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "0",
+        "COUNT",
+        "21"
+      ],
+      "verdict": "deny",
+      "reason": "count-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "0",
+        "COUNT",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/scan/: COUNT must be positive"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "0",
+        "COUNT",
+        "+5"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "Redis string2ll accepts only a canonical decimal integer"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "0",
+        "COUNT",
+        "05"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "Redis string2ll accepts only a canonical decimal integer"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "abc",
+        "COUNT",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/scan/: the cursor is an unsigned integer"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "-1",
+        "COUNT",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/scan/: the cursor is an unsigned integer"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "0",
+        "COUNT",
+        "10",
+        "COUNT",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "duplicate-argument",
+      "source": "Redis keeps the last COUNT, so a repeated option is refused rather than guessed"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "0",
+        "COUNT",
+        "10",
+        "NOVALUES"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-argument",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know: NOVALUES belongs to HSCAN"
+    },
+    {
+      "argv": [
+        "SCAN",
+        "0",
+        "COUNT"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "https://redis.io/docs/latest/commands/scan/"
+    },
+    {
+      "argv": [
+        "SCAN"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "TYPE",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/type/"
+    },
+    {
+      "argv": [
+        "TYPE"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "TTL",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/ttl/"
+    },
+    {
+      "argv": [
+        "TTL"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "PTTL",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/pttl/"
+    },
+    {
+      "argv": [
+        "PTTL"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "EXPIRETIME",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/expiretime/"
+    },
+    {
+      "argv": [
+        "EXPIRETIME"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "PEXPIRETIME",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/pexpiretime/"
+    },
+    {
+      "argv": [
+        "PEXPIRETIME"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "STRLEN",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/strlen/"
+    },
+    {
+      "argv": [
+        "STRLEN"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "GET",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/get/"
+    },
+    {
+      "argv": [
+        "GET"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "HLEN",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/hlen/"
+    },
+    {
+      "argv": [
+        "HLEN"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "LLEN",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/llen/"
+    },
+    {
+      "argv": [
+        "LLEN"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "SCARD",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/scard/"
+    },
+    {
+      "argv": [
+        "SCARD"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "ZCARD",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zcard/"
+    },
+    {
+      "argv": [
+        "ZCARD"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "XLEN",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/xlen/"
+    },
+    {
+      "argv": [
+        "XLEN"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "TYPE",
+        "a",
+        "b"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "GET",
+        "a",
+        "b"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "GET",
+        {
+          "base64": "/wBAgA=="
+        }
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "argv carries arbitrary bytes: a key that is not UTF-8"
+    },
+    {
+      "argv": [
+        "GET",
+        "café:日本"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "argv carries arbitrary bytes: a UTF-8 key"
+    },
+    {
+      "argv": [
+        "GET",
+        {
+          "base64": "a2V5AHdpdGgAbnVs"
+        }
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "argv carries arbitrary bytes: a key with NUL bytes"
+    },
+    {
+      "argv": [
+        "EXISTS",
+        "a",
+        "b"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/exists/"
+    },
+    {
+      "argv": [
+        "EXISTS"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "EXISTS",
+        "k0",
+        "k1",
+        "k2",
+        "k3",
+        "k4",
+        "k5",
+        "k6",
+        "k7",
+        "k8",
+        "k9",
+        "k10"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "OBJECT",
+        "ENCODING",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/object-encoding/"
+    },
+    {
+      "argv": [
+        "OBJECT",
+        "ENCODING"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "OBJECT",
+        "FREQ",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/object-freq/"
+    },
+    {
+      "argv": [
+        "OBJECT",
+        "FREQ"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "OBJECT",
+        "IDLETIME",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/object-idletime/"
+    },
+    {
+      "argv": [
+        "OBJECT",
+        "IDLETIME"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "OBJECT",
+        "REFCOUNT",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/object-refcount/"
+    },
+    {
+      "argv": [
+        "OBJECT",
+        "REFCOUNT"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "object",
+        "encoding",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/object-encoding/ (subcommands are case-insensitive)"
+    },
+    {
+      "argv": [
+        "OBJECT"
+      ],
+      "verdict": "deny",
+      "reason": "missing-subcommand",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "OBJECT",
+        "HELP"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-subcommand",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "MEMORY",
+        "USAGE",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/memory-usage/"
+    },
+    {
+      "argv": [
+        "MEMORY",
+        "USAGE",
+        "k",
+        "SAMPLES",
+        "10"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/memory-usage/"
+    },
+    {
+      "argv": [
+        "MEMORY",
+        "USAGE",
+        "k",
+        "SAMPLES",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "https://redis.io/docs/latest/commands/memory-usage/: SAMPLES 0 samples every nested value"
+    },
+    {
+      "argv": [
+        "MEMORY",
+        "USAGE",
+        "k",
+        "SAMPLES",
+        "11"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "MEMORY",
+        "USAGE",
+        "k",
+        "SAMPLES",
+        "-1"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/memory-usage/"
+    },
+    {
+      "argv": [
+        "MEMORY",
+        "USAGE",
+        "k",
+        "DEEP",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-argument",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "MEMORY"
+      ],
+      "verdict": "deny",
+      "reason": "missing-subcommand",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "MEMORY",
+        "STATS"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-subcommand",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "MEMORY",
+        "PURGE"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-subcommand",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "DBSIZE"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/dbsize/"
+    },
+    {
+      "argv": [
+        "DBSIZE",
+        "x"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "RANDOMKEY"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/randomkey/"
+    },
+    {
+      "argv": [
+        "RANDOMKEY",
+        "x"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "MGET",
+        "a",
+        "b"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/mget/"
+    },
+    {
+      "argv": [
+        "MGET",
+        "k0",
+        "k1",
+        "k2",
+        "k3",
+        "k4",
+        "k5",
+        "k6",
+        "k7",
+        "k8",
+        "k9"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 5 (R3): the cap plus one: exactly the cap"
+    },
+    {
+      "argv": [
+        "MGET"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "MGET",
+        "k0",
+        "k1",
+        "k2",
+        "k3",
+        "k4",
+        "k5",
+        "k6",
+        "k7",
+        "k8",
+        "k9",
+        "k10"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "GETRANGE",
+        "k",
+        "0",
+        "-1"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/getrange/"
+    },
+    {
+      "argv": [
+        "GETRANGE",
+        "k",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "GETRANGE",
+        "k",
+        "a",
+        "b"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "Redis string2ll accepts only a canonical decimal integer"
+    },
+    {
+      "argv": [
+        "SUBSTR",
+        "k",
+        "0",
+        "10"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/substr/"
+    },
+    {
+      "argv": [
+        "SUBSTR",
+        "k",
+        "0",
+        "x"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "Redis string2ll accepts only a canonical decimal integer"
+    },
+    {
+      "argv": [
+        "GETBIT",
+        "k",
+        "7"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/getbit/"
+    },
+    {
+      "argv": [
+        "GETBIT",
+        "k",
+        "-1"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/getbit/: the offset is non-negative"
+    },
+    {
+      "argv": [
+        "GETBIT",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "BITCOUNT",
+        "k"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/bitcount/"
+    },
+    {
+      "argv": [
+        "BITCOUNT",
+        "k",
+        "0",
+        "-1",
+        "BIT"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/bitcount/"
+    },
+    {
+      "argv": [
+        "BITCOUNT",
+        "k",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "https://redis.io/docs/latest/commands/bitcount/: start needs end"
+    },
+    {
+      "argv": [
+        "BITCOUNT",
+        "k",
+        "0",
+        "1",
+        "WORD"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-argument",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "BITPOS",
+        "k",
+        "1"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/bitpos/"
+    },
+    {
+      "argv": [
+        "BITPOS",
+        "k",
+        "0",
+        "2",
+        "-1",
+        "byte"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/bitpos/"
+    },
+    {
+      "argv": [
+        "BITPOS",
+        "k",
+        "2"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/bitpos/: bit is 0 or 1"
+    },
+    {
+      "argv": [
+        "HGET",
+        "h",
+        "f"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/hget/"
+    },
+    {
+      "argv": [
+        "HGET",
+        "h"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "HMGET",
+        "h",
+        "a",
+        "b"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/hmget/"
+    },
+    {
+      "argv": [
+        "HMGET",
+        "h"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "HMGET",
+        "h",
+        "f0",
+        "f1",
+        "f2",
+        "f3",
+        "f4",
+        "f5",
+        "f6",
+        "f7",
+        "f8",
+        "f9",
+        "f10"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "HSTRLEN",
+        "h",
+        "f"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/hstrlen/"
+    },
+    {
+      "argv": [
+        "HSTRLEN",
+        "h"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "HEXISTS",
+        "h",
+        "f"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/hexists/"
+    },
+    {
+      "argv": [
+        "HEXISTS",
+        "h"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "HSCAN",
+        "h",
+        "0",
+        "COUNT",
+        "10",
+        "NOVALUES"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/hscan/"
+    },
+    {
+      "argv": [
+        "HSCAN",
+        "h",
+        "0",
+        "MATCH",
+        "f*",
+        "COUNT",
+        "20"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/hscan/"
+    },
+    {
+      "argv": [
+        "HSCAN",
+        "h",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "missing-count",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "HSCAN",
+        "h",
+        "0",
+        "COUNT",
+        "21"
+      ],
+      "verdict": "deny",
+      "reason": "count-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "HSCAN",
+        "h",
+        "0",
+        "COUNT",
+        "10",
+        "NOVALUES",
+        "NOVALUES"
+      ],
+      "verdict": "deny",
+      "reason": "duplicate-argument",
+      "source": "a repeated flag is refused rather than guessed"
+    },
+    {
+      "argv": [
+        "HRANDFIELD",
+        "h"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/hrandfield/"
+    },
+    {
+      "argv": [
+        "HRANDFIELD",
+        "h",
+        "-10",
+        "WITHVALUES"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/hrandfield/: a negative count may repeat fields and is bounded by its absolute value"
+    },
+    {
+      "argv": [
+        "HRANDFIELD",
+        "h",
+        "11"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "HRANDFIELD",
+        "h",
+        "1",
+        "WITHSCORES"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-argument",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "HGETALL",
+        "h"
+      ],
+      "verdict": "deny",
+      "reason": "unbounded-command",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "HKEYS",
+        "h"
+      ],
+      "verdict": "deny",
+      "reason": "unbounded-command",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "HVALS",
+        "h"
+      ],
+      "verdict": "deny",
+      "reason": "unbounded-command",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "LINDEX",
+        "l",
+        "-1"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/lindex/"
+    },
+    {
+      "argv": [
+        "LINDEX",
+        "l",
+        "x"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "Redis string2ll accepts only a canonical decimal integer"
+    },
+    {
+      "argv": [
+        "LINDEX",
+        "l",
+        "9"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 12: LINDEX index must be within the element cap of either end: the last position from the head"
+    },
+    {
+      "argv": [
+        "LINDEX",
+        "l",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "draft criterion 12: LINDEX index must be within the element cap of either end: one past it from the head"
+    },
+    {
+      "argv": [
+        "LINDEX",
+        "l",
+        "-10"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 12: LINDEX index must be within the element cap of either end: the last position from the tail"
+    },
+    {
+      "argv": [
+        "LINDEX",
+        "l",
+        "-11"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "draft criterion 12: LINDEX index must be within the element cap of either end: one past it from the tail"
+    },
+    {
+      "argv": [
+        "LRANGE",
+        "l",
+        "0",
+        "9"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 5 (R3): the cap plus one: a window of exactly the cap"
+    },
+    {
+      "argv": [
+        "LRANGE",
+        "l",
+        "9",
+        "5"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/lrange/: start after stop is an empty window"
+    },
+    {
+      "argv": [
+        "LRANGE",
+        "l",
+        "0",
+        "-1"
+      ],
+      "verdict": "deny",
+      "reason": "unbounded-window",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "LRANGE",
+        "l",
+        "-10",
+        "-1"
+      ],
+      "verdict": "deny",
+      "reason": "unbounded-window",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "LRANGE",
+        "l",
+        "0",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "window-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "LRANGE",
+        "l",
+        "9",
+        "9"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 12: LRANGE stop must be below the element cap: stop at the last position"
+    },
+    {
+      "argv": [
+        "LRANGE",
+        "l",
+        "10",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "draft criterion 12: LRANGE stop must be below the element cap: stop one past it"
+    },
+    {
+      "argv": [
+        "LRANGE",
+        "l",
+        "5",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "draft criterion 12: LRANGE stop must be below the element cap: a window within the cap whose stop is past it"
+    },
+    {
+      "argv": [
+        "LRANGE",
+        "l",
+        "1000000",
+        "1000005"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "https://redis.io/docs/latest/commands/lrange/: O(S+N), S being the distance of start from the head"
+    },
+    {
+      "argv": [
+        "LPOS",
+        "l",
+        "e",
+        "MAXLEN",
+        "10"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/lpos/"
+    },
+    {
+      "argv": [
+        "LPOS",
+        "l",
+        "e",
+        "RANK",
+        "-1",
+        "COUNT",
+        "0",
+        "MAXLEN",
+        "10"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/lpos/: COUNT 0 is bounded by MAXLEN"
+    },
+    {
+      "argv": [
+        "LPOS",
+        "l",
+        "e"
+      ],
+      "verdict": "deny",
+      "reason": "missing-maxlen",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "LPOS",
+        "l",
+        "e",
+        "MAXLEN",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "https://redis.io/docs/latest/commands/lpos/: MAXLEN 0 scans the whole list"
+    },
+    {
+      "argv": [
+        "LPOS",
+        "l",
+        "e",
+        "COUNT",
+        "21",
+        "MAXLEN",
+        "5"
+      ],
+      "verdict": "deny",
+      "reason": "count-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "LPOS",
+        "l",
+        "e",
+        "RANK",
+        "0",
+        "MAXLEN",
+        "5"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/lpos/: RANK cannot be zero"
+    },
+    {
+      "argv": [
+        "LPOS",
+        "l",
+        "e",
+        "MAXLEN",
+        "5",
+        "MAXLEN",
+        "5"
+      ],
+      "verdict": "deny",
+      "reason": "duplicate-argument",
+      "source": "a repeated option is refused rather than guessed"
+    },
+    {
+      "argv": [
+        "SISMEMBER",
+        "s",
+        "m"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/sismember/"
+    },
+    {
+      "argv": [
+        "SISMEMBER",
+        "s"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "SMISMEMBER",
+        "s",
+        "a",
+        "b"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/smismember/"
+    },
+    {
+      "argv": [
+        "SMISMEMBER",
+        "s"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "SMISMEMBER",
+        "s",
+        "m0",
+        "m1",
+        "m2",
+        "m3",
+        "m4",
+        "m5",
+        "m6",
+        "m7",
+        "m8",
+        "m9",
+        "m10"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "SSCAN",
+        "s",
+        "0",
+        "MATCH",
+        "a*",
+        "COUNT",
+        "20"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/sscan/"
+    },
+    {
+      "argv": [
+        "SSCAN",
+        "s",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "missing-count",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "SSCAN",
+        "s",
+        "0",
+        "COUNT",
+        "5",
+        "TYPE",
+        "set"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-argument",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know: TYPE belongs to SCAN"
+    },
+    {
+      "argv": [
+        "SRANDMEMBER",
+        "s"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/srandmember/"
+    },
+    {
+      "argv": [
+        "SRANDMEMBER",
+        "s",
+        "-10"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/srandmember/"
+    },
+    {
+      "argv": [
+        "SRANDMEMBER",
+        "s",
+        "11"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "SRANDMEMBER",
+        "s",
+        "x"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "Redis string2ll accepts only a canonical decimal integer"
+    },
+    {
+      "argv": [
+        "SMEMBERS",
+        "s"
+      ],
+      "verdict": "deny",
+      "reason": "unbounded-command",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "ZSCORE",
+        "z",
+        "m"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zscore/"
+    },
+    {
+      "argv": [
+        "ZSCORE",
+        "z"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "ZMSCORE",
+        "z",
+        "a",
+        "b"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zmscore/"
+    },
+    {
+      "argv": [
+        "ZMSCORE",
+        "z"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "ZMSCORE",
+        "z",
+        "m0",
+        "m1",
+        "m2",
+        "m3",
+        "m4",
+        "m5",
+        "m6",
+        "m7",
+        "m8",
+        "m9",
+        "m10"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "ZRANK",
+        "z",
+        "m",
+        "WITHSCORE"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrank/"
+    },
+    {
+      "argv": [
+        "ZRANK",
+        "z"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "ZREVRANK",
+        "z",
+        "m"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrevrank/"
+    },
+    {
+      "argv": [
+        "ZREVRANK",
+        "z",
+        "m",
+        "WITHSCORES"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-argument",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "ZCOUNT",
+        "z",
+        "-inf",
+        "+inf"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zcount/"
+    },
+    {
+      "argv": [
+        "ZCOUNT",
+        "z",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "ZLEXCOUNT",
+        "z",
+        "-",
+        "+"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zlexcount/"
+    },
+    {
+      "argv": [
+        "ZLEXCOUNT",
+        "z",
+        "-"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "0",
+        "9",
+        "WITHSCORES"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 5 (R3): the cap plus one: a window of exactly the cap"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "-inf",
+        "+inf",
+        "BYSCORE",
+        "LIMIT",
+        "0",
+        "10"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrange/"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "[a",
+        "[z",
+        "BYLEX",
+        "REV",
+        "LIMIT",
+        "0",
+        "10"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrange/"
+    },
+    {
+      "argv": [
+        "zrange",
+        "z",
+        "(1",
+        "5",
+        "byscore",
+        "withscores",
+        "limit",
+        "2",
+        "3"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrange/ (options are case-insensitive)"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "0",
+        "-1"
+      ],
+      "verdict": "deny",
+      "reason": "unbounded-window",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "0",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "window-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "-inf",
+        "+inf",
+        "BYSCORE"
+      ],
+      "verdict": "deny",
+      "reason": "missing-limit",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "0",
+        "5",
+        "STORE",
+        "d"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-argument",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "0",
+        "5",
+        "BYSCORE",
+        "BYLEX",
+        "LIMIT",
+        "0",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/zrange/: BYSCORE and BYLEX are exclusive"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "0",
+        "5",
+        "LIMIT",
+        "0",
+        "5"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/zrange/: LIMIT needs BYSCORE or BYLEX"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "0",
+        "5",
+        "BYSCORE",
+        "LIMIT",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "https://redis.io/docs/latest/commands/zrange/"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "-inf",
+        "+inf",
+        "BYSCORE",
+        "LIMIT",
+        "9",
+        "1"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 12: LIMIT offset + count must be at most the element cap: at the bound"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "-inf",
+        "+inf",
+        "BYSCORE",
+        "LIMIT",
+        "10",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "draft criterion 12: LIMIT offset + count must be at most the element cap: one past it"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "[a",
+        "[z",
+        "BYLEX",
+        "LIMIT",
+        "5",
+        "5"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 12: LIMIT offset + count must be at most the element cap: at the bound"
+    },
+    {
+      "argv": [
+        "ZRANGE",
+        "z",
+        "[a",
+        "[z",
+        "BYLEX",
+        "REV",
+        "LIMIT",
+        "5",
+        "6"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "draft criterion 12: LIMIT offset + count must be at most the element cap: one past it"
+    },
+    {
+      "argv": [
+        "ZRANGEBYSCORE",
+        "z",
+        "-inf",
+        "+inf",
+        "WITHSCORES",
+        "LIMIT",
+        "0",
+        "10"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrangebyscore/"
+    },
+    {
+      "argv": [
+        "ZRANGEBYSCORE",
+        "z",
+        "-inf",
+        "+inf"
+      ],
+      "verdict": "deny",
+      "reason": "missing-limit",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "ZRANGEBYSCORE",
+        "z",
+        "-inf",
+        "+inf",
+        "LIMIT",
+        "0",
+        "-1"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "https://redis.io/docs/latest/commands/zrangebyscore/: a negative count returns every element"
+    },
+    {
+      "argv": [
+        "ZRANGEBYSCORE",
+        "z",
+        "-inf",
+        "+inf",
+        "LIMIT",
+        "9",
+        "1"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 12: LIMIT offset + count must be at most the element cap: at the bound"
+    },
+    {
+      "argv": [
+        "ZRANGEBYSCORE",
+        "z",
+        "-inf",
+        "+inf",
+        "LIMIT",
+        "999999999",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "https://redis.io/docs/latest/commands/zrangebyscore/: a large offset is traversed before the reply"
+    },
+    {
+      "argv": [
+        "ZRANGEBYSCORE",
+        "z",
+        "-inf",
+        "+inf",
+        "LIMIT",
+        "9223372036854775807",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "draft criterion 12: LIMIT offset + count must be at most the element cap: an offset at the int64 maximum must not overflow the sum"
+    },
+    {
+      "argv": [
+        "ZREVRANGEBYSCORE",
+        "z",
+        "+inf",
+        "-inf",
+        "LIMIT",
+        "5",
+        "5"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrevrangebyscore/"
+    },
+    {
+      "argv": [
+        "ZREVRANGEBYSCORE",
+        "z",
+        "+inf",
+        "-inf"
+      ],
+      "verdict": "deny",
+      "reason": "missing-limit",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "ZREVRANGEBYSCORE",
+        "z",
+        "+inf",
+        "-inf",
+        "LIMIT",
+        "6",
+        "5"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "draft criterion 12: LIMIT offset + count must be at most the element cap: one past the bound"
+    },
+    {
+      "argv": [
+        "ZRANGEBYLEX",
+        "z",
+        "-",
+        "+",
+        "LIMIT",
+        "0",
+        "5"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrangebylex/"
+    },
+    {
+      "argv": [
+        "ZRANGEBYLEX",
+        "z",
+        "-",
+        "+"
+      ],
+      "verdict": "deny",
+      "reason": "missing-limit",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "ZRANGEBYLEX",
+        "z",
+        "-",
+        "+",
+        "LIMIT",
+        "8",
+        "2"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 12: LIMIT offset + count must be at most the element cap: at the bound"
+    },
+    {
+      "argv": [
+        "ZRANGEBYLEX",
+        "z",
+        "-",
+        "+",
+        "LIMIT",
+        "8",
+        "3"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "draft criterion 12: LIMIT offset + count must be at most the element cap: one past it"
+    },
+    {
+      "argv": [
+        "ZRANGEBYLEX",
+        "z",
+        "-",
+        "+",
+        "LIMIT",
+        "0",
+        "5",
+        "WITHSCORES"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-argument",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "ZREVRANGEBYLEX",
+        "z",
+        "+",
+        "-",
+        "LIMIT",
+        "0",
+        "5"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrevrangebylex/"
+    },
+    {
+      "argv": [
+        "ZREVRANGEBYLEX",
+        "z",
+        "+",
+        "-"
+      ],
+      "verdict": "deny",
+      "reason": "missing-limit",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "ZREVRANGEBYLEX",
+        "z",
+        "+",
+        "-",
+        "LIMIT",
+        "10",
+        "0"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "draft criterion 12: LIMIT offset + count must be at most the element cap: at the bound with a zero count"
+    },
+    {
+      "argv": [
+        "ZREVRANGEBYLEX",
+        "z",
+        "+",
+        "-",
+        "LIMIT",
+        "999999999",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "https://redis.io/docs/latest/commands/zrangebyscore/: a large offset is traversed before the reply"
+    },
+    {
+      "argv": [
+        "ZREVRANGE",
+        "z",
+        "0",
+        "9"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrevrange/"
+    },
+    {
+      "argv": [
+        "ZREVRANGE",
+        "z",
+        "0",
+        "-1"
+      ],
+      "verdict": "deny",
+      "reason": "unbounded-window",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "ZSCAN",
+        "z",
+        "0",
+        "COUNT",
+        "5"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zscan/"
+    },
+    {
+      "argv": [
+        "ZSCAN",
+        "z",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "missing-count",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "ZRANDMEMBER",
+        "z",
+        "5",
+        "WITHSCORES"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/zrandmember/"
+    },
+    {
+      "argv": [
+        "ZRANDMEMBER",
+        "z",
+        "-11"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "XRANGE",
+        "s",
+        "-",
+        "+",
+        "COUNT",
+        "20"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/xrange/"
+    },
+    {
+      "argv": [
+        "XRANGE",
+        "s",
+        "-",
+        "+"
+      ],
+      "verdict": "deny",
+      "reason": "missing-count",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "XRANGE",
+        "s",
+        "-",
+        "+",
+        "COUNT",
+        "21"
+      ],
+      "verdict": "deny",
+      "reason": "count-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "XREVRANGE",
+        "s",
+        "+",
+        "-",
+        "COUNT",
+        "1"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/xrevrange/"
+    },
+    {
+      "argv": [
+        "XREVRANGE",
+        "s",
+        "+",
+        "-"
+      ],
+      "verdict": "deny",
+      "reason": "missing-count",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "XINFO",
+        "STREAM",
+        "s"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/xinfo-stream/"
+    },
+    {
+      "argv": [
+        "XINFO",
+        "STREAM",
+        "s",
+        "FULL",
+        "COUNT",
+        "20"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/xinfo-stream/"
+    },
+    {
+      "argv": [
+        "XINFO",
+        "STREAM",
+        "s",
+        "FULL"
+      ],
+      "verdict": "deny",
+      "reason": "missing-count",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "XINFO",
+        "STREAM",
+        "s",
+        "FULL",
+        "COUNT",
+        "21"
+      ],
+      "verdict": "deny",
+      "reason": "count-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "XINFO",
+        "STREAM"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "XINFO"
+      ],
+      "verdict": "deny",
+      "reason": "missing-subcommand",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "XINFO",
+        "HELP"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-subcommand",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "XINFO",
+        "GROUPS",
+        "s"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/xinfo-groups/"
+    },
+    {
+      "argv": [
+        "XINFO",
+        "GROUPS"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "XINFO",
+        "CONSUMERS",
+        "s",
+        "g"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/xinfo-consumers/"
+    },
+    {
+      "argv": [
+        "XINFO",
+        "CONSUMERS",
+        "s"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "XPENDING",
+        "s",
+        "g"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/xpending/: the summary form"
+    },
+    {
+      "argv": [
+        "XPENDING",
+        "s",
+        "g",
+        "-",
+        "+",
+        "10"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/xpending/"
+    },
+    {
+      "argv": [
+        "XPENDING",
+        "s",
+        "g",
+        "IDLE",
+        "60000",
+        "-",
+        "+",
+        "10",
+        "consumer"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "https://redis.io/docs/latest/commands/xpending/: Redis skips entries younger than IDLE without counting them, so COUNT does not bound the walk"
+    },
+    {
+      "argv": [
+        "XPENDING",
+        "s",
+        "g",
+        "IDLE",
+        "9223372036854775807",
+        "-",
+        "+",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "https://redis.io/docs/latest/commands/xpending/: Redis skips entries younger than IDLE without counting them, so COUNT does not bound the walk"
+    },
+    {
+      "argv": [
+        "XPENDING",
+        "s",
+        "g",
+        "IDLE",
+        "9223372036854775807",
+        "-",
+        "+",
+        "1",
+        "consumer"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "https://redis.io/docs/latest/commands/xpending/: Redis skips entries younger than IDLE without counting them, so COUNT does not bound the walk"
+    },
+    {
+      "argv": [
+        "XPENDING",
+        "s",
+        "g",
+        "-",
+        "+"
+      ],
+      "verdict": "deny",
+      "reason": "missing-count",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "XPENDING",
+        "s",
+        "g",
+        "-"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "https://redis.io/docs/latest/commands/xpending/"
+    },
+    {
+      "argv": [
+        "XPENDING",
+        "s",
+        "g",
+        "IDLE",
+        "-1",
+        "-",
+        "+",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "traversal-too-deep",
+      "source": "https://redis.io/docs/latest/commands/xpending/: IDLE is refused whatever its value"
+    },
+    {
+      "argv": [
+        "XPENDING",
+        "s",
+        "g",
+        "-",
+        "+",
+        "21"
+      ],
+      "verdict": "deny",
+      "reason": "count-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "GEOPOS",
+        "g",
+        "a",
+        "b"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/geopos/"
+    },
+    {
+      "argv": [
+        "GEOPOS"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "GEOPOS",
+        "g",
+        "m0",
+        "m1",
+        "m2",
+        "m3",
+        "m4",
+        "m5",
+        "m6",
+        "m7",
+        "m8",
+        "m9",
+        "m10"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "GEODIST",
+        "g",
+        "a",
+        "b",
+        "km"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/geodist/"
+    },
+    {
+      "argv": [
+        "GEODIST",
+        "g",
+        "a",
+        "b",
+        "parsec"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-argument",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "GEODIST",
+        "g",
+        "a"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "GEOHASH",
+        "g",
+        "a"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/geohash/"
+    },
+    {
+      "argv": [
+        "GEOHASH"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "GEOHASH",
+        "g",
+        "m0",
+        "m1",
+        "m2",
+        "m3",
+        "m4",
+        "m5",
+        "m6",
+        "m7",
+        "m8",
+        "m9",
+        "m10"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "GEOSEARCH",
+        "g",
+        "FROMMEMBER",
+        "m",
+        "BYRADIUS",
+        "100",
+        "km",
+        "ASC",
+        "COUNT",
+        "10",
+        "ANY",
+        "WITHDIST"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/geosearch/"
+    },
+    {
+      "argv": [
+        "GEOSEARCH",
+        "g",
+        "FROMLONLAT",
+        "13.36",
+        "38.11",
+        "BYBOX",
+        "400",
+        "400",
+        "km",
+        "COUNT",
+        "5",
+        "WITHCOORD",
+        "WITHHASH"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/geosearch/"
+    },
+    {
+      "argv": [
+        "GEOSEARCH",
+        "g",
+        "FROMMEMBER",
+        "m",
+        "BYRADIUS",
+        "100",
+        "km"
+      ],
+      "verdict": "deny",
+      "reason": "missing-count",
+      "source": "draft criterion 4 (R2): a read without a cost ceiling"
+    },
+    {
+      "argv": [
+        "GEOSEARCH",
+        "g",
+        "FROMMEMBER",
+        "m",
+        "BYRADIUS",
+        "100",
+        "km",
+        "COUNT",
+        "5",
+        "STOREDIST"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-argument",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know: STOREDIST belongs to GEOSEARCHSTORE"
+    },
+    {
+      "argv": [
+        "GEOSEARCH",
+        "g",
+        "BYRADIUS",
+        "100",
+        "km",
+        "COUNT",
+        "5"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/geosearch/: one origin is required"
+    },
+    {
+      "argv": [
+        "GEOSEARCH",
+        "g",
+        "FROMMEMBER",
+        "a",
+        "FROMMEMBER",
+        "b",
+        "BYRADIUS",
+        "1",
+        "m",
+        "COUNT",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "invalid-argument",
+      "source": "https://redis.io/docs/latest/commands/geosearch/: exactly one origin"
+    },
+    {
+      "argv": [
+        "GEOSEARCH",
+        "g",
+        "FROMMEMBER",
+        "m",
+        "BYRADIUS",
+        "100",
+        "km",
+        "COUNT",
+        "21"
+      ],
+      "verdict": "deny",
+      "reason": "count-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [
+        "PFCOUNT",
+        "h"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/pfcount/"
+    },
+    {
+      "argv": [
+        "PFCOUNT",
+        "h1",
+        "h2"
+      ],
+      "verdict": "allow",
+      "reason": "bounded-read",
+      "source": "https://redis.io/docs/latest/commands/pfcount/"
+    },
+    {
+      "argv": [
+        "PFCOUNT"
+      ],
+      "verdict": "deny",
+      "reason": "wrong-arity",
+      "source": "arity from COMMAND INFO on redis:7.4.2-alpine"
+    },
+    {
+      "argv": [
+        "PFCOUNT",
+        "h0",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "h7",
+        "h8",
+        "h9",
+        "h10"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-elements",
+      "source": "draft criterion 5 (R3): the cap plus one"
+    },
+    {
+      "argv": [],
+      "verdict": "deny",
+      "reason": "empty-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know: an empty argv"
+    },
+    {
+      "argv": [
+        "MGET",
+        "k0",
+        "k1",
+        "k2",
+        "k3",
+        "k4",
+        "k5",
+        "k6",
+        "k7",
+        "k8",
+        "k9",
+        "k10",
+        "k11",
+        "k12",
+        "k13",
+        "k14",
+        "k15",
+        "k16",
+        "k17",
+        "k18",
+        "k19",
+        "k20",
+        "k21",
+        "k22",
+        "k23"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-arguments",
+      "source": "draft criterion 5 (R3): the cap plus one: the argv length is checked before the command rule"
+    },
+    {
+      "argv": [
+        "DEL",
+        "k0",
+        "k1",
+        "k2",
+        "k3",
+        "k4",
+        "k5",
+        "k6",
+        "k7",
+        "k8",
+        "k9",
+        "k10",
+        "k11",
+        "k12",
+        "k13",
+        "k14",
+        "k15",
+        "k16",
+        "k17",
+        "k18",
+        "k19",
+        "k20",
+        "k21",
+        "k22",
+        "k23"
+      ],
+      "verdict": "deny",
+      "reason": "too-many-arguments",
+      "source": "draft criterion 5 (R3): the cap plus one: the argv length is checked before the name"
+    },
+    {
+      "argv": [
+        "GET",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+      ],
+      "verdict": "deny",
+      "reason": "command-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one: the argv bytes are checked before the command rule"
+    },
+    {
+      "argv": [
+        "SET",
+        "k",
+        "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+      ],
+      "verdict": "deny",
+      "reason": "command-too-large",
+      "source": "draft criterion 5 (R3): the cap plus one: the argv bytes are checked before the name"
+    },
+    {
+      "argv": [
+        "SET",
+        "k",
+        "v"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "DEL",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "UNLINK",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "FLUSHALL"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "flushall"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "FlUsHdB"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "CONFIG",
+        "GET",
+        "*"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "CONFIG",
+        "SET",
+        "maxmemory",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "EVAL",
+        "return 1",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "EVAL_RO",
+        "return 1",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "EVALSHA_RO",
+        "e0e1f9fabfc9d4800c877a703b823ac0578ff8db",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "FCALL_RO",
+        "f",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "SCRIPT",
+        "FLUSH"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "FUNCTION",
+        "LIST"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "MULTI"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "EXEC"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "SELECT",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "SWAPDB",
+        "0",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "SUBSCRIBE",
+        "c"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "PSUBSCRIBE",
+        "c*"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "MONITOR"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "DEBUG",
+        "SLEEP",
+        "10"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "BLPOP",
+        "k",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "BLMOVE",
+        "a",
+        "b",
+        "LEFT",
+        "RIGHT",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "XREAD",
+        "COUNT",
+        "1",
+        "STREAMS",
+        "s",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "XREADGROUP",
+        "GROUP",
+        "g",
+        "c",
+        "STREAMS",
+        "s",
+        ">"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "KEYS",
+        "*"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "SORT",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "SORT_RO",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "GEORADIUS",
+        "k",
+        "0",
+        "0",
+        "1",
+        "km"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "GEORADIUS_RO",
+        "k",
+        "0",
+        "0",
+        "1",
+        "km"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "INFO"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "CLIENT",
+        "LIST"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "SHUTDOWN"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "MIGRATE",
+        "h",
+        "6379",
+        "k",
+        "0",
+        "1000"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "RESTORE",
+        "k",
+        "0",
+        "p"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "DUMP",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "TOUCH",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "LCS",
+        "a",
+        "b"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "GETEX",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "GETDEL",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "AUTH",
+        "pw"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "HELLO",
+        "3"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "ACL",
+        "WHOAMI"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "MODULE",
+        "LIST"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "WAIT",
+        "1",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "SINTER",
+        "a",
+        "b"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "ZRANGESTORE",
+        "d",
+        "z",
+        "0",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "GEOSEARCHSTORE",
+        "d",
+        "g",
+        "FROMMEMBER",
+        "m",
+        "BYRADIUS",
+        "1",
+        "m",
+        "COUNT",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "HTTL",
+        "h",
+        "FIELDS",
+        "1",
+        "f"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "SLOWLOG",
+        "GET"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "PFADD",
+        "h",
+        "x"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "BITFIELD_RO",
+        "k",
+        "GET",
+        "u8",
+        "0"
+      ],
+      "verdict": "deny",
+      "reason": "forbidden-command",
+      "source": "draft criterion 3 (R1): forbidden catalogue"
+    },
+    {
+      "argv": [
+        "NOSUCHCOMMAND"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "GETX",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "JSON.GET",
+        "k",
+        "$"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "FT.SEARCH",
+        "idx",
+        "*"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "TS.RANGE",
+        "t",
+        "-",
+        "+"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "BF.EXISTS",
+        "b",
+        "x"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "ſcan",
+        "0",
+        "COUNT",
+        "1"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        {
+          "base64": "/w=="
+        },
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        {
+          "base64": "R0VUAA=="
+        },
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    },
+    {
+      "argv": [
+        "",
+        "k"
+      ],
+      "verdict": "deny",
+      "reason": "unknown-command",
+      "source": "draft criterion 6 (R4): not on the allowlist, or an option the rule does not know"
+    }
+  ]
+}

@@ -65,6 +65,7 @@ var requiredWholeModuleSources = []string{
 	path.Join(repoDir, "internal/gate/engine.go"),
 	path.Join(repoDir, "internal/httplog/httplog.go"),
 	path.Join(repoDir, "internal/mcp/audit.go"),
+	path.Join(repoDir, "internal/redisgate/gate.go"),
 	path.Join(repoDir, "internal/refuse/refuse.go"),
 	path.Join(repoDir, "tools/reachability/main.go"),
 	path.Join(repoDir, "tools/wide-schema/main.go"),
