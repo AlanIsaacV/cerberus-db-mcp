@@ -788,6 +788,169 @@ address. If it does ever appear, its body is `Forbidden: invalid Host header
 tell it apart from an identity-allowlist refusal. The SDK rule remains relevant
 when running the binary directly with its loopback default.
 
+## Raspberry Pi deployment of cerberus-cache-mcp
+
+The Redis MCP server ships as a second image, `ghcr.io/alanisaacv/cerberus-cache-mcp`,
+built from the same Dockerfile (target `cerberus-cache-mcp`) and published by the
+same release run, on the same version, as `ghcr.io/alanisaacv/cerberus-db-mcp`.
+Its entrypoint is `/usr/local/bin/cerberus-redis-mcp`, and the image contains no
+other binary. It runs as its own service, from its own stack directory, beside the
+SQL stack; nothing in the SQL stack changes.
+
+Like the SQL deployment, this has not yet been run on the Pi.
+
+### The stack directory
+
+On the Pi, create `/opt/stacks/cerberus-cache-mcp` and copy into it:
+
+- `deploy/cache/compose.yaml` as `compose.yaml`;
+- `deploy/cache/.env.example` as `.env`, then fill it in.
+
+The compose file runs one service, `cerberus-cache-mcp`, from the `:latest`
+image, restarts it unless stopped, sets `CERBERUS_MCP_ADDRESS=0.0.0.0:8080`, and
+starts at `mem_reservation: 64m` and `mem_limit: 256m` — starting points, not
+measurements; "Measure memory before tuning it" below applies with the service
+name changed. It publishes no host port and joins the external `homelab`
+network, which must already exist. It has no healthcheck, for the reason
+"Health and logs" gives, and no gate mount: the Redis binary reads no overlay.
+`.env` is required, so a stack directory without one fails at `docker compose`
+rather than starting a restart loop.
+
+Deploy and update from that directory with:
+
+```sh
+docker compose pull && docker compose up -d
+```
+
+To roll back, pin a release tag such as `:vX.Y.Z` in `image:` and repeat
+`docker compose pull && docker compose up -d`. Both images carry the same
+version, so the tag that matches a SQL release is the one built from the same
+commit.
+
+The first release that publishes this image creates a new ghcr package. If the
+SQL package is public and the Pi pulls without logging in, give the new package
+the same visibility in its package settings before the first pull.
+
+### The env file
+
+`deploy/cache/.env.example` names every variable the Redis binary reads and
+nothing else. A blank value is the same as unset.
+
+- `CERBERUS_MCP_*`: as in "Defaulted or optional" above. The compose file's
+  `CERBERUS_MCP_ADDRESS` takes precedence over the one in `.env`, so the listen
+  address is changed in `compose.yaml`, not in `.env`. There is no
+  `CERBERUS_MCP_GATE_OVERLAY` here.
+- `CERBERUS_AUTH_*`: the same six variables, with the same rules, as in
+  "Required" above. The sections below cover the two whose values differ from
+  the SQL server's: `CERBERUS_AUTH_PUBLIC_BASE_URL`, and the choice behind
+  `CERBERUS_AUTH_SEALING_SECRET`. `CERBERUS_AUTH_CLIENT_REDIRECT_URIS` lists the
+  redirect URIs of the clients that connect to this server.
+- Redis settings, each shown at its default: `CERBERUS_REDIS_COMMAND_TIMEOUT`
+  (`20s`), `CERBERUS_REDIS_CONNECT_TIMEOUT` (`10s`), `CERBERUS_REDIS_MAX_CONNS`
+  (`4`, per `<alias>.<number>`), `CERBERUS_REDIS_REPLY_BYTE_BUDGET` (`32768`),
+  `CERBERUS_REDIS_MAX_ELEMENTS` (`1000`), `CERBERUS_REDIS_MAX_COUNT` (`1000`),
+  `CERBERUS_REDIS_MAX_ARGS` (`1024`) and `CERBERUS_REDIS_MAX_ARGV_BYTES`
+  (`65536`). Each must be positive.
+- `CERBERUS_REDIS_ALIASES`: the comma-separated Redis aliases. The template
+  configures one, `cache`. Each alias needs a variable family named after it,
+  upper-cased with hyphens changed to underscores — for `cache`,
+  `CERBERUS_REDIS_CACHE_HOST`, `CERBERUS_REDIS_CACHE_PORT`,
+  `CERBERUS_REDIS_CACHE_USER`, `CERBERUS_REDIS_CACHE_PASSWORD` and
+  `CERBERUS_REDIS_CACHE_DATABASES`, all required, and the optional
+  `CERBERUS_REDIS_CACHE_TLS`.
+- `_DATABASES` is a comma-separated list of logical database numbers, and each
+  becomes an alias of its own named `<alias>.<number>`: the template's `cache`
+  with `0` is what `list_connections` reports as `cache.0`.
+- `_TLS` is `disable` when unset; `require` verifies the server's certificate
+  against the host name, and `require-insecure` encrypts without verifying it.
+- `_PASSWORD` refuses whitespace rather than trimming it.
+
+A set `CERBERUS_REDIS_*` variable that belongs to no configured alias — one left
+behind when an alias was removed, or a misspelled suffix — refuses startup and
+names the variable. Startup does not connect to Redis, so a wrong host or
+password shows up at the first tool call, not at `docker compose up`.
+
+### A hostname of its own
+
+The Redis server needs its own public hostname, such as
+`https://<cache-hostname>`, and cannot live under a path of the SQL one. Every
+route of the authorization flow — `/authorize`, `/authorize/callback`, `/token`
+and the `/.well-known/` documents listed in "What is served" — is mounted at the
+origin's root, so two servers behind one hostname would claim the same paths.
+
+Set `CERBERUS_AUTH_PUBLIC_BASE_URL` to that origin, with the same rules as
+above, and register `<CERBERUS_AUTH_PUBLIC_BASE_URL>/authorize/callback` as an
+authorized redirect URI on the Google OAuth client this server uses. That can be
+the SQL server's client, with the new callback added beside the existing one, or
+a client of its own; `CERBERUS_AUTH_GOOGLE_CLIENT_ID` and
+`CERBERUS_AUTH_GOOGLE_CLIENT_SECRET` follow whichever you choose.
+
+### Sharing the sealing secret, or not
+
+`CERBERUS_AUTH_SEALING_SECRET` is the key every credential this server issues is
+sealed with, and a credential carries no record of which server issued it.
+
+- **Shared with the SQL server**: a credential issued by either server opens the
+  other. Each server still applies its own `CERBERUS_AUTH_ALLOWED_EMAILS` to every
+  request, so this matters only for identities both allowlists admit. Rotating
+  the secret means changing it in both stacks, which signs everybody out of
+  both.
+- **Separate**: generate a new base64-encoded 32-byte value for this stack. Each
+  server's credentials open only that server, each client signs in to each
+  server separately, and either secret can be rotated without touching the other.
+
+### The read-only ACL user on each Redis
+
+The command gate in the binary is the first layer of read-only enforcement. The
+second is the Redis account it connects as. On each Redis instance an alias
+points at, create a user that can read and select a database, and nothing else —
+the rule the integration tests run against:
+
+```text
+ACL SETUSER <user> on ><password> ~* &* +@read +select
+```
+
+Put that user and password in the alias's `_USER` and `_PASSWORD`. `ACL SETUSER`
+takes effect immediately but lasts only until the instance restarts unless that
+instance persists its ACLs (`ACL SAVE` with an ACL file, or `CONFIG REWRITE`).
+The Pi has to reach each instance's host and port on its own network; nothing in
+this repository can check that.
+
+### Cloudflare Tunnel rule
+
+Add a rule for the new hostname to the shared cloudflared configuration, routing
+the whole hostname — not only `/mcp`, for the reason "Cloudflare Tunnel" above
+gives — to the service by name over `homelab`:
+
+```yaml
+ingress:
+  - hostname: <cache-hostname>
+    service: http://cerberus-cache-mcp:8080
+```
+
+The port is the one in the compose file's `CERBERUS_MCP_ADDRESS`; change one
+and the other has to follow. Then confirm the public surface the same way as
+the SQL server's:
+
+```sh
+go run ./tools/reachability https://<cache-hostname>
+```
+
+### Connecting Claude Code
+
+```sh
+claude mcp add --transport http cerberus-cache https://<cache-hostname>/mcp
+```
+
+The sign-in works as described in "Configuring Claude Code", against this
+server's own `CERBERUS_AUTH_CLIENT_REDIRECT_URIS` and allowlist. The `401`
+challenge still names `realm="cerberus-db-mcp"`; that string is shared with the
+SQL server's code and has no effect on the flow.
+
+To see logs or memory, use the commands in "Health and logs" and "Measure memory
+before tuning it" from `/opt/stacks/cerberus-cache-mcp`, with
+`cerberus-cache-mcp` as the service name.
+
 ## Health and logs
 
 `GET /healthz` returns `200` without authentication and does not touch a

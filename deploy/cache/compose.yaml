@@ -1,0 +1,17 @@
+services:
+  cerberus-cache-mcp:
+    image: ghcr.io/alanisaacv/cerberus-cache-mcp:latest
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      CERBERUS_MCP_ADDRESS: "0.0.0.0:8080"
+    mem_reservation: 64m
+    mem_limit: 256m
+    networks:
+      - homelab
+
+networks:
+  homelab:
+    external: true

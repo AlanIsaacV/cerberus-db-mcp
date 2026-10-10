@@ -24,7 +24,7 @@ concurrency:
 
 permissions:
   contents: write   # create the tag, commit CHANGELOG.md and create the Release
-  packages: write   # push the image to ghcr
+  packages: write   # push the images to ghcr
 
 env:
   REGISTRY: ghcr.io
@@ -37,11 +37,12 @@ jobs:
         with:
           fetch-depth: 0   # git-cliff needs the complete history and its tags
 
-      - name: Lowercase image name
+      - name: Lowercase image names
         # ghcr/Docker require a lowercase repository path. The owner can contain
         # uppercase letters, so normalize GITHUB_REPOSITORY before it reaches a tag.
         run: |
           echo "IMAGE=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+          echo "IMAGE_OWNER=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
       - name: Install git-cliff
         uses: taiki-e/install-action@v2
@@ -117,6 +118,22 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build and publish arm64 cache image
+        if: steps.version.outputs.release == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: cerberus-cache-mcp
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cerberus-cache-mcp:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cerberus-cache-mcp:latest
+          cache-from: |
+            type=gha
+            type=gha,scope=cerberus-cache-mcp
+          cache-to: type=gha,mode=max,scope=cerberus-cache-mcp
 
       - name: Create GitHub Release
         if: steps.version.outputs.release == 'true'
