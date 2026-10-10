@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.10.0 - 2026-10-10
+
+
+### Features
+
+- A read-only Redis command gate as a standalone package
+
+- A gated Redis connection layer with bounded replies
+
+- The cerberus-redis-mcp binary over a shared MCP server core
+
+- Publish and deploy cerberus-redis-mcp as the cerberus-cache-mcp image
+
+
 ## v0.9.0 - 2026-10-08
 
 
