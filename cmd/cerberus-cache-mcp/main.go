@@ -18,7 +18,7 @@ func main() {
 	log := mcpserve.NewLogger(os.Stdout)
 
 	if err := run(log); err != nil {
-		log.Error().Err(err).Msg("cerberus-redis-mcp is exiting on an error")
+		log.Error().Err(err).Msg("cerberus-cache-mcp is exiting on an error")
 		os.Exit(1)
 	}
 }

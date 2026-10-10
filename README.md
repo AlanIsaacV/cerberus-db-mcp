@@ -793,7 +793,7 @@ when running the binary directly with its loopback default.
 The Redis MCP server ships as a second image, `ghcr.io/alanisaacv/cerberus-cache-mcp`,
 built from the same Dockerfile (target `cerberus-cache-mcp`) and published by the
 same release run, on the same version, as `ghcr.io/alanisaacv/cerberus-db-mcp`.
-Its entrypoint is `/usr/local/bin/cerberus-redis-mcp`, and the image contains no
+Its entrypoint is `/usr/local/bin/cerberus-cache-mcp`, and the image contains no
 other binary. It runs as its own service, from its own stack directory, beside the
 SQL stack; nothing in the SQL stack changes.
 

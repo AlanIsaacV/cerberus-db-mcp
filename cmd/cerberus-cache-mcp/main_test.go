@@ -222,7 +222,7 @@ func unauthenticatedPost(t *testing.T, address string) (int, string, string) {
 }
 
 func TestTheCompiledBinaryRefusesToStartWithoutRedisAliasesOrAuthentication(t *testing.T) {
-	binary := build(t, ".", "cerberus-redis-mcp")
+	binary := build(t, ".", "cerberus-cache-mcp")
 	for _, variable := range []string{
 		"CERBERUS_REDIS_ALIASES",
 		"CERBERUS_AUTH_GOOGLE_CLIENT_ID",
@@ -250,7 +250,7 @@ func TestTheCompiledBinaryRefusesToStartWithoutRedisAliasesOrAuthentication(t *t
 }
 
 func TestTheCompiledBinaryRefusesAnUnusableLogLevel(t *testing.T) {
-	binary := build(t, ".", "cerberus-redis-mcp")
+	binary := build(t, ".", "cerberus-cache-mcp")
 	command := exec.Command(binary)
 	command.Env = append(redisEnvironment(reservedAddress(t)), "CERBERUS_MCP_LOG_LEVEL=trace")
 	output, err := command.CombinedOutput()
@@ -264,7 +264,7 @@ func TestTheCompiledBinaryRefusesAnUnusableLogLevel(t *testing.T) {
 }
 
 func TestTheCompiledBinaryAppliesTheConfiguredLogLevelToEveryLine(t *testing.T) {
-	binary := build(t, ".", "cerberus-redis-mcp")
+	binary := build(t, ".", "cerberus-cache-mcp")
 	for _, tt := range []struct {
 		level     string
 		infoLines bool
@@ -287,7 +287,7 @@ func TestTheCompiledBinaryAppliesTheConfiguredLogLevelToEveryLine(t *testing.T) 
 }
 
 func TestTheCompiledBinaryAnswersHealthAndTheSameChallengeAsTheSQLBinary(t *testing.T) {
-	redisBinary := build(t, ".", "cerberus-redis-mcp")
+	redisBinary := build(t, ".", "cerberus-cache-mcp")
 	sqlBinary := build(t, "../cerberus-db-mcp", "cerberus-db-mcp")
 
 	redisAddress := reservedAddress(t)

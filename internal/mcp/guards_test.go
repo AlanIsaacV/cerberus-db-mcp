@@ -37,7 +37,7 @@ import (
 // the only path base available to a test.
 const cmdDir = "../../cmd/cerberus-db-mcp"
 
-const redisCmdDir = "../../cmd/cerberus-redis-mcp"
+const redisCmdDir = "../../cmd/cerberus-cache-mcp"
 
 var binaryDirs = []string{cmdDir, redisCmdDir}
 
@@ -77,7 +77,7 @@ var requiredBinarySources = append(slices.Clone(requiredSources),
 // each package remains explicit for review when it is added.
 var requiredWholeModuleSources = []string{
 	path.Join(repoDir, "cmd/cerberus-db-mcp/main.go"),
-	path.Join(repoDir, "cmd/cerberus-redis-mcp/main.go"),
+	path.Join(repoDir, "cmd/cerberus-cache-mcp/main.go"),
 	path.Join(repoDir, "internal/auth/config.go"),
 	path.Join(repoDir, "internal/authflow/config.go"),
 	path.Join(repoDir, "internal/db/config.go"),

@@ -19,14 +19,14 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/cerberus-db-mcp ./cmd/cerberus-db-mcp
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/cerberus-redis-mcp ./cmd/cerberus-redis-mcp
+    go build -trimpath -ldflags="-s -w" -o /out/cerberus-cache-mcp ./cmd/cerberus-cache-mcp
 
 FROM gcr.io/distroless/static-debian12:nonroot AS cerberus-cache-mcp
 
-COPY --from=builder /out/cerberus-redis-mcp /usr/local/bin/cerberus-redis-mcp
+COPY --from=builder /out/cerberus-cache-mcp /usr/local/bin/cerberus-cache-mcp
 
 USER nonroot:nonroot
-ENTRYPOINT ["/usr/local/bin/cerberus-redis-mcp"]
+ENTRYPOINT ["/usr/local/bin/cerberus-cache-mcp"]
 
 # Final: distroless deliberately supplies neither a shell nor package manager.
 # The image therefore exposes only the static server binary and runs it as the

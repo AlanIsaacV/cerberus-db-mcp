@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	ServerName    = "cerberus-redis-mcp"
+	ServerName    = "cerberus-cache-mcp"
 	serverVersion = "0.1.0"
 )
 

@@ -35,7 +35,7 @@ import (
 // guarded.
 const cmdDir = "../../cmd/cerberus-db-mcp"
 
-const redisCmdDir = "../../cmd/cerberus-redis-mcp"
+const redisCmdDir = "../../cmd/cerberus-cache-mcp"
 
 var cmdDirs = []string{cmdDir, redisCmdDir}
 

@@ -192,10 +192,10 @@ jobs:
       - name: redismcp dependency closure
         run: |
           set -euo pipefail
-          deps=$(go list -deps ./internal/redismcp ./cmd/cerberus-redis-mcp)
+          deps=$(go list -deps ./internal/redismcp ./cmd/cerberus-cache-mcp)
           forbidden='database/sql|sql/driver|go-sql-driver|jackc/pgx|go-mssqldb|^github\.com/AlanIsaacV/cerberus-db-mcp/internal/(db|gate|mcp)($|/)'
           if grep -Eq "$forbidden" <<<"$deps"; then
-            echo "internal/redismcp's or cmd/cerberus-redis-mcp's dependency closure contains a forbidden package:"
+            echo "internal/redismcp's or cmd/cerberus-cache-mcp's dependency closure contains a forbidden package:"
             grep -E "$forbidden" <<<"$deps"
             exit 1
           fi
@@ -406,7 +406,7 @@ jobs:
           CERBERUS_TEST_REDIS_ADDR: 127.0.0.1:56379
           CERBERUS_TEST_REDIS_USER: ro
           CERBERUS_TEST_REDIS_PASSWORD: cerberus-test-redis-ro
-        run: go test -tags integration -race -count=1 ./internal/redismcp/ ./cmd/cerberus-redis-mcp/
+        run: go test -tags integration -race -count=1 ./internal/redismcp/ ./cmd/cerberus-cache-mcp/
 
       # The whole repository, not an enumerated list of the packages that have
       # container-backed tests today. The list is what went wrong once already:

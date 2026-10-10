@@ -283,8 +283,8 @@ func argvField(argv ...string) []any {
 func TestToolsListIsExactlyTheFiveReadOnlyToolsWithDerivedSchemas(t *testing.T) {
 	h := connect(t, redisConfig(t, deadPort(t), nil))
 
-	if got := h.session.InitializeResult().ServerInfo.Name; got != "cerberus-redis-mcp" {
-		t.Errorf("server name = %q, want cerberus-redis-mcp", got)
+	if got := h.session.InitializeResult().ServerInfo.Name; got != "cerberus-cache-mcp" {
+		t.Errorf("server name = %q, want cerberus-cache-mcp", got)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
