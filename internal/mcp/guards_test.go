@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/mcpserve"
 )
 
 // This file holds the assertions that are about the source rather than about a
@@ -35,6 +37,14 @@ import (
 // the only path base available to a test.
 const cmdDir = "../../cmd/cerberus-db-mcp"
 
+const redisCmdDir = "../../cmd/cerberus-redis-mcp"
+
+var binaryDirs = []string{cmdDir, redisCmdDir}
+
+const mcpserveDir = "../mcpserve"
+
+const redismcpDir = "../redismcp"
+
 // repoDir is the repository root relative to this package, where `go test`
 // starts this package's tests.
 const repoDir = "../.."
@@ -50,8 +60,16 @@ var requiredSources = []string{
 	"config.go",
 	"server.go",
 	"tools.go",
+	path.Join(mcpserveDir, "config.go"),
+	path.Join(mcpserveDir, "server.go"),
 	path.Join(cmdDir, "main.go"),
 }
+
+var requiredBinarySources = append(slices.Clone(requiredSources),
+	path.Join(redismcpDir, "server.go"),
+	path.Join(redismcpDir, "tools.go"),
+	path.Join(redisCmdDir, "main.go"),
+)
 
 // requiredWholeModuleSources anchors both whole-module guards' root walks to
 // the same set. One readable literal is safer than two byte-identical lists:
@@ -59,14 +77,17 @@ var requiredSources = []string{
 // each package remains explicit for review when it is added.
 var requiredWholeModuleSources = []string{
 	path.Join(repoDir, "cmd/cerberus-db-mcp/main.go"),
+	path.Join(repoDir, "cmd/cerberus-redis-mcp/main.go"),
 	path.Join(repoDir, "internal/auth/config.go"),
 	path.Join(repoDir, "internal/authflow/config.go"),
 	path.Join(repoDir, "internal/db/config.go"),
 	path.Join(repoDir, "internal/gate/engine.go"),
 	path.Join(repoDir, "internal/httplog/httplog.go"),
 	path.Join(repoDir, "internal/mcp/audit.go"),
+	path.Join(repoDir, "internal/mcpserve/config.go"),
 	path.Join(repoDir, "internal/redisdb/config.go"),
 	path.Join(repoDir, "internal/redisgate/gate.go"),
+	path.Join(repoDir, "internal/redismcp/server.go"),
 	path.Join(repoDir, "internal/refuse/refuse.go"),
 	path.Join(repoDir, "tools/reachability/main.go"),
 	path.Join(repoDir, "tools/wide-schema/main.go"),
@@ -115,7 +136,8 @@ var allowedImports = map[string]bool{
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate": true,
 	// internal/httplog observes dependency-owned handler responses and recovers
 	// panics without changing this package's own refusal behaviour.
-	"github.com/AlanIsaacV/cerberus-db-mcp/internal/httplog": true,
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/httplog":  true,
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/mcpserve": true,
 	// internal/refuse is the shared refusal seam this boundary reaches for the
 	// responses its mux writes itself.
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/refuse": true,
@@ -219,20 +241,29 @@ func parseRepositoryFilesAt(t *testing.T, root string) (*gotoken.FileSet, map[st
 	return fset, files
 }
 
-// parsePackageFiles is the scan for the rules that are this package's own.
+// parsePackageFiles is the scan for the rules that are this package's own, over
+// this package and internal/mcpserve.
 func parsePackageFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 	t.Helper()
-	return parseFiles(t, ".")
+	return parseFiles(t, ".", mcpserveDir)
 }
 
 // parseObjectiveFiles is the scan for the rules that are the objective's:
-// everything in internal/mcp plus everything in cmd/cerberus-db-mcp, checked
+// everything in internal/mcp and internal/mcpserve plus everything in
+// cmd/cerberus-db-mcp, checked
 // against [requiredSources] so that a scan which found nothing fails here rather
 // than passing downstream.
 func parseObjectiveFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 	t.Helper()
-	fset, files := parseFiles(t, ".", cmdDir)
+	fset, files := parseFiles(t, ".", mcpserveDir, cmdDir)
 	requireScanned(t, files, requiredSources)
+	return fset, files
+}
+
+func parseBinaryFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
+	t.Helper()
+	fset, files := parseFiles(t, append([]string{".", mcpserveDir, redismcpDir}, binaryDirs...)...)
+	requireScanned(t, files, requiredBinarySources)
 	return fset, files
 }
 
@@ -375,7 +406,7 @@ func environmentFile(base string) bool {
 }
 
 // TestPackageImportsNothingItShouldNot is scoped to this package's own
-// directory, and stays that way.
+// directory and internal/mcpserve's, and stays that way.
 //
 // An import allowlist is a per-package rule: cmd/cerberus-db-mcp legitimately
 // imports internal/db and internal/gate directly, which this package's list
@@ -564,7 +595,7 @@ func TestNoSQLIsWrittenAnywhereInThisLayer(t *testing.T) {
 // "Nowhere else" includes the binary's main, which is where a resolved address,
 // a fallback for an empty variable or a flag would most naturally be written.
 func TestNoOtherListenAddressDefaultExists(t *testing.T) {
-	fset, files := parseObjectiveFiles(t)
+	fset, files := parseBinaryFiles(t)
 
 	// Every spelling of "every interface" that net.Listen accepts.
 	everyInterface := []string{"0.0.0.0", "[::]", "::"}
@@ -579,9 +610,10 @@ func TestNoOtherListenAddressDefaultExists(t *testing.T) {
 				return true
 			}
 			// Struct tags are string literals too, which is what puts the one real
-			// default in reach of this walk.
+			// default in reach of this walk; of a tag, only its envDefault value is a
+			// default.
 			if strings.Contains(value, "envDefault:") {
-				return true
+				value = reflect.StructTag(value).Get("envDefault")
 			}
 			for _, spelling := range everyInterface {
 				if strings.Contains(value, spelling) {
@@ -596,12 +628,102 @@ func TestNoOtherListenAddressDefaultExists(t *testing.T) {
 	// And the one default there is, read off the struct tag rather than off a
 	// loaded value, so that a change to the tag fails here even if some other
 	// default happened to compensate for it.
-	field, ok := reflect.TypeFor[Config]().FieldByName("Address")
+	field, ok := reflect.TypeFor[mcpserve.Config]().FieldByName("Address")
 	if !ok {
 		t.Fatal("Config has no Address field")
 	}
 	if got := field.Tag.Get("envDefault"); got != "127.0.0.1:8080" {
 		t.Errorf("Config.Address envDefault = %q, want a loopback address", got)
+	}
+}
+
+func TestConfigDeclaresEverySharedListenerField(t *testing.T) {
+	shared := reflect.TypeFor[mcpserve.Config]()
+	own := reflect.TypeFor[Config]()
+	if shared.NumField() == 0 {
+		t.Fatal("mcpserve.Config has no fields, so this guard is asserting nothing")
+	}
+	for i := range shared.NumField() {
+		want := shared.Field(i)
+		got, ok := own.FieldByName(want.Name)
+		if !ok {
+			t.Errorf("Config has no %s field; mcpserve.Config declares %s %s with env %q, and cerberus-db-mcp would drop it",
+				want.Name, want.Name, want.Type, want.Tag.Get("env"))
+			continue
+		}
+		if got.Type != want.Type {
+			t.Errorf("Config.%s is %s, mcpserve.Config.%s is %s", want.Name, got.Type, want.Name, want.Type)
+		}
+		if got.Tag.Get("env") != want.Tag.Get("env") {
+			t.Errorf("Config.%s reads env %q, mcpserve.Config.%s reads env %q",
+				want.Name, got.Tag.Get("env"), want.Name, want.Tag.Get("env"))
+		}
+	}
+	for i := range own.NumField() {
+		field := own.Field(i)
+		if field.Name == "GateOverlay" {
+			continue
+		}
+		if _, ok := shared.FieldByName(field.Name); !ok {
+			t.Errorf("Config.%s is neither GateOverlay nor a field of mcpserve.Config; a listener field belongs to mcpserve.Config", field.Name)
+		}
+	}
+	if _, ok := own.FieldByName("GateOverlay"); !ok {
+		t.Error("Config has no GateOverlay field")
+	}
+}
+
+func TestConfigConversionCarriesEverySharedField(t *testing.T) {
+	var source mcpserve.Config
+	value := reflect.ValueOf(&source).Elem()
+	for i := range value.NumField() {
+		field := value.Field(i)
+		name := value.Type().Field(i).Name
+		switch field.Kind() {
+		case reflect.String:
+			field.SetString("value of " + name)
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			field.SetInt(int64(i + 1))
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			field.SetUint(uint64(i + 1))
+		case reflect.Bool:
+			field.SetBool(true)
+		case reflect.Float32, reflect.Float64:
+			field.SetFloat(float64(i + 1))
+		default:
+			t.Fatalf("mcpserve.Config.%s is a %s, which this guard cannot fill with a non-zero value; teach it the kind rather than skip the field",
+				name, field.Kind())
+		}
+		if field.IsZero() {
+			t.Fatalf("mcpserve.Config.%s is still its zero value, so a dropped copy of it would go unseen", name)
+		}
+	}
+
+	const overlay = "value of GateOverlay"
+	converted := withGateOverlay(&source, overlay)
+	if converted.GateOverlay != overlay {
+		t.Errorf("withGateOverlay set GateOverlay to %q, want %q", converted.GateOverlay, overlay)
+	}
+	convertedValue := reflect.ValueOf(*converted)
+	for i := range value.NumField() {
+		name := value.Type().Field(i).Name
+		got := convertedValue.FieldByName(name)
+		if !got.IsValid() {
+			t.Errorf("withGateOverlay has nowhere to put mcpserve.Config.%s; Config has no such field", name)
+			continue
+		}
+		if !reflect.DeepEqual(got.Interface(), value.Field(i).Interface()) {
+			t.Errorf("withGateOverlay copied mcpserve.Config.%s as %v, want %v", name, got.Interface(), value.Field(i).Interface())
+		}
+	}
+
+	back := converted.shared()
+	backValue := reflect.ValueOf(back)
+	for i := range value.NumField() {
+		name := value.Type().Field(i).Name
+		if !reflect.DeepEqual(backValue.Field(i).Interface(), value.Field(i).Interface()) {
+			t.Errorf("Config.shared copied %s as %v, want %v", name, backValue.Field(i).Interface(), value.Field(i).Interface())
+		}
 	}
 }
 
@@ -1066,10 +1188,11 @@ func declaresResponseWriterUnwrap(file *ast.File, typeName string) bool {
 // for httptest bypass Run, so an integration test could pass while production's
 // http.Server still sent its diagnostics to stderr.
 func TestServerRunConfiguresErrorLog(t *testing.T) {
-	_, files := parseObjectiveFiles(t)
-	server, ok := files["server.go"]
+	fset, files := parseBinaryFiles(t)
+	serverFile := path.Join(mcpserveDir, "server.go")
+	server, ok := files[serverFile]
 	if !ok {
-		t.Fatal("the ErrorLog source scan did not parse server.go")
+		t.Fatalf("the ErrorLog source scan did not parse %s", serverFile)
 	}
 
 	configured := false
@@ -1080,18 +1203,8 @@ func TestServerRunConfiguresErrorLog(t *testing.T) {
 		}
 		ast.Inspect(function.Body, func(node ast.Node) bool {
 			literal, ok := node.(*ast.CompositeLit)
-			if !ok || !isHTTPServerLiteral(literal) {
-				return true
-			}
-			for _, element := range literal.Elts {
-				field, ok := element.(*ast.KeyValueExpr)
-				if !ok {
-					continue
-				}
-				key, ok := field.Key.(*ast.Ident)
-				if ok && key.Name == "ErrorLog" && isServerErrorLogAdapter(field.Value) {
-					configured = true
-				}
+			if ok && isHTTPServerLiteral(literal) && setsServerErrorLog(literal) {
+				configured = true
 			}
 			return true
 		})
@@ -1100,6 +1213,31 @@ func TestServerRunConfiguresErrorLog(t *testing.T) {
 	if !configured {
 		t.Error("Server.Run's http.Server literal does not set ErrorLog from httplog.NewServerErrorLog")
 	}
+
+	for name, f := range files {
+		ast.Inspect(f, func(node ast.Node) bool {
+			literal, ok := node.(*ast.CompositeLit)
+			if ok && isHTTPServerLiteral(literal) && !setsServerErrorLog(literal) {
+				t.Errorf("%s:%d builds an http.Server that does not set ErrorLog from httplog.NewServerErrorLog",
+					name, fset.Position(literal.Pos()).Line)
+			}
+			return true
+		})
+	}
+}
+
+func setsServerErrorLog(literal *ast.CompositeLit) bool {
+	for _, element := range literal.Elts {
+		field, ok := element.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, ok := field.Key.(*ast.Ident)
+		if ok && key.Name == "ErrorLog" && isServerErrorLogAdapter(field.Value) {
+			return true
+		}
+	}
+	return false
 }
 
 func isHTTPServerLiteral(literal *ast.CompositeLit) bool {

@@ -7,9 +7,9 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/AlanIsaacV/cerberus-db-mcp/internal/auth"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/mcpserve"
 )
 
 // The tool names. There are five: search_schema is the deliberately narrow
@@ -242,17 +242,7 @@ type DescribeTableResult struct {
 // nothing; the application log gets the error in full.
 const internalFailure = "the server failed to complete the call"
 
-// agentError carries exactly the text the agent may read, and nothing else.
-//
-// It exists because the SDK's typed handler turns a returned error into the
-// tool result's content by calling Error() on it. Returning a *db.Error directly
-// would therefore put [db.Error.Error] — the operator-facing rendering, which
-// includes the engine's own words in Detail — into the agent's hands. Wrapping
-// [db.Error.Agent] in a type whose only string is that one makes the boundary a
-// property of the type rather than of remembering.
-type agentError struct{ message string }
-
-func (e *agentError) Error() string { return e.message }
+type agentError = mcpserve.AgentError
 
 // registerTools installs the five tools on an SDK server.
 //
@@ -325,38 +315,8 @@ func (s *Server) registerTools(srv *sdk.Server) {
 	}, s.describeTable)
 }
 
-// caller resolves the two identity fields of an audit event from the context the
-// SDK handed this handler.
-//
-// internal/auth puts an [auth.Identity] on the request it admits and this reads
-// it back out, which works only because the identity survives the SDK's
-// dispatch between those two points — a property of Stateless: true rather than
-// a documented contract, pinned by
-// TestAnIdentitySetOnTheRequestContextSurvivesTheSDKsDispatchToTheToolHandler.
-//
-// There is no identity when the server was built with a nil Middleware. Every
-// test in this package does that, and no deployment can: the binary refuses to
-// start without authentication configured. Both fields then stay empty rather
-// than carrying a word such as "unauthenticated", and the two are different
-// claims to whoever reads the stream. A word sits in a field whose every other
-// value is an email address, so it reads as a caller, and it satisfies any
-// downstream check that asks only whether an identity was recorded — including
-// this project's own "every query logged with its calling identity" — which is
-// backwards for the one state where nobody was identified. An absence fails that
-// check, which is the cheapest check anyone will write. What the operator needs
-// instead of a sentinel is to be told, so the telling goes to the application
-// log: a tool that ran for nobody is a defect in this process, and a defect
-// belongs where the person debugging is looking rather than in the vocabulary of
-// a stream whose worth is that its shape can be relied on.
 func (s *Server) caller(ctx context.Context, tool string) (email, subject string) {
-	id, ok := auth.IdentityFrom(ctx)
-	if !ok {
-		s.log.Warn().
-			Str("tool", tool).
-			Msg("a tool call ran with no identity on its context: either no authentication middleware is installed or the identity did not survive the transport, and the audit record for this call names nobody")
-		return "", ""
-	}
-	return id.Email, id.Subject
+	return mcpserve.Caller(ctx, s.log, tool)
 }
 
 func (s *Server) listConnections(ctx context.Context, _ *sdk.CallToolRequest, _ ListConnectionsInput) (*sdk.CallToolResult, *ListConnectionsResult, error) {
@@ -688,7 +648,7 @@ func (s *Server) refuseOrFail(ctx context.Context, call attempt, elapsed time.Du
 			Str("alias", call.alias).
 			Msg("a tool call failed with an error that did not come from internal/db")
 		s.audit.Record(event)
-		return &agentError{message: internalFailure}
+		return &agentError{Message: internalFailure}
 	}
 
 	event.Engine = dbErr.Engine
@@ -721,5 +681,5 @@ func (s *Server) refuseOrFail(ctx context.Context, call attempt, elapsed time.Du
 		Msg("a tool call did not return rows")
 
 	s.audit.Record(event)
-	return &agentError{message: dbErr.Agent()}
+	return &agentError{Message: dbErr.Agent()}
 }

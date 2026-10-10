@@ -2,13 +2,13 @@ package mcp
 
 import (
 	"io"
-	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/db"
 	"github.com/AlanIsaacV/cerberus-db-mcp/internal/gate"
+	"github.com/AlanIsaacV/cerberus-db-mcp/internal/mcpserve"
 )
 
 // Outcome is the class of a tool call, as the audit stream records it.
@@ -94,42 +94,12 @@ type AuditEvent struct {
 	Elapsed   time.Duration
 }
 
-// Auditor writes the audit stream.
-//
-// It is a distinct logger over a distinct writer rather than a level or a field
-// on the application log, because the two have different retention answers and
-// different audiences: the application log is for whoever is debugging this
-// process, and the audit stream is the record of what was asked of somebody
-// else's database. Merging them makes the second one's completeness depend on
-// the first one's log level.
 type Auditor struct {
-	// One event is one Write on the writer, and [NewAuditor] takes an io.Writer,
-	// which promises nothing at all about two goroutines calling Write at once.
-	// Tool calls are served on independent HTTP goroutines because the transport
-	// is stateless, so two overlapping records are the ordinary case and not an
-	// exotic one, and a record is large: the statement is carried verbatim and in
-	// full and an agent's SQL has no bound. A destination that splits or reorders
-	// a large write — a bufio.Writer, a rotating file, a tee, a bytes.Buffer in a
-	// test — turns two overlapping records into two lines that parse as neither,
-	// in the one stream whose completeness is its entire justification, and a
-	// mangled audit record cannot be reconstructed from anywhere else.
-	//
-	// The process passes stdout, whose file descriptor currently holds a per-file
-	// write lock across each Write (internal/poll's FD.Write), so it would survive
-	// without this. That is a property of what main happens to pass, not of what
-	// this type accepts, and it is not what the guarantee should rest on.
-	mu  sync.Mutex
-	log zerolog.Logger
+	shared *mcpserve.Auditor
 }
 
-// NewAuditor builds an auditor over a plain zerolog logger, with no level
-// filter and no sampler: a stream whose completeness is the whole point of it
-// cannot have a knob that drops records, and an event this process decided not
-// to write is one nobody can reconstruct afterwards. The timestamp is attached
-// here rather than by [Auditor.Record] so that no caller can produce an event
-// without one.
 func NewAuditor(w io.Writer) *Auditor {
-	return &Auditor{log: zerolog.New(w).With().Timestamp().Logger()}
+	return &Auditor{shared: mcpserve.NewAuditor(w)}
 }
 
 // Record writes one event.
@@ -139,30 +109,20 @@ func NewAuditor(w io.Writer) *Auditor {
 // outcome happens to fill. The exception is Pending, which is a list and is
 // meaningless when empty.
 func (a *Auditor) Record(e AuditEvent) {
-	// The audit stream records what happened rather than application diagnostics,
-	// so application log levels must not silence it; its events are level-less.
-	ev := a.log.Log().
-		Str("stream", "audit").
-		Str("tool", e.Tool).
-		Str("identity", e.Identity).
-		Str("subject", e.Subject).
-		Str("alias", e.Alias).
-		Str("engine", string(e.Engine)).
-		Str("statement", e.Statement).
-		Str("outcome", string(e.Outcome)).
-		Str("verdict", string(e.Verdict)).
-		Str("reason", string(e.Reason)).
-		Str("rule_id", e.RuleID).
-		Str("error_kind", string(e.ErrorKind)).
-		Int("rows", e.Rows).
-		Bool("truncated", e.Truncated).
-		Dur("elapsed_ms", e.Elapsed)
-	if len(e.Pending) > 0 {
-		ev = ev.Strs("pending", e.Pending)
-	}
-	// The lock is taken around the write and not around the whole event, since
-	// building it touches nothing shared. See [Auditor] for what it is for.
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	ev.Msg("tool call")
+	a.shared.Record(e.Tool, e.Identity, e.Subject, func(ev *zerolog.Event) {
+		ev.Str("alias", e.Alias).
+			Str("engine", string(e.Engine)).
+			Str("statement", e.Statement).
+			Str("outcome", string(e.Outcome)).
+			Str("verdict", string(e.Verdict)).
+			Str("reason", string(e.Reason)).
+			Str("rule_id", e.RuleID).
+			Str("error_kind", string(e.ErrorKind)).
+			Int("rows", e.Rows).
+			Bool("truncated", e.Truncated).
+			Dur("elapsed_ms", e.Elapsed)
+		if len(e.Pending) > 0 {
+			ev.Strs("pending", e.Pending)
+		}
+	})
 }

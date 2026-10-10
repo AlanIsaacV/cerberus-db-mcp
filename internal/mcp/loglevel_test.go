@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"go/ast"
+	gotoken "go/token"
+	"path"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -45,13 +47,30 @@ func TestConfiguredApplicationLoggerCarriesLevel(t *testing.T) {
 	}
 }
 
-func TestMainAppliesTheConfiguredLoggerLevelBeforeLoggerConsumers(t *testing.T) {
-	fset, files := parseObjectiveFiles(t)
-	mainFile, ok := files[cmdDir+"/main.go"]
-	if !ok {
-		t.Fatalf("the source scan did not reach %s/main.go", cmdDir)
-	}
+var loadConfigPackages = map[string]string{
+	cmdDir:      "mcp",
+	redisCmdDir: "mcpserve",
+}
 
+func TestMainAppliesTheConfiguredLoggerLevelBeforeLoggerConsumers(t *testing.T) {
+	fset, files := parseBinaryFiles(t)
+	for _, dir := range binaryDirs {
+		t.Run(path.Base(dir), func(t *testing.T) {
+			configPackage, ok := loadConfigPackages[dir]
+			if !ok {
+				t.Fatalf("%s has no entry in loadConfigPackages naming the package whose LoadConfig its run calls", dir)
+			}
+			mainFile, ok := files[dir+"/main.go"]
+			if !ok {
+				t.Fatalf("the source scan did not reach %s/main.go", dir)
+			}
+			requireLevelAppliedBeforeLoggerConsumers(t, fset, mainFile, configPackage)
+		})
+	}
+}
+
+func requireLevelAppliedBeforeLoggerConsumers(t *testing.T, fset *gotoken.FileSet, mainFile *ast.File, configPackage string) {
+	t.Helper()
 	var loadConfigs, levelApplications []ast.Node
 	for _, declaration := range mainFile.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
@@ -61,7 +80,7 @@ func TestMainAppliesTheConfiguredLoggerLevelBeforeLoggerConsumers(t *testing.T) 
 		ast.Inspect(function.Body, func(node ast.Node) bool {
 			switch node := node.(type) {
 			case *ast.CallExpr:
-				if isQualifiedCall(node, "mcp", "LoadConfig") {
+				if isQualifiedCall(node, configPackage, "LoadConfig") {
 					loadConfigs = append(loadConfigs, node)
 				}
 			case *ast.AssignStmt:
@@ -74,7 +93,7 @@ func TestMainAppliesTheConfiguredLoggerLevelBeforeLoggerConsumers(t *testing.T) 
 	}
 
 	if len(loadConfigs) != 1 {
-		t.Fatalf("run calls mcp.LoadConfig %d times, want once", len(loadConfigs))
+		t.Fatalf("run calls %s.LoadConfig %d times, want once", configPackage, len(loadConfigs))
 	}
 	if len(levelApplications) != 1 {
 		t.Fatalf("run applies cfg.LogLevel with log = log.Level(cfg.LogLevel) %d times, want once", len(levelApplications))
@@ -82,7 +101,7 @@ func TestMainAppliesTheConfiguredLoggerLevelBeforeLoggerConsumers(t *testing.T) 
 	loadConfig := loadConfigs[0]
 	applyLevel := levelApplications[0]
 	if loadConfig.Pos() >= applyLevel.Pos() {
-		t.Errorf("mcp.LoadConfig at %s must precede logger level application at %s", fset.Position(loadConfig.Pos()), fset.Position(applyLevel.Pos()))
+		t.Errorf("%s.LoadConfig at %s must precede logger level application at %s", configPackage, fset.Position(loadConfig.Pos()), fset.Position(applyLevel.Pos()))
 	}
 
 	for _, declaration := range mainFile.Decls {

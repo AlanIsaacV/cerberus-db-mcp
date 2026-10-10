@@ -35,6 +35,10 @@ import (
 // guarded.
 const cmdDir = "../../cmd/cerberus-db-mcp"
 
+const redisCmdDir = "../../cmd/cerberus-redis-mcp"
+
+var cmdDirs = []string{cmdDir, redisCmdDir}
+
 // mcpDir is the transport package, resolved the same way and for the same reason.
 //
 // It is scanned by the token guard alone. internal/mcp is everything downstream of
@@ -43,6 +47,10 @@ const cmdDir = "../../cmd/cerberus-db-mcp"
 // headers. It is deliberately not scanned by the endpoint or configuration guards,
 // which are about rules that are internal/auth's own.
 const mcpDir = "../mcp"
+
+const mcpserveDir = "../mcpserve"
+
+const redismcpDir = "../redismcp"
 
 const refuseDir = "../refuse"
 
@@ -106,6 +114,7 @@ var requiredSources = append([]string{
 	sealingFile,
 	tokenFile,
 	path.Join(cmdDir, "main.go"),
+	path.Join(redisCmdDir, "main.go"),
 	// The files of the authorization flow come from the two lists above, so a scan
 	// that reached ../authflow and found nothing in it fails here rather than
 	// reporting success over the package these guards were extended for.
@@ -117,12 +126,20 @@ func authflowSources() []string {
 }
 
 // requiredTokenScanSources are the files the token guard must have parsed: the
-// ones above, plus the three files in internal/mcp that write somewhere a person
-// reads — the transport's own log, the audit stream, and the tool handlers.
+// ones above, plus the files in internal/mcp and internal/mcpserve that write
+// somewhere a person reads — the transport's own log, the audit stream, and the
+// tool handlers.
 var requiredTokenScanSources = append([]string{
 	path.Join(mcpDir, "server.go"),
 	path.Join(mcpDir, "tools.go"),
 	path.Join(mcpDir, "audit.go"),
+	path.Join(mcpserveDir, "server.go"),
+	path.Join(mcpserveDir, "audit.go"),
+	path.Join(mcpserveDir, "caller.go"),
+	path.Join(redismcpDir, "server.go"),
+	path.Join(redismcpDir, "tools.go"),
+	path.Join(redismcpDir, "audit.go"),
+	path.Join(redismcpDir, "errors.go"),
 	path.Join(refuseDir, "refuse.go"),
 }, requiredSources...)
 
@@ -328,17 +345,18 @@ func parsePackageFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 // nothing fails here rather than passing downstream.
 func parseObjectiveFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 	t.Helper()
-	fset, files := parseFiles(t, ".", cmdDir, authflowDir)
+	fset, files := parseFiles(t, append([]string{".", authflowDir}, cmdDirs...)...)
 	requireScanned(t, files, requiredSources)
 	return fset, files
 }
 
 // parseTokenScanFiles is the scan for the one claim that reaches past this
-// objective's own files: internal/auth, the binary, internal/authflow, and
-// internal/mcp, which is everything a credential could have travelled into.
+// objective's own files: internal/auth, the binary, internal/authflow,
+// internal/mcp and internal/mcpserve, which is everything a credential could have
+// travelled into.
 func parseTokenScanFiles(t *testing.T) (*gotoken.FileSet, map[string]*ast.File) {
 	t.Helper()
-	fset, files := parseFiles(t, ".", cmdDir, mcpDir, authflowDir, refuseDir)
+	fset, files := parseFiles(t, append([]string{".", mcpDir, mcpserveDir, redismcpDir, authflowDir, refuseDir}, cmdDirs...)...)
 	requireScanned(t, files, requiredTokenScanSources)
 	return fset, files
 }
@@ -386,8 +404,8 @@ func TestPackageImportsNothingItShouldNot(t *testing.T) {
 }
 
 // TestTheRawTokenNeverReachesALogger is acceptance criterion 6's source half, over
-// internal/auth, the binary, internal/authflow and internal/mcp — everywhere in
-// this process a credential could have been carried to.
+// internal/auth, the binary, internal/authflow, internal/mcp and internal/mcpserve
+// — everywhere in this process a credential could have been carried to.
 //
 // What it establishes, and what it does not, both need saying, because an earlier
 // version of this comment claimed the whole property and a leak walked through it: a
@@ -423,10 +441,11 @@ func TestPackageImportsNothingItShouldNot(t *testing.T) {
 //   - The scan actually found the token where it claims it is, so a rename turns
 //     this into a failure rather than into a guard over nothing.
 //
-// internal/mcp is scanned by the name checks alone, and the reason that is enough is
-// not in this file: the middleware deletes the inbound Authorization header on every
-// path before anything downstream runs, so there is no credential left there to
-// leak. The scan there guards against a re-read of a header that is gone.
+// internal/mcp and internal/mcpserve are scanned by the name checks alone, and the
+// reason that is enough is not in this file: the middleware deletes the inbound
+// Authorization header on every path before anything downstream runs, so there is
+// no credential left there to leak. The scan there guards against a re-read of a
+// header that is gone.
 func TestTheRawTokenNeverReachesALogger(t *testing.T) {
 	fset, files := parseTokenScanFiles(t)
 
@@ -586,16 +605,30 @@ func TestTheRawTokenNeverReachesALogger(t *testing.T) {
 // file that is guarded, so none of them may exist.
 func TestNothingInTheBinaryHandlesABearerTokenItself(t *testing.T) {
 	fset, files := parseObjectiveFiles(t)
+	for _, dir := range cmdDirs {
+		refuseBearerHandling(t, fset, files, dir, "the binary only assigns the middleware")
+	}
+}
+
+func TestNothingInTheSharedTransportHandlesABearerTokenItself(t *testing.T) {
+	fset, files := parseTokenScanFiles(t)
+	refuseBearerHandling(t, fset, files, mcpserveDir, "the shared transport only runs behind the middleware, which has already deleted the header")
+}
+
+func refuseBearerHandling(t *testing.T, fset *gotoken.FileSet, files map[string]*ast.File, dir, role string) {
+	t.Helper()
+	scanned := 0
 	for name, f := range files {
-		if !strings.HasPrefix(name, cmdDir) {
+		if !strings.HasPrefix(name, dir+"/") {
 			continue
 		}
+		scanned++
 		ast.Inspect(f, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.Ident:
 				if strings.Contains(strings.ToLower(node.Name), "token") {
-					t.Errorf("%s:%d names %s; the bearer token is internal/auth's alone and the binary only assigns the middleware",
-						name, fset.Position(node.Pos()).Line, node.Name)
+					t.Errorf("%s:%d names %s; the bearer token is internal/auth's alone and %s",
+						name, fset.Position(node.Pos()).Line, node.Name, role)
 				}
 			case *ast.BasicLit:
 				if node.Kind != gotoken.STRING {
@@ -613,6 +646,9 @@ func TestNothingInTheBinaryHandlesABearerTokenItself(t *testing.T) {
 			}
 			return true
 		})
+	}
+	if scanned == 0 {
+		t.Fatalf("no scanned file is in %s, so this guard is asserting nothing about it", dir)
 	}
 }
 
