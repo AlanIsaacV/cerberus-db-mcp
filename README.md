@@ -853,11 +853,16 @@ nothing else. A blank value is the same as unset.
   (`65536`). Each must be positive.
 - `CERBERUS_REDIS_ALIASES`: the comma-separated Redis aliases. The template
   configures one, `cache`. Each alias needs a variable family named after it,
-  upper-cased with hyphens changed to underscores — for `cache`,
-  `CERBERUS_REDIS_CACHE_HOST`, `CERBERUS_REDIS_CACHE_PORT`,
-  `CERBERUS_REDIS_CACHE_USER`, `CERBERUS_REDIS_CACHE_PASSWORD` and
-  `CERBERUS_REDIS_CACHE_DATABASES`, all required, and the optional
-  `CERBERUS_REDIS_CACHE_TLS`.
+  upper-cased with hyphens changed to underscores — for `cache`, the required
+  `CERBERUS_REDIS_CACHE_HOST` and `CERBERUS_REDIS_CACHE_DATABASES`, and the
+  optional `CERBERUS_REDIS_CACHE_PORT`, `CERBERUS_REDIS_CACHE_USER`,
+  `CERBERUS_REDIS_CACHE_PASSWORD` and `CERBERUS_REDIS_CACHE_TLS`. An empty
+  value reads as unset.
+- `_PORT` is `6379` when unset.
+- With no `_PASSWORD` no `AUTH` is sent. A `_PASSWORD` alone authenticates
+  Redis's `default` user; with `_USER` it authenticates that ACL user. A `_USER`
+  without a `_PASSWORD` refuses startup, because Redis authenticates no user
+  without one.
 - `_DATABASES` is a comma-separated list of logical database numbers, and each
   becomes an alias of its own named `<alias>.<number>`: the template's `cache`
   with `0` is what `list_connections` reports as `cache.0`.
@@ -910,7 +915,9 @@ the rule the integration tests run against:
 ACL SETUSER <user> on ><password> ~* &* +@read +select
 ```
 
-Put that user and password in the alias's `_USER` and `_PASSWORD`. `ACL SETUSER`
+Put that user and password in the alias's `_USER` and `_PASSWORD`. An instance
+with no authentication needs neither, and is then read with whatever its
+`default` user is allowed. `ACL SETUSER`
 takes effect immediately but lasts only until the instance restarts unless that
 instance persists its ACLs (`ACL SAVE` with an ACL file, or `CONFIG REWRITE`).
 The Pi has to reach each instance's host and port on its own network; nothing in

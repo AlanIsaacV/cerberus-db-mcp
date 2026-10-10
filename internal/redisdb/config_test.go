@@ -128,6 +128,49 @@ func TestLoadConfigAccepts(t *testing.T) {
 			wantAliases:  []AliasSpec{cacheSpec(3, TLSRequireInsecure)},
 		},
 		{
+			name: "only _HOST and _DATABASES: _PORT defaults to 6379 and no AUTH is sent",
+			environ: base(func(e map[string]string) {
+				delete(e, "CERBERUS_REDIS_CACHE_PORT")
+				delete(e, "CERBERUS_REDIS_CACHE_USER")
+				delete(e, "CERBERUS_REDIS_CACHE_PASSWORD")
+			}),
+			wantSettings: defaults,
+			wantAliases: []AliasSpec{{
+				Alias: "cache.3", Host: "redis.internal.example", Port: 6379, Database: 3, TLS: TLSDisable,
+			}},
+		},
+		{
+			name: "empty _PORT, _USER and _PASSWORD read as unset",
+			environ: base(func(e map[string]string) {
+				e["CERBERUS_REDIS_CACHE_PORT"] = ""
+				e["CERBERUS_REDIS_CACHE_USER"] = ""
+				e["CERBERUS_REDIS_CACHE_PASSWORD"] = ""
+			}),
+			wantSettings: defaults,
+			wantAliases: []AliasSpec{{
+				Alias: "cache.3", Host: "redis.internal.example", Port: 6379, Database: 3, TLS: TLSDisable,
+			}},
+		},
+		{
+			name:         "_PASSWORD without _USER authenticates the default user",
+			environ:      base(func(e map[string]string) { delete(e, "CERBERUS_REDIS_CACHE_USER") }),
+			wantSettings: defaults,
+			wantAliases: []AliasSpec{{
+				Alias: "cache.3", Host: "redis.internal.example", Port: 6379, Database: 3,
+				Password: Secret(knownPassword), TLS: TLSDisable,
+			}},
+		},
+		{
+			name:         "a non-default _PORT is read",
+			environ:      base(func(e map[string]string) { e["CERBERUS_REDIS_CACHE_PORT"] = "6380" }),
+			wantSettings: defaults,
+			wantAliases: func() []AliasSpec {
+				spec := cacheSpec(3, TLSDisable)
+				spec.Port = 6380
+				return []AliasSpec{spec}
+			}(),
+		},
+		{
 			name:         "each database becomes a derived alias in declared order",
 			environ:      base(func(e map[string]string) { e["CERBERUS_REDIS_CACHE_DATABASES"] = "12, 0,3" }),
 			wantSettings: defaults,
@@ -230,12 +273,10 @@ func TestLoadConfigRefusesAndNamesTheVariable(t *testing.T) {
 		{name: "two aliases in one variable family", variable: "CERBERUS_REDIS_ALIASES", value: "hot-cache,hot_cache", want: ErrDuplicateAlias},
 		{name: "two aliases differing only in case", variable: "CERBERUS_REDIS_ALIASES", value: "Cache,cache", want: ErrDuplicateAlias},
 		{name: "a missing host", variable: "CERBERUS_REDIS_CACHE_HOST", value: "", want: ErrMissingVariable},
-		{name: "a missing port", variable: "CERBERUS_REDIS_CACHE_PORT", value: "", want: ErrMissingVariable},
 		{name: "a port that is not a number", variable: "CERBERUS_REDIS_CACHE_PORT", value: "redisport", want: ErrInvalidVariable},
 		{name: "a port above the range", variable: "CERBERUS_REDIS_CACHE_PORT", value: "70000", want: ErrInvalidVariable},
 		{name: "a zero port", variable: "CERBERUS_REDIS_CACHE_PORT", value: "0", want: ErrInvalidVariable},
-		{name: "a missing user", variable: "CERBERUS_REDIS_CACHE_USER", value: "", want: ErrMissingVariable},
-		{name: "a missing password", variable: "CERBERUS_REDIS_CACHE_PASSWORD", value: "", want: ErrMissingVariable},
+		{name: "a user without a password", variable: "CERBERUS_REDIS_CACHE_PASSWORD", value: "", want: ErrMissingVariable},
 		{name: "a password with an inner space", variable: "CERBERUS_REDIS_CACHE_PASSWORD", value: "pa55 word-secret", want: ErrInvalidVariable},
 		{name: "a password with a trailing newline", variable: "CERBERUS_REDIS_CACHE_PASSWORD", value: "pa55word-secret\n", want: ErrInvalidVariable},
 		{name: "a password with a leading tab", variable: "CERBERUS_REDIS_CACHE_PASSWORD", value: "\tpa55word-secret", want: ErrInvalidVariable},

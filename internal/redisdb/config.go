@@ -120,6 +120,7 @@ func aliasSuffixes() []string {
 }
 
 const (
+	defaultPort           = 6379
 	aliasPrefix           = "CERBERUS_REDIS_"
 	derivedAliasSeparator = "."
 	maxAliasLength        = 64
@@ -281,24 +282,21 @@ func parseAlias(alias, family string, environ map[string]string) ([]AliasSpec, e
 	if spec.Host, err = required(suffixHost); err != nil {
 		return nil, err
 	}
-	portText, err := required(suffixPort)
-	if err != nil {
-		return nil, err
+	spec.Port = defaultPort
+	if portText := environ[family+suffixPort]; portText != "" {
+		port, convErr := strconv.Atoi(portText)
+		if convErr != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("redisdb: %s must be a TCP port between 1 and 65535: %w", family+suffixPort, ErrInvalidVariable)
+		}
+		spec.Port = port
 	}
-	port, convErr := strconv.Atoi(portText)
-	if convErr != nil || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("redisdb: %s must be a TCP port between 1 and 65535: %w", family+suffixPort, ErrInvalidVariable)
-	}
-	spec.Port = port
-	if spec.User, err = required(suffixUser); err != nil {
-		return nil, err
-	}
-	password, err := required(suffixPassword)
-	if err != nil {
-		return nil, err
-	}
+	spec.User = environ[family+suffixUser]
+	password := environ[family+suffixPassword]
 	if strings.IndexFunc(password, unicode.IsSpace) >= 0 {
 		return nil, fmt.Errorf("redisdb: %s contains whitespace, which is refused rather than trimmed: %w", family+suffixPassword, ErrInvalidVariable)
+	}
+	if spec.User != "" && password == "" {
+		return nil, fmt.Errorf("redisdb: %s is set without %s, and Redis authenticates no user without a password: %w", family+suffixUser, family+suffixPassword, ErrMissingVariable)
 	}
 	spec.Password = Secret(password)
 
