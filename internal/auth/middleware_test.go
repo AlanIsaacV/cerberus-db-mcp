@@ -193,7 +193,10 @@ func challengeFor(t *testing.T, class string) string {
 		return `Bearer realm="cerberus-db-mcp"`
 	case failureSealedCredentialExpired, failureSealedCredentialCorrupt, failureSealedCredentialWrongPurpose:
 		return `Bearer realm="cerberus-db-mcp"`
-	case failureUnavailable, failureNoTokenValidation, failureNoSealedCredentialValidation,
+	case failureAssertionRejected, failureAssertionWrongAudience, failureAssertionExpired:
+		return `Bearer realm="cerberus-db-mcp"`
+	case failureNoAssertionVerification,
+		failureUnavailable, failureNoTokenValidation, failureNoSealedCredentialValidation,
 		failureNotAllowlisted, failureEmailUnverified, failureNoEmailInToken:
 		return ""
 	}

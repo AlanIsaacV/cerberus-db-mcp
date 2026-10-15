@@ -55,11 +55,18 @@ func run(log zerolog.Logger) error {
 		return err
 	}
 
-	log.Info().
+	admission := log.Info().
 		Str("google_client_id", authCfg.ClientID).
 		Strs("allowed_identities", authCfg.AllowedEmails).
-		Strs("allowed_identities_normalised", authCfg.Allowlist()).
-		Msg("callers must present a Google credential this client issued, held by an allowlisted identity")
+		Strs("allowed_identities_normalised", authCfg.Allowlist())
+	if audience, kid, trusted := authCfg.GatewayTrust(); trusted {
+		admission.
+			Str("gateway_assertion_audience", audience).
+			Str("gateway_assertion_kid", kid).
+			Msg("callers must present a Google credential this client issued, held by an allowlisted identity, or a cerberus-gw assertion for this audience signed by the key with this kid, whose identity is admitted without the allowlist")
+	} else {
+		admission.Msg("callers must present a Google credential this client issued, held by an allowlisted identity")
+	}
 
 	redisCfg, err := redisdb.LoadConfig()
 	if err != nil {

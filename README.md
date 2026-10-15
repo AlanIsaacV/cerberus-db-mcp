@@ -2,7 +2,9 @@
 
 cerberus-db-mcp is a gated, read-only Model Context Protocol server for MySQL,
 PostgreSQL, and SQL Server. An authenticated Google identity must be on the
-deployment's allowlist before it can reach a tool; the statement gate executes
+deployment's allowlist before it can reach a tool, unless the deployment trusts
+cerberus-gw, whose signed assertion is admitted without the allowlist (see
+`CERBERUS_AUTH_GATEWAY_PUBLIC_KEY` below); the statement gate executes
 no statement it cannot establish is a read, and each query is audited with the
 calling identity.
 
@@ -124,6 +126,15 @@ connect.
 - `CERBERUS_MCP_GATE_OVERLAY` is optional. Empty or unset, the gate runs the
   ruleset embedded in the binary and nothing else; set, it is the path of an
   overlay file applied on top of it — see "Gate overlay" below.
+- `CERBERUS_AUTH_GATEWAY_PUBLIC_KEY` and `CERBERUS_AUTH_GATEWAY_AUDIENCE` are
+  optional and set both or neither; exactly one set refuses to start and names
+  the missing one. Set, the server also admits the short-lived assertion
+  cerberus-gw signs per call. The key is cerberus-gw's raw 32-byte Ed25519
+  public key in standard base64; the audience is matched exactly against the
+  assertion's `aud`. Whitespace in either is refused rather than trimmed. An
+  assertion is verified locally and never sent to Google, set or not, and its
+  `sub` and `email` become the caller's identity without the email being checked
+  against `CERBERUS_AUTH_ALLOWED_EMAILS`.
 
 The process also refuses to start when a configured PostgreSQL alias has a
 non-empty `PGSERVICE` or `PGSERVICEFILE`, or when a configured SQL Server alias
@@ -841,7 +852,8 @@ nothing else. A blank value is the same as unset.
   address is changed in `compose.yaml`, not in `.env`. There is no
   `CERBERUS_MCP_GATE_OVERLAY` here.
 - `CERBERUS_AUTH_*`: the same six variables, with the same rules, as in
-  "Required" above. The sections below cover the two whose values differ from
+  "Required" above, and the optional `CERBERUS_AUTH_GATEWAY_*` pair from
+  "Defaulted or optional". The sections below cover the two whose values differ from
   the SQL server's: `CERBERUS_AUTH_PUBLIC_BASE_URL`, and the choice behind
   `CERBERUS_AUTH_SEALING_SECRET`. `CERBERUS_AUTH_CLIENT_REDIRECT_URIS` lists the
   redirect URIs of the clients that connect to this server.

@@ -41,7 +41,8 @@ var (
 	// ErrNoSealingMaterial reports a missing master secret. Credentials sealed by
 	// this process must remain usable across a restart, so making one up here
 	// would turn a deploy into a silent mass logout.
-	ErrNoSealingMaterial = errors.New("no credential sealing material was configured")
+	ErrNoSealingMaterial      = errors.New("no credential sealing material was configured")
+	ErrIncompleteGatewayTrust = errors.New("gateway assertion trust is configured by only one of its two variables")
 )
 
 // Config is the whole of this package's configuration. Like the other two
@@ -78,6 +79,9 @@ type Config struct {
 	// not generated here: a generated value would invalidate every credential on
 	// the next process restart.
 	SealingSecret Secret `env:"CERBERUS_AUTH_SEALING_SECRET"`
+
+	GatewayPublicKey string `env:"CERBERUS_AUTH_GATEWAY_PUBLIC_KEY"`
+	GatewayAudience  string `env:"CERBERUS_AUTH_GATEWAY_AUDIENCE"`
 }
 
 // LoadConfig reads the configuration from the process environment.
@@ -119,9 +123,11 @@ func LoadConfigFrom(environ map[string]string) (*Config, error) {
 // replacement is built from this table. TestVariableFormsCoverEveryField keeps it
 // in step with the struct's tags.
 var variableForms = map[string]struct{ variable, form string }{
-	"ClientID":      {"CERBERUS_AUTH_GOOGLE_CLIENT_ID", "a Google OAuth client ID, with no spaces in it"},
-	"AllowedEmails": {"CERBERUS_AUTH_ALLOWED_EMAILS", "a comma-separated list of email addresses"},
-	"SealingSecret": {"CERBERUS_AUTH_SEALING_SECRET", "a base64-encoded 32-byte master secret, with no spaces in it"},
+	"ClientID":         {"CERBERUS_AUTH_GOOGLE_CLIENT_ID", "a Google OAuth client ID, with no spaces in it"},
+	"AllowedEmails":    {"CERBERUS_AUTH_ALLOWED_EMAILS", "a comma-separated list of email addresses"},
+	"SealingSecret":    {"CERBERUS_AUTH_SEALING_SECRET", "a base64-encoded 32-byte master secret, with no spaces in it"},
+	"GatewayPublicKey": {"CERBERUS_AUTH_GATEWAY_PUBLIC_KEY", "a standard-base64-encoded 32-byte Ed25519 public key, with no spaces in it"},
+	"GatewayAudience":  {"CERBERUS_AUTH_GATEWAY_AUDIENCE", "an audience string with no spaces in it"},
 }
 
 // variableFault is a refusal naming a variable, assembled rather than formatted.
@@ -201,6 +207,24 @@ func (c Config) validate() error {
 	}
 	if _, err := decodeSealingSecret(c.SealingSecret); err != nil {
 		return fault(mustBe("SealingSecret"), ErrInvalidVariable)
+	}
+	return c.validateGatewayTrust()
+}
+
+func (c Config) validateGatewayTrust() error {
+	switch {
+	case c.GatewayPublicKey == "" && c.GatewayAudience == "":
+		return nil
+	case c.GatewayPublicKey == "":
+		return fault(variableForms["GatewayPublicKey"].variable+" is not set while "+variableForms["GatewayAudience"].variable+" is; set both or neither", ErrIncompleteGatewayTrust)
+	case c.GatewayAudience == "":
+		return fault(variableForms["GatewayAudience"].variable+" is not set while "+variableForms["GatewayPublicKey"].variable+" is; set both or neither", ErrIncompleteGatewayTrust)
+	}
+	if _, err := decodeGatewayPublicKey(c.GatewayPublicKey); err != nil {
+		return fault(mustBe("GatewayPublicKey"), ErrInvalidVariable)
+	}
+	if strings.ContainsAny(c.GatewayAudience, whitespace) {
+		return fault(mustBe("GatewayAudience"), ErrInvalidVariable)
 	}
 	return nil
 }

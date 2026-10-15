@@ -109,6 +109,7 @@ var authflowWriterFiles = []string{
 // looked in — ADR 01KZT76QT9ECEMKYGKXVZ5XPPJ.
 var requiredSources = append([]string{
 	configFile,
+	assertionFile,
 	"identity.go",
 	"middleware.go",
 	sealingFile,
@@ -169,6 +170,8 @@ const sealingFile = "sealing.go"
 // and internal/authflow/config.go, which do it the same way.
 const configFile = "config.go"
 
+const assertionFile = "assertion.go"
+
 // allowedImports is the whole of what this package's non-test files may import.
 //
 // It is enumerated rather than filtered for the reason internal/mcp's is: this is
@@ -182,6 +185,7 @@ var allowedImports = map[string]bool{
 	"context":         true,
 	"crypto/aes":      true,
 	"crypto/cipher":   true,
+	"crypto/ed25519":  true,
 	"crypto/hkdf":     true,
 	"crypto/rand":     true,
 	"crypto/sha256":   true, // the cache key, and the only lasting form of a token
@@ -422,7 +426,7 @@ func TestPackageImportsNothingItShouldNot(t *testing.T) {
 // anything here matches. What the checks are worth together is four things, and the
 // first is the one that does not depend on a name at all:
 //
-//   - Every file that holds a credential — [tokenFile], [sealingFile] and
+//   - Every file that holds a credential — [tokenFile], [sealingFile], [assertionFile] and
 //     [configFile] here, [authflowCredentialFiles] in internal/authflow — imports no
 //     logger and no formatter, and every file that can write to one holds no
 //     credential and names no credential-bearing field. It is the whole set in both
@@ -450,7 +454,7 @@ func TestTheRawTokenNeverReachesALogger(t *testing.T) {
 	fset, files := parseTokenScanFiles(t)
 
 	// One: every file that holds a credential has nothing to write it with.
-	for _, source := range append([]string{tokenFile, sealingFile, configFile}, authflowCredentialFiles...) {
+	for _, source := range append([]string{tokenFile, sealingFile, configFile, assertionFile}, authflowCredentialFiles...) {
 		for _, spec := range files[source].Imports {
 			imported, err := strconv.Unquote(spec.Path.Value)
 			if err != nil {

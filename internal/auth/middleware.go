@@ -49,6 +49,10 @@ const (
 	failureSealedCredentialExpired      = "sealed_credential_expired"
 	failureSealedCredentialCorrupt      = "sealed_credential_corrupt"
 	failureSealedCredentialWrongPurpose = "sealed_credential_wrong_purpose"
+	failureNoAssertionVerification      = "no_gateway_trust"
+	failureAssertionRejected            = "gateway_assertion_rejected"
+	failureAssertionWrongAudience       = "gateway_assertion_wrong_audience"
+	failureAssertionExpired             = "gateway_assertion_expired"
 )
 
 // NewMiddleware builds the authentication seam internal/mcp applies to its MCP
@@ -107,6 +111,7 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 	// every request this process will ever refuse, and building it in the handler
 	// would put a string concatenation on the path of a denial-of-service attempt.
 	challenge := challengeValue(publicBaseURL)
+	gateway := newAssertionVerifier(cfg)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			values := r.Header.Values("Authorization")
@@ -172,6 +177,39 @@ func newMiddlewareWithSealer(cfg Config, publicBaseURL string, log zerolog.Logge
 				next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), Identity{
 					Subject: caller.subject,
 					Email:   caller.email,
+				})))
+				return
+			}
+			if isUnreadableAssertion(token) {
+				unauthorized(w, r, log, challenge, failureAssertionRejected)
+				return
+			}
+			if isGatewayAssertion(token) {
+				if gateway == nil {
+					unauthorized(w, r, log, challenge, failureNoAssertionVerification)
+					return
+				}
+				asserted, err := gateway.verify(token, now())
+				if err != nil {
+					class := failureAssertionRejected
+					switch {
+					case errors.Is(err, errAssertionExpired):
+						class = failureAssertionExpired
+					case errors.Is(err, errAssertionWrongAudience):
+						class = failureAssertionWrongAudience
+					}
+					unauthorized(w, r, log, challenge, class)
+					return
+				}
+				log.Debug().
+					Str("email", asserted.Email).
+					Str("subject", asserted.Sub).
+					Str("path", r.URL.Path).
+					Str("admitted_by", "gateway_assertion").
+					Msg("request admitted")
+				next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), Identity{
+					Subject: asserted.Sub,
+					Email:   asserted.Email,
 				})))
 				return
 			}
@@ -316,7 +354,8 @@ func challengeValue(publicBaseURL string) string {
 func challengesTheCredential(class string) bool {
 	switch class {
 	case failureAbsentHeader, failureRepeatedHeader, failureMalformedHeader, failureTokenRejected,
-		failureSealedCredentialExpired, failureSealedCredentialCorrupt, failureSealedCredentialWrongPurpose:
+		failureSealedCredentialExpired, failureSealedCredentialCorrupt, failureSealedCredentialWrongPurpose,
+		failureAssertionRejected, failureAssertionWrongAudience, failureAssertionExpired:
 		return true
 	default:
 		return false
