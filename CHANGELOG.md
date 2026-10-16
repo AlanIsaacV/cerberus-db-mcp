@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.11.0 - 2026-10-16
+
+
+### Features
+
+- Admit the short-lived assertion cerberus-gw signs per call
+
+
 ## v0.10.1 - 2026-10-10
 
 
